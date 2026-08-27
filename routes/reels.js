@@ -61,13 +61,15 @@ function mapReelToFrontend(reel, currentUserId = null) {
     isSaved: !!isSaved,
     likes: Array.isArray(reel.reel_likes) ? reel.reel_likes.map(l => l.user_id) : [],
     createdAt: reel.created_at,
-    updatedAt: reel.updated_at
+    updatedAt: reel.updated_at,
+    location: reel.location || '',
+    locationData: reel.location_data || null
   };
 }
 
 // 1. POST /api/reels - Create new reel
 router.post('/api/reels', authenticateToken, async (req, res) => {
-  const { videoUrl, caption, audioTrackName, thumbnailUrl } = req.body;
+  const { videoUrl, caption, audioTrackName, thumbnailUrl, location, locationData, mentions } = req.body;
   if (!videoUrl) return res.status(400).json({ error: 'Video URL or media data is required.' });
 
   // Extract & validate duration_seconds
@@ -96,6 +98,16 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
           const mimeType = matches[1];
           const base64Data = matches[2];
           const buffer = Buffer.from(base64Data, 'base64');
+
+          if (!mimeType.startsWith('video/')) {
+            return res.status(400).json({ error: 'Uploaded file is not a valid video MIME type.' });
+          }
+          if (buffer.length < 1024) {
+            return res.status(400).json({ error: 'Uploaded video media payload is corrupt or too small.' });
+          }
+
+          console.log(`[API REEL UPLOAD] Validated media payload: size=${buffer.length} bytes, MIME=${mimeType}`);
+
           const ext = mimeType.split('/')[1] || 'webm';
           const filename = `${userId}/reel_${Date.now()}.${ext}`;
 
@@ -111,9 +123,12 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
           } else {
             console.warn("Reel storage upload notice:", uploadErr.message);
           }
+        } else {
+          return res.status(400).json({ error: 'Malformed base64 video data URL.' });
         }
       } catch (e) {
         console.warn("Reel storage exception notice:", e.message);
+        return res.status(500).json({ error: 'Failed to process video media payload.' });
       }
     }
 
@@ -141,12 +156,41 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
       view_count: 0,
       like_count: 0,
       comment_count: 0,
-      share_count: 0
+      share_count: 0,
+      location: location || null,
+      location_data: locationData || null
     }]).select('*, author:profiles(id, full_name, username, profile_image_url)').single();
 
     if (error) {
       console.error("Reel insert error:", error.message);
       return res.status(500).json({ error: error.message });
+    }
+
+    // Process structured mentions if any
+    if (Array.isArray(mentions) && mentions.length > 0) {
+      const uniqueMentions = [...new Set(mentions)];
+
+      // 1. Insert mentions table entries with status 'pending'
+      const mentionsInserts = uniqueMentions.map(mUserId => ({
+        user_id: mUserId,
+        reel_id: newReel.id,
+        target_type: 'reel',
+        status: 'pending'
+      }));
+      const { error: mentionsErr } = await supabase.from('mentions').insert(mentionsInserts);
+      if (mentionsErr) console.error("Reel mentions db insertion error:", mentionsErr.message);
+
+      // 2. Insert notifications table entries
+      const notificationsInserts = uniqueMentions.map(mUserId => ({
+        recipient_id: mUserId,
+        sender_id: userId,
+        type: 'reel_mention',
+        target_type: 'reel',
+        reel_id: newReel.id,
+        is_read: false
+      }));
+      const { error: notifsErr } = await supabase.from('notifications').insert(notificationsInserts);
+      if (notifsErr) console.error("Reel notifications db insertion error:", notifsErr.message);
     }
 
     res.status(201).json(mapReelToFrontend(newReel, userId));
@@ -498,6 +542,401 @@ router.delete('/api/reels/:id', authenticateToken, async (req, res) => {
     res.json({ message: 'Reel deleted successfully.' });
   } catch (err) {
     console.error("DELETE /api/reels/:id error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. GET /api/reels/saved - Get all saved reels for user
+router.get('/api/reels/saved', authenticateToken, async (req, res) => {
+  const userId = req.user.id || req.user.userId;
+  try {
+    const { data: savedReelsData, error: savedErr } = await supabase
+      .from('saved_reels')
+      .select(`
+        reel_id,
+        created_at,
+        reels (
+          *,
+          author:profiles(id, full_name, username, profile_image_url),
+          reel_likes(user_id),
+          reel_comments(id),
+          saved_reels(user_id)
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (savedErr) throw savedErr;
+
+    const reels = [];
+    if (savedReelsData && savedReelsData.length > 0) {
+      for (const s of savedReelsData) {
+        if (!s.reels) continue;
+        const r = s.reels;
+        const mapped = mapReelToFrontend(r, userId);
+        if (mapped) {
+          mapped.isReel = true;
+          mapped.saved_at = s.created_at;
+          reels.push(mapped);
+        }
+      }
+    }
+    res.json(reels);
+  } catch (err) {
+    console.error("GET /api/reels/saved error:", err);
+    res.status(500).json({ error: 'Failed to retrieve saved reels' });
+  }
+});
+
+// 9. POST /api/reels/mentions/accept - Accept a reel mention
+router.post('/api/reels/mentions/accept', authenticateToken, async (req, res) => {
+  const { reelId, notificationId } = req.body;
+  const userId = req.user.id;
+  if (!reelId) return res.status(400).json({ error: 'Reel ID is required.' });
+
+  try {
+    const { error } = await supabase
+      .from('mentions')
+      .update({ status: 'accepted' })
+      .eq('reel_id', reelId)
+      .eq('user_id', userId);
+
+    if (error) throw error;
+
+    if (notificationId) {
+      await supabase
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', notificationId)
+        .eq('recipient_id', userId);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Accept Reel Mention Error]:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 10. POST /api/reels/mentions/reject - Reject a reel mention
+router.post('/api/reels/mentions/reject', authenticateToken, async (req, res) => {
+  const { reelId, notificationId } = req.body;
+  const userId = req.user.id;
+  if (!reelId) return res.status(400).json({ error: 'Reel ID is required.' });
+
+  try {
+    const { error } = await supabase
+      .from('mentions')
+      .update({ status: 'rejected' })
+      .eq('reel_id', reelId)
+      .eq('user_id', userId);
+
+    if (error) throw error;
+
+    if (notificationId) {
+      await supabase
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', notificationId)
+        .eq('recipient_id', userId);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Reject Reel Mention Error]:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- SAVED DRAFTS ENDPOINTS ---
+
+const MAX_SIZE = 100 * 1024 * 1024; // 100 MB limit
+const ALLOWED_MIMES = [
+  'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime', 'video/x-matroska',
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+  'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/aac', 'audio/m4a'
+];
+const ALLOWED_EXTS = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'mp3', 'wav', 'aac', 'm4a'];
+
+// Helper to parse file paths from Supabase URLs
+function getStoragePathFromUrl(url, bucketName) {
+  if (!url) return null;
+  const searchStr = `/${bucketName}/`;
+  const idx = url.indexOf(searchStr);
+  if (idx !== -1) {
+    return decodeURIComponent(url.substring(idx + searchStr.length));
+  }
+  return null;
+}
+
+// Helper to delete draft files from Supabase Storage
+async function deleteDraftMedia(editorState, userId) {
+  if (!editorState) return;
+  try {
+    const filesToDelete = { 'post-videos': [], 'post-images': [] };
+
+    // Inspect clips
+    if (Array.isArray(editorState.clips)) {
+      editorState.clips.forEach(clip => {
+        if (clip.url && clip.url.includes('/draft_') && clip.url.includes(`/${userId}/`)) {
+          const bucketName = clip.type === 'video' ? 'post-videos' : 'post-images';
+          const path = getStoragePathFromUrl(clip.url, bucketName);
+          if (path) filesToDelete[bucketName].push(path);
+        }
+      });
+    }
+
+    // Inspect background music
+    if (editorState.bgAudio && editorState.bgAudio.url && editorState.bgAudio.url.includes('/draft_') && editorState.bgAudio.url.includes(`/${userId}/`)) {
+      const path = getStoragePathFromUrl(editorState.bgAudio.url, 'post-videos');
+      if (path) filesToDelete['post-videos'].push(path);
+    }
+
+    // Perform deletion
+    for (const bucket of ['post-videos', 'post-images']) {
+      const paths = filesToDelete[bucket];
+      if (paths.length > 0) {
+        console.log(`[Draft Cleanup] Deleting files from bucket '${bucket}':`, paths);
+        const { error } = await supabase.storage.from(bucket).remove(paths);
+        if (error) {
+          console.warn(`[Draft Cleanup Warning] Failed to delete from '${bucket}':`, error.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Draft Cleanup Exception]:", err.message);
+  }
+}
+
+// 10. POST /api/reels/drafts/upload - Secure binary streaming upload to Supabase Storage
+router.post('/api/reels/drafts/upload', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const fileName = req.query.name || `file_${Date.now()}`;
+  const mimeType = req.headers['content-type'] || 'application/octet-stream';
+  
+  // Validate file types and content
+  const isVideo = mimeType.startsWith('video');
+  const isImage = mimeType.startsWith('image');
+  const isAudio = mimeType.startsWith('audio');
+  
+  const ext = fileName.split('.').pop().toLowerCase();
+  
+  if (!ALLOWED_MIMES.includes(mimeType) || !ALLOWED_EXTS.includes(ext)) {
+    return res.status(400).json({ error: 'Unsupported file format or invalid file type.' });
+  }
+
+  // Validate size limits from headers
+  const contentLength = parseInt(req.headers['content-length']);
+  if (contentLength && contentLength > MAX_SIZE) {
+    return res.status(400).json({ error: 'File size exceeds maximum allowed limit of 100MB.' });
+  }
+
+  const bucketName = isVideo || isAudio ? 'post-videos' : 'post-images';
+  const filename = `${userId}/draft_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+
+  let totalSize = 0;
+  const chunks = [];
+  let aborted = false;
+
+  req.on('data', chunk => {
+    if (aborted) return;
+    totalSize += chunk.length;
+    if (totalSize > MAX_SIZE) {
+      aborted = true;
+      req.destroy();
+      return res.status(400).json({ error: 'Upload content exceeds the 100MB limit.' });
+    }
+    chunks.push(chunk);
+  });
+
+  req.on('error', (err) => {
+    if (aborted) return;
+    console.error("Stream upload request error:", err);
+    res.status(500).json({ error: 'Upload stream encountered a transfer issue.' });
+  });
+
+  req.on('end', async () => {
+    if (aborted) return;
+    try {
+      const buffer = Buffer.concat(chunks);
+      const { error: uploadErr } = await supabase.storage
+        .from(bucketName)
+        .upload(filename, buffer, { contentType: mimeType, upsert: true });
+
+      if (uploadErr) {
+        console.error("Supabase Storage save error:", uploadErr.message);
+        return res.status(500).json({ error: uploadErr.message });
+      }
+
+      const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(filename);
+      if (!publicUrlData || !publicUrlData.publicUrl) {
+        return res.status(500).json({ error: 'Failed to retrieve public storage path.' });
+      }
+
+      res.json({ url: publicUrlData.publicUrl });
+    } catch (err) {
+      console.error("Upload process exception:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+});
+
+// 11. GET /api/reels/drafts - Get all drafts for user
+router.get('/api/reels/drafts', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const { data: drafts, error } = await supabase
+      .from('drafts')
+      .select('id, caption, location, created_at, updated_at, editor_state')
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false });
+
+    if (error) throw error;
+
+    const results = (drafts || []).map(d => {
+      let thumbnailUrl = '';
+      if (d.editor_state && Array.isArray(d.editor_state.clips) && d.editor_state.clips.length > 0) {
+        thumbnailUrl = d.editor_state.clips[0].url || '';
+      }
+      return {
+        id: d.id,
+        caption: d.caption || '',
+        location: d.location || '',
+        createdAt: d.created_at,
+        updatedAt: d.updated_at,
+        thumbnailUrl
+      };
+    });
+
+    res.json(results);
+  } catch (err) {
+    console.error("GET /api/reels/drafts error:", err.message);
+    res.status(500).json({ error: 'Failed to retrieve drafts' });
+  }
+});
+
+// 12. GET /api/reels/drafts/:id - Get a specific draft
+router.get('/api/reels/drafts/:id', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const draftId = req.params.id;
+  try {
+    const { data: draft, error } = await supabase
+      .from('drafts')
+      .select('*')
+      .eq('id', draftId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Draft not found.' });
+    }
+
+    res.json({
+      id: draft.id,
+      caption: draft.caption || '',
+      hashtags: draft.hashtags || [],
+      mentions: draft.mentions || [],
+      location: draft.location || '',
+      locationData: draft.location_data || null,
+      editorState: draft.editor_state
+    });
+  } catch (err) {
+    console.error("GET /api/reels/drafts/:id error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 13. POST /api/reels/drafts - Create new draft
+router.post('/api/reels/drafts', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { caption, hashtags, mentions, location, locationData, editorState } = req.body;
+  if (!editorState) return res.status(400).json({ error: 'Editor state is required.' });
+
+  try {
+    const { data: createdDraft, error } = await supabase
+      .from('drafts')
+      .insert([{
+        user_id: userId,
+        caption: caption || '',
+        hashtags: hashtags || [],
+        mentions: mentions || [],
+        location: location || null,
+        location_data: locationData || null,
+        editor_state: editorState
+      }])
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(createdDraft);
+  } catch (err) {
+    console.error("POST /api/reels/drafts error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 14. PUT /api/reels/drafts/:id - Update an existing draft
+router.put('/api/reels/drafts/:id', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const draftId = req.params.id;
+  const { caption, hashtags, mentions, location, locationData, editorState } = req.body;
+  if (!editorState) return res.status(400).json({ error: 'Editor state is required.' });
+
+  try {
+    const { data: updatedDraft, error } = await supabase
+      .from('drafts')
+      .update({
+        caption: caption || '',
+        hashtags: hashtags || [],
+        mentions: mentions || [],
+        location: location || null,
+        location_data: locationData || null,
+        editor_state: editorState,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', draftId)
+      .eq('user_id', userId)
+      .select('*')
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Draft not found or unauthorized.' });
+    }
+
+    res.json(updatedDraft);
+  } catch (err) {
+    console.error("PUT /api/reels/drafts/:id error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 15. DELETE /api/reels/drafts/:id - Delete a draft
+router.delete('/api/reels/drafts/:id', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const draftId = req.params.id;
+  try {
+    const { data: draft } = await supabase
+      .from('drafts')
+      .select('editor_state')
+      .eq('id', draftId)
+      .eq('user_id', userId)
+      .single();
+
+    const { error } = await supabase
+      .from('drafts')
+      .delete()
+      .eq('id', draftId)
+      .eq('user_id', userId);
+
+    if (error) throw error;
+
+    if (draft && draft.editor_state) {
+      deleteDraftMedia(draft.editor_state, userId);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /api/reels/drafts/:id error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });

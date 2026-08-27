@@ -836,6 +836,113 @@ router.get('/api/posts/trending', async (req, res) => {
 });
 
 // ------------------------------------------------------------------------------
+// GET /api/posts/saved - Get all saved posts for user
+// ------------------------------------------------------------------------------
+router.get('/api/posts/saved', authenticateToken, async (req, res) => {
+  const userId = req.user.id || req.user.userId;
+
+  try {
+    const { data: savedPostsData, error: savedErr } = await supabase
+      .from('saved_posts')
+      .select(`
+        post_id,
+        created_at,
+        posts (
+          *,
+          author_profile:profiles!author_id(id, full_name, username, profile_image_url),
+          media:post_media(media_url, media_type)
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (savedErr) throw savedErr;
+
+    const posts = [];
+    if (savedPostsData && savedPostsData.length > 0) {
+      const postIds = savedPostsData.map(s => s.post_id).filter(Boolean);
+
+      if (postIds.length > 0) {
+        // Batch fetch comments & likes in 2 bulk queries
+        const [{ data: allComments }, { data: allLikes }] = await Promise.all([
+          supabase
+            .from('comments')
+            .select('*, author_profile:profiles!author_id(id, full_name, username, profile_image_url)')
+            .in('post_id', postIds)
+            .order('created_at', { ascending: true }),
+          supabase
+            .from('likes')
+            .select('post_id, user_id')
+            .in('post_id', postIds)
+        ]);
+
+        const commentsByPost = {};
+        (allComments || []).forEach(c => {
+          if (!commentsByPost[c.post_id]) commentsByPost[c.post_id] = [];
+          commentsByPost[c.post_id].push(mapCommentToFrontend(c));
+        });
+
+        const likesByPost = {};
+        (allLikes || []).forEach(l => {
+          if (!likesByPost[l.post_id]) likesByPost[l.post_id] = [];
+          likesByPost[l.post_id].push(l.user_id);
+        });
+
+        for (const s of savedPostsData) {
+          if (!s.posts) continue;
+          const p = s.posts;
+          const authorObj = p.author_profile || {
+            id: p.author_id,
+            username: 'user',
+            full_name: 'User',
+            profile_image_url: ''
+          };
+
+          const mappedComments = commentsByPost[p.id] || [];
+          const mappedLikes = likesByPost[p.id] || [];
+
+          posts.push(mapPostToFrontend(p, p.media || [], authorObj, mappedComments, mappedLikes));
+        }
+      }
+    }
+    res.json(posts);
+  } catch (err) {
+    console.error("GET /api/posts/saved error:", err);
+    res.status(500).json({ error: 'Failed to retrieve saved posts' });
+  }
+});
+
+// ------------------------------------------------------------------------------
+// POST /api/posts/:id/save - Toggle bookmark/save for post
+// ------------------------------------------------------------------------------
+router.post('/api/posts/:id/save', authenticateToken, async (req, res) => {
+  const postId = req.params.id;
+  const userId = req.user.id || req.user.userId;
+
+  try {
+    const { data: existingSave } = await supabase
+      .from('saved_posts')
+      .select('id')
+      .eq('post_id', postId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const isSaved = !existingSave;
+
+    if (isSaved) {
+      await supabase.from('saved_posts').insert([{ post_id: postId, user_id: userId }]);
+    } else {
+      await supabase.from('saved_posts').delete().eq('post_id', postId).eq('user_id', userId);
+    }
+
+    res.json({ isSaved });
+  } catch (err) {
+    console.error("POST /api/posts/:id/save error:", err.message);
+    res.status(500).json({ error: 'Failed to toggle save post' });
+  }
+});
+
+// ------------------------------------------------------------------------------
 // 10. GET SINGLE POST BY ID
 // ------------------------------------------------------------------------------
 router.get('/api/posts/:id', authenticateToken, async (req, res) => {

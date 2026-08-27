@@ -2,7 +2,466 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import CreatePost from './pages/CreatePost/CreatePost.jsx';
 import { initVideoEditor } from './video_editor_controller.js';
+import { Input, Output, BlobSource, BufferTarget, WebMOutputFormat, Mp4OutputFormat, Conversion, ALL_FORMATS } from 'mediabunny';
 import './style.css'
+
+window.reelsMuted = false; // Unmuted by default
+
+// --- HUBBING REEL PLAYBACK CONTROLLER (CENTRALIZED SINGLETON STATE MACHINE) ---
+class HubbingPlaybackController {
+  constructor() {
+    this.activeReelId = null;
+    this.activeVideo = null;
+    this.activeCard = null;
+    this.activationId = 0;
+    this.pendingPlayPromise = null;
+    this.visibilityMap = new Map(); // card -> { video, reelId, ratio, entry }
+    this.unloadTimers = new Map(); // reelId -> timerId
+    this.settleTimer = null;
+    this.isExploreActive = false;
+    this.isUserMuted = window.reelsMuted !== false;
+    this.perfInterval = null;
+    this.scrollListenerBound = false;
+
+    this.startPerfMonitoring();
+    this.bindGlobalScrollListener();
+  }
+
+  bindGlobalScrollListener() {
+    if (this.scrollListenerBound) return;
+    const bindScroller = () => {
+      const scroller = document.querySelector('.main-content');
+      if (scroller && !scroller._hubbingScrollBound) {
+        scroller._hubbingScrollBound = true;
+        this.scrollListenerBound = true;
+        scroller.addEventListener('scroll', () => {
+          if (!this.isExploreActive) return;
+          this.scheduleSettleEvaluation(120);
+        }, { passive: true });
+      }
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', bindScroller);
+    } else {
+      bindScroller();
+    }
+  }
+
+  startPerfMonitoring() {
+    if (this.perfInterval) clearInterval(this.perfInterval);
+    this.perfInterval = setInterval(() => {
+      if (!this.isExploreActive) return;
+      this.logPerfDiagnostics();
+    }, 4000);
+  }
+
+  logPerfDiagnostics() {
+    const scroller = document.querySelector('#explore-reels-container .reels-scroller');
+    if (!scroller) return;
+    const cards = scroller.querySelectorAll('.reel-card');
+    const videos = scroller.querySelectorAll('.reel-video');
+    let playingCount = 0;
+    let loadedCount = 0;
+
+    videos.forEach(v => {
+      if (!v.paused && v.readyState >= 2) playingCount++;
+      if (v.src && v.src.length > 0) loadedCount++;
+    });
+
+    let qualityInfo = '';
+    if (this.activeVideo && typeof this.activeVideo.getVideoPlaybackQuality === 'function') {
+      const q = this.activeVideo.getVideoPlaybackQuality();
+      qualityInfo = ` droppedFrames=${q.droppedVideoFrames}/${q.totalVideoFrames}`;
+    }
+
+    let memoryInfo = '';
+    if (window.performance && window.performance.memory) {
+      const usedMb = Math.round(window.performance.memory.usedJSHeapSize / (1024 * 1024));
+      memoryInfo = ` memUsed=${usedMb}MB`;
+    }
+
+    console.log(`[HUBBING PERF] activeReel=${this.activeReelId || 'none'} cards=${cards.length} videos=${videos.length} loaded=${loadedCount} playing=${playingCount}${qualityInfo}${memoryInfo}`);
+  }
+
+  onViewChange(viewName) {
+    this.isExploreActive = (viewName === 'explore' || viewName === 'reels');
+    console.log(`[HUBBING PLAYER] onViewChange: ${viewName}, isExploreActive=${this.isExploreActive}`);
+    
+    if (!this.isExploreActive) {
+      this.deactivateCurrentReel('view_leave');
+      this.pauseAllReelVideos();
+    } else {
+      this.bindGlobalScrollListener();
+      this.scheduleSettleEvaluation(80);
+    }
+  }
+
+  pauseAllReelVideos(exceptVideo = null) {
+    document.querySelectorAll('.reel-video').forEach(v => {
+      if (v !== exceptVideo) {
+        try {
+          if (!v.paused) {
+            v.pause();
+          }
+          v.muted = true;
+        } catch (_) {}
+        const card = v.closest('.reel-card');
+        const playOverlay = card?.querySelector('.reel-play-icon-overlay');
+        if (playOverlay) {
+          playOverlay.classList.add('paused-state');
+        }
+      }
+    });
+  }
+
+  onVisibilityChange(entries) {
+    entries.forEach(entry => {
+      const target = entry.target;
+      let card = null;
+      let video = null;
+
+      if (target.classList.contains('reel-card')) {
+        card = target;
+        video = card.querySelector('.reel-video');
+      } else if (target.classList.contains('reel-video')) {
+        video = target;
+        card = video.closest('.reel-card');
+      }
+
+      if (!card || !video) return;
+      const reelId = card.getAttribute('data-reel-id');
+      if (!reelId) return;
+
+      const ratio = entry.intersectionRatio;
+      this.visibilityMap.set(card, { video, reelId, ratio, entry });
+
+      // Controlled lazy activation
+      if (ratio === 0) {
+        this.scheduleUnload(reelId, video, card);
+      } else if (ratio >= 0.15) {
+        this.cancelUnload(reelId);
+        if (!video.src && video.dataset.src) {
+          video.src = video.dataset.src;
+          video.preload = 'metadata';
+        }
+      }
+    });
+
+    if (this.isExploreActive) {
+      this.scheduleSettleEvaluation(100);
+    }
+  }
+
+  scheduleSettleEvaluation(delayMs = 120) {
+    if (this.settleTimer) clearTimeout(this.settleTimer);
+    this.settleTimer = setTimeout(() => {
+      this.evaluateBestReel();
+    }, delayMs);
+  }
+
+  evaluateBestReel() {
+    if (!this.isExploreActive) return;
+
+    const exploreContainer = document.getElementById('explore-reels-container');
+    if (!exploreContainer || !exploreContainer.classList.contains('active')) {
+      if (this.activeReelId) this.deactivateCurrentReel('explore_container_inactive');
+      return;
+    }
+
+    const scroller = exploreContainer.querySelector('.reels-scroller');
+    if (!scroller) return;
+
+    const cards = Array.from(scroller.querySelectorAll('.reel-card'));
+    if (cards.length === 0) {
+      if (this.activeReelId) this.deactivateCurrentReel('no_cards');
+      return;
+    }
+
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+    const viewportCenter = viewportHeight / 2;
+
+    let bestCandidate = null;
+    let minCenterDistance = Infinity;
+
+    cards.forEach(card => {
+      if (card.getAttribute('data-reel-failed') === 'true') return;
+      if (!document.body.contains(card)) {
+        this.visibilityMap.delete(card);
+        return;
+      }
+
+      const rect = card.getBoundingClientRect();
+      const cardHeight = rect.height || 640;
+      
+      // Calculate visible overlap in viewport
+      const visibleTop = Math.max(0, rect.top);
+      const visibleBottom = Math.min(viewportHeight, rect.bottom);
+      const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+      const visibleRatio = visibleHeight / cardHeight;
+
+      const cardCenter = rect.top + (cardHeight / 2);
+      const centerDistance = Math.abs(cardCenter - viewportCenter);
+
+      // Card must be at least 25% visible in viewport
+      if (visibleRatio >= 0.25) {
+        if (centerDistance < minCenterDistance) {
+          minCenterDistance = centerDistance;
+          const video = card.querySelector('.reel-video');
+          const reelId = card.getAttribute('data-reel-id');
+          if (video && reelId) {
+            bestCandidate = { card, video, reelId, ratio: visibleRatio, centerDistance };
+          }
+        }
+      }
+    });
+
+    if (bestCandidate) {
+      if (this.activeReelId !== bestCandidate.reelId) {
+        this.activateReel(bestCandidate.reelId, bestCandidate.video, bestCandidate.card, false);
+      } else {
+        // Active reel is still best, ensure it is playing if paused unintentionally
+        if (this.activeVideo && this.activeVideo.paused && !this.activeVideo._userExplicitlyPaused) {
+          this.safePlay(this.activeVideo, this.activationId, bestCandidate.reelId, bestCandidate.card);
+        }
+      }
+    } else {
+      // No reel sufficiently visible in viewport
+      if (this.activeReelId) {
+        this.deactivateCurrentReel('no_visible_reels');
+      }
+    }
+  }
+
+  scheduleUnload(reelId, video, card) {
+    if (this.unloadTimers.has(reelId)) return;
+    // Long hysteresis timeout (10s) to prevent tearing down decoders during normal scrolling
+    const timerId = setTimeout(() => {
+      this.unloadTimers.delete(reelId);
+      if (this.activeReelId !== reelId && video && video.src) {
+        // Only unload if card is truly far away (> 2 cards away from active)
+        const scroller = document.querySelector('#explore-reels-container .reels-scroller');
+        if (scroller && this.activeCard) {
+          const cards = Array.from(scroller.querySelectorAll('.reel-card'));
+          const activeIdx = cards.indexOf(this.activeCard);
+          const thisIdx = cards.indexOf(card);
+          if (activeIdx !== -1 && thisIdx !== -1 && Math.abs(activeIdx - thisIdx) <= 2) {
+            // Keep neighbor alive
+            return;
+          }
+        }
+        try {
+          if (!video.paused) video.pause();
+          video.removeAttribute('src');
+          video.load();
+          console.log(`[HUBBING PLAYER] Unloaded far off-screen reel decoder resources: ${reelId}`);
+        } catch (_) {}
+      }
+    }, 10000);
+    this.unloadTimers.set(reelId, timerId);
+  }
+
+  cancelUnload(reelId) {
+    if (this.unloadTimers.has(reelId)) {
+      clearTimeout(this.unloadTimers.get(reelId));
+      this.unloadTimers.delete(reelId);
+    }
+  }
+
+  async activateReel(reelId, video, card = null, userForced = false) {
+    if (!reelId || !video) return;
+    if (!card) card = video.closest('.reel-card');
+
+    this.activationId++;
+    const currentActivationId = this.activationId;
+
+    console.log(`[HUBBING PLAYER] activateReel: reelId=${reelId} (token #${currentActivationId}, forced=${userForced})`);
+
+    // 1. Cancel unload timer for this reel
+    this.cancelUnload(reelId);
+
+    // 2. Pause and mute all other videos immediately (Single Active Video Lock)
+    this.pauseAllReelVideos(video);
+
+    // 3. Ensure target video src is assigned
+    if (!video.src && video.dataset.src) {
+      video.src = video.dataset.src;
+    }
+    video.preload = 'auto';
+
+    // 4. Update audio settings (Strict audio policy)
+    this.isUserMuted = window.reelsMuted !== false;
+    video.muted = this.isUserMuted;
+    video.volume = 1.0;
+
+    // 5. Update state
+    this.activeReelId = reelId;
+    this.activeVideo = video;
+    this.activeCard = card;
+    if (video) video._userExplicitlyPaused = false;
+
+    // 6. Update UI state across all cards
+    this.syncAllAudioIcons();
+    this.syncCardPlayOverlay(card, false);
+
+    // 7. Preload adjacent neighbors (±1 and ±2)
+    this.preloadAdjacentNeighbors(card);
+
+    // 8. Safe play execution with race-condition prevention
+    await this.safePlay(video, currentActivationId, reelId, card);
+  }
+
+  async safePlay(video, token, reelId, card) {
+    if (!video || this.activationId !== token) return;
+
+    try {
+      const playPromise = video.play();
+      if (playPromise !== undefined) {
+        this.pendingPlayPromise = playPromise;
+        await playPromise;
+      }
+
+      // Check if token changed while waiting for play()
+      if (this.activationId !== token) {
+        console.log(`[HUBBING PLAYER] Stale play token #${token} resolved (active is #${this.activationId}), pausing.`);
+        try { video.pause(); } catch (_) {}
+        return;
+      }
+
+      this.syncCardPlayOverlay(card, false);
+      console.log(`[HUBBING PLAYER] Playing active reelId=${reelId} (token #${token}, muted=${video.muted}, currentTime=${video.currentTime.toFixed(2)})`);
+    } catch (err) {
+      if (this.activationId !== token) return;
+
+      console.warn(`[HUBBING PLAYER] Play rejected for reelId=${reelId}:`, err.message);
+
+      // If autoplay failed due to unmuted audio policy, retry with muted=true
+      if (err.name === 'NotAllowedError' && !video.muted) {
+        console.log('[HUBBING PLAYER] Autoplay blocked with sound, falling back to muted playback.');
+        video.muted = true;
+        window.reelsMuted = true;
+        this.isUserMuted = true;
+        this.syncAllAudioIcons();
+        try {
+          await video.play();
+          if (this.activationId === token) {
+            this.syncCardPlayOverlay(card, false);
+          }
+        } catch (_) {
+          this.syncCardPlayOverlay(card, true);
+        }
+      } else {
+        this.syncCardPlayOverlay(card, true);
+      }
+    } finally {
+      if (this.activationId === token) {
+        this.pendingPlayPromise = null;
+      }
+    }
+  }
+
+  deactivateCurrentReel(reason = 'manual') {
+    console.log(`[HUBBING PLAYER] deactivateCurrentReel (reason: ${reason}, activeReelId=${this.activeReelId})`);
+    this.activationId++;
+    if (this.activeVideo) {
+      try {
+        if (!this.activeVideo.paused) {
+          this.activeVideo.pause();
+        }
+        this.activeVideo.muted = true;
+      } catch (_) {}
+    }
+    if (this.activeCard) {
+      this.syncCardPlayOverlay(this.activeCard, true);
+    }
+    this.activeReelId = null;
+    this.activeVideo = null;
+    this.activeCard = null;
+  }
+
+  togglePlayPause(card) {
+    if (!card) return;
+    const video = card.querySelector('.reel-video');
+    const reelId = card.getAttribute('data-reel-id');
+    if (!video || !reelId) return;
+
+    if (this.activeReelId === reelId && !video.paused) {
+      video._userExplicitlyPaused = true;
+      this.deactivateCurrentReel('user_tap_pause');
+    } else {
+      video._userExplicitlyPaused = false;
+      this.activateReel(reelId, video, card, true);
+    }
+  }
+
+  toggleAudio(card) {
+    const nextMuted = (window.reelsMuted === false); // toggle: if false -> true, if true -> false
+    window.reelsMuted = nextMuted;
+    this.isUserMuted = nextMuted;
+
+    console.log(`[HUBBING PLAYER] toggleAudio: global reelsMuted=${nextMuted}`);
+
+    if (this.activeVideo) {
+      this.activeVideo.muted = nextMuted;
+      this.activeVideo.volume = 1.0;
+    }
+
+    this.syncAllAudioIcons();
+
+    if (typeof safeShowToast === 'function') {
+      safeShowToast(nextMuted ? 'Reel audio muted 🔇' : 'Reel audio unmuted 🔊');
+    } else if (typeof window.showToast === 'function') {
+      window.showToast(nextMuted ? 'Reel audio muted 🔇' : 'Reel audio unmuted 🔊');
+    }
+  }
+
+  syncAllAudioIcons() {
+    const isMuted = window.reelsMuted !== false;
+    document.querySelectorAll('.reel-audio-toggle-btn i, .reel-audio-toggle-btn svg').forEach(icon => {
+      icon.setAttribute('data-lucide', isMuted ? 'volume-x' : 'volume-2');
+    });
+    if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+  }
+
+  syncCardPlayOverlay(card, isPaused) {
+    if (!card) return;
+    const playOverlay = card.querySelector('.reel-play-icon-overlay');
+    if (playOverlay) {
+      if (isPaused) {
+        playOverlay.classList.add('paused-state');
+      } else {
+        playOverlay.classList.remove('paused-state');
+      }
+    }
+  }
+
+  preloadAdjacentNeighbors(currentCard) {
+    if (!currentCard) return;
+    const scroller = currentCard.closest('.reels-scroller');
+    if (!scroller) return;
+
+    const cards = Array.from(scroller.querySelectorAll('.reel-card'));
+    const idx = cards.indexOf(currentCard);
+    if (idx === -1) return;
+
+    const neighbors = [
+      cards[idx - 2],
+      cards[idx - 1],
+      cards[idx + 1],
+      cards[idx + 2]
+    ].filter(Boolean);
+
+    neighbors.forEach(nCard => {
+      const nVid = nCard.querySelector('.reel-video');
+      if (nVid && !nVid.src && nVid.dataset.src) {
+        nVid.src = nVid.dataset.src;
+        nVid.preload = 'metadata';
+        console.log(`[HUBBING PLAYER] Preloaded neighbor metadata: ${nCard.getAttribute('data-reel-id')}`);
+      }
+    });
+  }
+}
+
+window.hubbingPlaybackController = new HubbingPlaybackController();
 
 // --- POST MUSIC PLAYBACK CONTROLLER ---
 const getPostMusicUrl = (post) => {
@@ -10,6 +469,30 @@ const getPostMusicUrl = (post) => {
   const match = post.caption.match(/data-music-url="([^"]+)"/);
   return match ? match[1] : null;
 };
+
+function bindPostVideoAudioSync(card, video, audio) {
+  if (video._syncBound) return;
+  video._syncBound = true;
+
+  video.addEventListener('play', () => {
+    if (audio.paused) audio.play().catch(() => {});
+  });
+  video.addEventListener('pause', () => {
+    if (!audio.paused) audio.pause();
+  });
+  video.addEventListener('seeking', () => {
+    audio.currentTime = video.currentTime % (audio.duration || 1);
+  });
+  video.addEventListener('seeked', () => {
+    audio.currentTime = video.currentTime % (audio.duration || 1);
+  });
+  video.addEventListener('timeupdate', () => {
+    const target = video.currentTime % (audio.duration || 1);
+    if (Math.abs(audio.currentTime - target) > 0.15) {
+      audio.currentTime = target;
+    }
+  });
+}
 
 window.togglePostMusic = (btn, musicUrl, postId) => {
   const card = document.getElementById('post-' + postId);
@@ -23,6 +506,11 @@ window.togglePostMusic = (btn, musicUrl, postId) => {
 
   const audio = card._audio;
   const vinyl = card.querySelector('.music-vinyl-disc');
+  const video = card.querySelector('.post-media-video');
+
+  if (video) {
+    bindPostVideoAudioSync(card, video, audio);
+  }
 
   if (audio.paused) {
     // Stop all other playing audios
@@ -41,6 +529,9 @@ window.togglePostMusic = (btn, musicUrl, postId) => {
     });
 
     audio.play().catch(err => console.warn('Audio play error:', err.message));
+    if (video && video.paused) {
+      video.play().catch(err => console.warn('Video play error:', err.message));
+    }
     if (vinyl) {
       vinyl.style.animationPlayState = 'running';
       vinyl.style.animation = 'spin 4s linear infinite';
@@ -50,6 +541,9 @@ window.togglePostMusic = (btn, musicUrl, postId) => {
     `;
   } else {
     audio.pause();
+    if (video && !video.paused) {
+      video.pause();
+    }
     if (vinyl) vinyl.style.animationPlayState = 'paused';
     btn.innerHTML = `
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/></svg>
@@ -66,12 +560,913 @@ window.stopAllPostMusic = () => {
   });
 };
 
+// =========================================================================
+// SHARE HUBBS (STORIES) SINGLETON AUDIO CONTROLLER & LIFECYCLE ENGINE
+// =========================================================================
+
+window.StoryAudioManager = {
+  audio: null,
+  currentTrack: null,
+  currentUrl: null,
+  isMutedState: false,
+  _userVolume: 1,
+  _isPlaying: false,
+  _owner: null, // 'editor' | 'preview' | 'viewer'
+
+  init() {
+    if (!this.audio) {
+      this.audio = new Audio();
+      this.audio.loop = true;
+      this.audio.preload = 'auto';
+      this.audio.crossOrigin = 'anonymous';
+
+      this.audio.addEventListener('play', () => { this._isPlaying = true; });
+      this.audio.addEventListener('pause', () => { this._isPlaying = false; });
+      this.audio.addEventListener('ended', () => {
+        if (this.audio && this.audio.loop) {
+          this.audio.currentTime = 0;
+          this.audio.play().catch(() => {});
+        }
+      });
+      this.audio.addEventListener('error', (err) => {
+        console.warn('[StoryAudioManager] Audio stream notice:', err);
+        this._isPlaying = false;
+      });
+    }
+    return this.audio;
+  },
+
+  load(trackOrUrl, owner = 'editor') {
+    this.init();
+    let url = null;
+    let track = null;
+
+    if (typeof trackOrUrl === 'string') {
+      url = trackOrUrl;
+      track = { previewUrl: url, url: url, title: 'Music', artist: '' };
+    } else if (trackOrUrl && typeof trackOrUrl === 'object') {
+      track = trackOrUrl;
+      url = track.previewUrl || track.url || null;
+    }
+
+    this._owner = owner;
+    this.currentTrack = track;
+
+    if (!url) {
+      this.stop();
+      this.currentUrl = null;
+      return false;
+    }
+
+    if (this.currentUrl !== url || !this.audio.src) {
+      this.currentUrl = url;
+      try {
+        this.audio.pause();
+        this.audio.src = url;
+        this.audio.currentTime = 0;
+        this.audio.load();
+      } catch (e) {
+        console.warn('[StoryAudioManager.load] Error setting src:', e);
+      }
+    }
+
+    if (track && typeof track.isMuted === 'boolean') {
+      this.isMutedState = track.isMuted;
+    }
+    this.audio.muted = !!this.isMutedState;
+    return true;
+  },
+
+  play(owner = null) {
+    this.init();
+    if (owner) this._owner = owner;
+    if (!this.currentUrl && this.currentTrack) {
+      this.load(this.currentTrack, this._owner || 'editor');
+    }
+    if (!this.currentUrl) return Promise.resolve();
+
+    this.audio.muted = !!this.isMutedState;
+    return this.audio.play().catch(e => {
+      console.warn('[StoryAudioManager.play] Autoplay notice:', e.message || e);
+      if (e.name === 'NotAllowedError') {
+        const unlockAudio = () => {
+          window.removeEventListener('click', unlockAudio, true);
+          window.removeEventListener('touchstart', unlockAudio, true);
+          window.removeEventListener('pointerdown', unlockAudio, true);
+          if (this.currentUrl && !this.isMutedState && this.audio) {
+            this.audio.play().catch(() => {});
+          }
+        };
+        window.addEventListener('click', unlockAudio, true);
+        window.addEventListener('touchstart', unlockAudio, true);
+        window.addEventListener('pointerdown', unlockAudio, true);
+      }
+    });
+  },
+
+  pause() {
+    if (this.audio) {
+      try {
+        this.audio.pause();
+      } catch (_) {}
+    }
+    this._isPlaying = false;
+  },
+
+  resume() {
+    if (this.currentUrl && !this.isMutedState) {
+      return this.play();
+    }
+    return Promise.resolve();
+  },
+
+  stop() {
+    if (this.audio) {
+      try {
+        this.audio.pause();
+        this.audio.currentTime = 0;
+      } catch (_) {}
+    }
+    this._isPlaying = false;
+  },
+
+  mute() {
+    this.isMutedState = true;
+    if (this.audio) {
+      this.audio.muted = true;
+    }
+    if (this.currentTrack) {
+      this.currentTrack.isMuted = true;
+    }
+  },
+
+  unmute() {
+    this.isMutedState = false;
+    if (this.audio) {
+      this.audio.muted = false;
+    }
+    if (this.currentTrack) {
+      this.currentTrack.isMuted = false;
+    }
+    if (this.audio && this.audio.paused && this.currentUrl) {
+      this.play();
+    }
+  },
+
+  toggleMute() {
+    if (this.isMutedState) {
+      this.unmute();
+    } else {
+      this.mute();
+    }
+    return this.isMutedState;
+  },
+
+  isMuted() {
+    return !!this.isMutedState;
+  },
+
+  seek(time) {
+    if (this.audio && typeof time === 'number' && isFinite(time)) {
+      try {
+        if (this.audio.duration && isFinite(this.audio.duration)) {
+          this.audio.currentTime = time % this.audio.duration;
+        } else {
+          this.audio.currentTime = time;
+        }
+      } catch (_) {}
+    }
+  },
+
+  sync(time) {
+    if (this.audio && typeof time === 'number' && isFinite(time)) {
+      const cur = this.audio.currentTime;
+      if (Math.abs(cur - time) > 0.3) {
+        this.seek(time);
+      }
+    }
+  },
+
+  setVolume(val) {
+    const v = Math.max(0, Math.min(1, val));
+    this._userVolume = v;
+    if (this.audio) {
+      this.audio.volume = v;
+    }
+  },
+
+  getVolume() {
+    return this.audio ? this.audio.volume : this._userVolume;
+  },
+
+  getCurrentTime() {
+    return this.audio ? this.audio.currentTime : 0;
+  },
+
+  getDuration() {
+    return (this.audio && isFinite(this.audio.duration)) ? this.audio.duration : 0;
+  },
+
+  isPlaying() {
+    return !!(this.audio && !this.audio.paused && this._isPlaying);
+  },
+
+  getTrack() {
+    return this.currentTrack;
+  },
+
+  destroy() {
+    if (this.audio) {
+      try {
+        this.audio.pause();
+        this.audio.currentTime = 0;
+        this.audio.removeAttribute('src');
+      } catch (_) {}
+    }
+    this.currentTrack = null;
+    this.currentUrl = null;
+    this._isPlaying = false;
+    this._owner = null;
+  }
+};
+
+// Comprehensive media & audio cleanup for Share HUBBs (Stories)
+window.cleanupStoryMedia = function () {
+  // 1. Pause, mute, unload, and remove all Story editor and review video instances
+  const storyVideos = document.querySelectorAll(
+    '#he-media-layer video, #review-slider-wrapper video, #review-before-container video, #review-after-container video, #ch-media-preview-container video, #view-create-hubbs video, #view-review-hubbs video, #he-canvas-modal video, .story-creator-preview video'
+  );
+
+  storyVideos.forEach(v => {
+    try {
+      v.pause();
+      v.muted = true;
+      v.autoplay = false;
+      v.currentTime = 0;
+      v.removeAttribute('src');
+      v.load();
+    } catch (_) {}
+    if (v.parentNode && (v.closest('#review-before-container') || v.closest('#review-after-container') || v.closest('#he-media-layer'))) {
+      try { v.remove(); } catch (_) {}
+    }
+  });
+
+  // 2. Clear review containers DOM completely
+  const beforeC = document.getElementById('review-before-container');
+  const afterC = document.getElementById('review-after-container');
+  if (beforeC) {
+    Array.from(beforeC.children).forEach(c => {
+      if (!c.style.position || !c.style.position.includes('absolute')) c.remove();
+    });
+  }
+  if (afterC) {
+    Array.from(afterC.children).forEach(c => {
+      if (!c.style.position || !c.style.position.includes('absolute')) c.remove();
+    });
+  }
+
+  // 3. Clear canvas media layer
+  const mediaLayer = document.getElementById('he-media-layer');
+  if (mediaLayer) mediaLayer.innerHTML = '';
+
+  // 4. Destroy Story audio completely via StoryAudioManager
+  if (window.StoryAudioManager) {
+    window.StoryAudioManager.destroy();
+  }
+  if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
+    try {
+      window.HubbleEditor.GlobalAudio.stop();
+    } catch (_) {}
+  }
+};
+
+// Relative time formatting helper with live granularity
+window.formatRelativeTime = function (timestamp) {
+  if (!timestamp) return 'Just now';
+  const diffSec = Math.floor((Date.now() - timestamp) / 1000);
+  if (diffSec < 10) return 'Just now';
+  if (diffSec < 60) return `${diffSec} sec ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return diffMin === 1 ? '1 min ago' : `${diffMin} mins ago`;
+  const diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 24) return diffHours === 1 ? '1 hour ago' : `${diffHours} hours ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays === 1) return 'Yesterday';
+  if (diffDays < 7) return `${diffDays} days ago`;
+  const d = new Date(timestamp);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+};
+
+// Global state tracking
+window.currentDraftId = null;
+window.currentDraftCreatedAt = null;
+window.lastDraftSavedAt = null;
+
+// Live timestamp ticker for active view and draft cards
+window.updateLastSavedLabel = function () {
+  const subtitleEl = document.getElementById('ch-save-draft-subtitle');
+  const reviewTimeEl = document.getElementById('review-draft-time');
+  const timeStr = window.lastDraftSavedAt ? window.formatRelativeTime(window.lastDraftSavedAt) : 'Just now';
+  if (subtitleEl) {
+    subtitleEl.innerText = `Last saved: ${timeStr}`;
+  }
+  if (reviewTimeEl) {
+    reviewTimeEl.innerText = `Last saved: ${timeStr}`;
+  }
+
+  // Update live relative times on visible draft cards in sidebar and modal
+  document.querySelectorAll('.ch-draft-time[data-timestamp]').forEach(el => {
+    const ts = parseInt(el.dataset.timestamp, 10);
+    if (!isNaN(ts)) {
+      el.innerText = `Saved ${window.formatRelativeTime(ts)}`;
+    }
+  });
+  document.querySelectorAll('.see-all-draft-time[data-timestamp]').forEach(el => {
+    const ts = parseInt(el.dataset.timestamp, 10);
+    if (!isNaN(ts)) {
+      el.innerText = `Saved ${window.formatRelativeTime(ts)}`;
+    }
+  });
+};
+
+// =========================================================================
+// SHARED SERVICES: MUSIC & LOCATION (REUSED ACROSS POSTING & STORIES)
+// =========================================================================
+
+window.HubbleMusicService = {
+  previewAudio: null,
+  playingUrl: null,
+  searchCache: new Map(),
+
+  async search(query) {
+    const q = (query || '').trim();
+    if (!q) return [];
+    if (this.searchCache.has(q.toLowerCase())) {
+      return this.searchCache.get(q.toLowerCase());
+    }
+    try {
+      const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(q)}&limit=15&media=music`);
+      if (res.ok) {
+        const data = await res.json();
+        const tracks = (data.results || []).map(item => ({
+          id: String(item.trackId || Math.random()),
+          title: item.trackName || 'Unknown Title',
+          artist: item.artistName || 'Unknown Artist',
+          previewUrl: item.previewUrl || '',
+          url: item.previewUrl || '',
+          artwork: item.artworkUrl100 || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80'
+        }));
+        this.searchCache.set(q.toLowerCase(), tracks);
+        return tracks;
+      }
+    } catch (err) {
+      console.error('[HubbleMusicService Error]', err);
+    }
+    return [];
+  },
+
+  togglePreview(track, onStateChange) {
+    if (!track || !track.previewUrl) return;
+    if (this.playingUrl === track.previewUrl) {
+      this.stopPreview();
+      if (typeof onStateChange === 'function') onStateChange(null);
+    } else {
+      this.stopPreview();
+      this.previewAudio = new Audio(track.previewUrl);
+      this.playingUrl = track.previewUrl;
+      this.previewAudio.play().catch(e => console.warn('[Preview Play Notice]', e));
+      this.previewAudio.onended = () => {
+        this.playingUrl = null;
+        if (typeof onStateChange === 'function') onStateChange(null);
+      };
+      if (typeof onStateChange === 'function') onStateChange(track.previewUrl);
+    }
+  },
+
+  stopPreview() {
+    if (this.previewAudio) {
+      try {
+        this.previewAudio.pause();
+        this.previewAudio.currentTime = 0;
+        this.previewAudio = null;
+      } catch (_) {}
+    }
+    this.playingUrl = null;
+  }
+};
+
+window.HubbleLocationService = {
+  searchCache: new Map(),
+
+  async search(query) {
+    const q = (query || '').trim();
+    if (!q || q.length < 2) return [];
+    if (this.searchCache.has(q.toLowerCase())) {
+      return this.searchCache.get(q.toLowerCase());
+    }
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=8&addressdetails=1`, {
+        headers: { 'accept-language': 'en' }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const results = (data || []).map(item => {
+          const addr = item.address || {};
+          const mainName = item.name || addr.city || addr.town || addr.village || addr.suburb || item.display_name.split(',')[0] || 'Unknown Place';
+          const subParts = [];
+          if (addr.city && addr.city !== mainName) subParts.push(addr.city);
+          if (addr.state) subParts.push(addr.state);
+          if (addr.country) subParts.push(addr.country);
+          const subText = subParts.length > 0 ? subParts.join(', ') : (item.display_name || '');
+          return {
+            id: String(item.place_id || Math.random()),
+            name: mainName,
+            displayName: mainName,
+            subText: subText,
+            fullAddress: item.display_name,
+            lat: item.lat,
+            lon: item.lon,
+            type: item.type || 'place'
+          };
+        });
+        this.searchCache.set(q.toLowerCase(), results);
+        return results;
+      }
+    } catch (err) {
+      console.error('[HubbleLocationService Error]', err);
+    }
+    return [];
+  }
+};
+
+// =========================================================================
+// SHARE HUBBS (STORIES) MUSIC & LOCATION PICKER CONTROLLER
+// =========================================================================
+
+let _storyMusicSearchTimeout = null;
+let _storyLocationSearchTimeout = null;
+
+// Render attached badges in Story Creator UI
+window.renderAttachedStoryBadges = function () {
+  const container = document.getElementById('ch-attached-badges-container');
+  const musicBtn = document.getElementById('ch-tool-music-btn');
+  const locBtn = document.getElementById('ch-tool-location-btn');
+
+  const musicTrack = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack) || null;
+  const selectedLocation = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.selectedLocation) || null;
+
+  if (musicBtn) {
+    if (musicTrack) {
+      musicBtn.classList.add('active');
+      musicBtn.style.background = 'rgba(168, 85, 247, 0.25)';
+      musicBtn.style.borderColor = 'var(--primary, #a855f7)';
+      musicBtn.style.boxShadow = '0 0 12px rgba(168, 85, 247, 0.4)';
+    } else {
+      musicBtn.classList.remove('active');
+      musicBtn.style.background = 'rgba(255, 255, 255, 0.05)';
+      musicBtn.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+      musicBtn.style.boxShadow = 'none';
+    }
+  }
+
+  if (locBtn) {
+    if (selectedLocation) {
+      locBtn.classList.add('active');
+      locBtn.style.background = 'rgba(168, 85, 247, 0.25)';
+      locBtn.style.borderColor = 'var(--primary, #a855f7)';
+      locBtn.style.boxShadow = '0 0 12px rgba(168, 85, 247, 0.4)';
+    } else {
+      locBtn.classList.remove('active');
+      locBtn.style.background = 'rgba(255, 255, 255, 0.05)';
+      locBtn.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+      locBtn.style.boxShadow = 'none';
+    }
+  }
+
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (musicTrack) {
+    const badge = document.createElement('div');
+    badge.className = 'ch-attached-badge';
+    badge.style.cssText = 'display: flex; align-items: center; justify-content: space-between; background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 12px; padding: 6px 12px; animation: fadeIn 0.2s ease-out;';
+    badge.innerHTML = `
+      <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+        <img src="${musicTrack.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80'}" style="width: 22px; height: 22px; border-radius: 50%; object-fit: cover;" alt="Artwork" />
+        <div style="min-width: 0;">
+          <div style="font-size: 11px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">🎵 ${musicTrack.title}</div>
+          <div style="font-size: 9px; color: rgba(255,255,255,0.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${musicTrack.artist}</div>
+        </div>
+      </div>
+      <button type="button" onclick="window.removeStoryMusic();" style="background: none; border: none; color: rgba(255,255,255,0.6); cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1;" title="Remove Music">✕</button>
+    `;
+    container.appendChild(badge);
+  }
+
+  if (selectedLocation) {
+    const locName = selectedLocation.displayName || selectedLocation.name || 'Selected Location';
+    const locSub = selectedLocation.subText || '';
+    const badge = document.createElement('div');
+    badge.className = 'ch-attached-badge';
+    badge.style.cssText = 'display: flex; align-items: center; justify-content: space-between; background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 12px; padding: 6px 12px; animation: fadeIn 0.2s ease-out;';
+    badge.innerHTML = `
+      <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+        <span style="display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: rgba(168,85,247,0.25); color: var(--primary, #a855f7); font-size: 11px;">📍</span>
+        <div style="min-width: 0;">
+          <div style="font-size: 11px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${locName}</div>
+          ${locSub ? `<div style="font-size: 9px; color: rgba(255,255,255,0.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${locSub}</div>` : ''}
+        </div>
+      </div>
+      <button type="button" onclick="window.removeStoryLocation();" style="background: none; border: none; color: rgba(255,255,255,0.6); cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1;" title="Remove Location">✕</button>
+    `;
+    container.appendChild(badge);
+  }
+};
+
+// --- MUSIC PICKER IMPLEMENTATION ---
+window.openStoryMusicPicker = function () {
+  const modal = document.getElementById('ch-music-picker-modal');
+  if (!modal) return;
+
+  const currentTrack = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack) || null;
+  const indicator = document.getElementById('ch-music-selected-indicator');
+  const imgEl = document.getElementById('ch-music-selected-img');
+  const titleEl = document.getElementById('ch-music-selected-title');
+  const artistEl = document.getElementById('ch-music-selected-artist');
+
+  if (currentTrack && indicator && imgEl && titleEl && artistEl) {
+    imgEl.src = currentTrack.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80';
+    titleEl.textContent = currentTrack.title;
+    artistEl.textContent = currentTrack.artist;
+    indicator.style.display = 'flex';
+  } else if (indicator) {
+    indicator.style.display = 'none';
+  }
+
+  modal.style.display = 'flex';
+  modal.style.opacity = '1';
+  modal.style.visibility = 'visible';
+  modal.style.pointerEvents = 'auto';
+  modal.classList.add('active');
+
+  const searchInput = document.getElementById('ch-music-search-input');
+  if (searchInput) {
+    if (!searchInput.value.trim()) {
+      searchInput.value = 'Trending';
+      window.searchStoryMusic('Trending');
+    } else {
+      window.searchStoryMusic(searchInput.value.trim());
+    }
+    setTimeout(() => searchInput.focus(), 50);
+  }
+};
+
+window.closeStoryMusicPicker = function () {
+  if (window.HubbleMusicService && window.HubbleMusicService.stopPreview) {
+    window.HubbleMusicService.stopPreview();
+  }
+  const modal = document.getElementById('ch-music-picker-modal');
+  if (modal) {
+    modal.classList.remove('active');
+    modal.style.display = 'none';
+    modal.style.opacity = '0';
+    modal.style.visibility = 'hidden';
+    modal.style.pointerEvents = 'none';
+  }
+};
+
+window.openMusicPicker = window.openStoryMusicPicker;
+window.closeMusicPicker = window.closeStoryMusicPicker;
+
+window.handleStoryMusicInput = function (query) {
+  if (_storyMusicSearchTimeout) clearTimeout(_storyMusicSearchTimeout);
+  _storyMusicSearchTimeout = setTimeout(() => {
+    window.searchStoryMusic(query);
+  }, 350);
+};
+
+window.setStoryMusicGenre = function (genre) {
+  const input = document.getElementById('ch-music-search-input');
+  if (input) input.value = genre;
+  window.searchStoryMusic(genre);
+};
+
+window.searchStoryMusic = async function (query) {
+  const resultsContainer = document.getElementById('ch-music-results-list');
+  if (!resultsContainer) return;
+
+  const q = (query || '').trim();
+  if (!q) {
+    resultsContainer.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 20px;">Type a song or artist to search...</div>';
+    return;
+  }
+
+  resultsContainer.innerHTML = '<div style="display: flex; align-items: center; justify-content: center; padding: 24px; color: var(--text-muted); gap: 8px; font-size: 11px;"><div class="hubble-spinner" style="width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.1); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite;"></div> Searching iTunes...</div>';
+
+  const tracks = await window.HubbleMusicService.search(q);
+  if (!tracks || tracks.length === 0) {
+    resultsContainer.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 20px;">No tracks found for "' + q.replace(/</g, '&lt;') + '". Try another search!</div>';
+    return;
+  }
+
+  const currentSelectedId = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack && window.HubbleEditor.state.musicTrack.id) || null;
+
+  resultsContainer.innerHTML = '';
+  tracks.forEach(t => {
+    const isSelected = String(currentSelectedId) === String(t.id);
+    const item = document.createElement('div');
+    item.style.cssText = `display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 12px; background: ${isSelected ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.04)'}; border: 1px solid ${isSelected ? 'rgba(168,85,247,0.4)' : 'rgba(255,255,255,0.08)'}; transition: all 0.2s; box-sizing: border-box;`;
+    
+    item.innerHTML = `
+      <img src="${t.artwork}" style="width: 36px; height: 36px; border-radius: 8px; object-fit: cover; flex-shrink: 0;" alt="Cover" />
+      <div style="flex: 1; min-width: 0; text-align: left;">
+        <div style="font-size: 12px; font-weight: 700; color: var(--text-main, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${t.title}</div>
+        <div style="font-size: 10px; color: var(--text-muted, rgba(255,255,255,0.6)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px;">${t.artist}</div>
+      </div>
+      <div style="display: flex; gap: 6px; align-items: center; flex-shrink: 0;">
+        <button type="button" class="story-music-preview-btn" style="background: rgba(255,255,255,0.08); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 11px;">▶</button>
+        <button type="button" class="story-music-select-btn" style="padding: 5px 12px; border-radius: 8px; background: ${isSelected ? 'var(--primary, #a855f7)' : 'linear-gradient(135deg, var(--primary, #a855f7) 0%, #7e22ce 100%)'}; color: white; border: none; font-size: 10px; font-weight: 700; cursor: pointer;">${isSelected ? 'Selected' : 'Select'}</button>
+      </div>
+    `;
+
+    const previewBtn = item.querySelector('.story-music-preview-btn');
+    previewBtn.onclick = (e) => {
+      e.stopPropagation();
+      window.HubbleMusicService.togglePreview(t, (activeUrl) => {
+        document.querySelectorAll('.story-music-preview-btn').forEach(btn => btn.innerText = '▶');
+        if (activeUrl === t.previewUrl) previewBtn.innerText = '⏸';
+      });
+    };
+
+    const selectBtn = item.querySelector('.story-music-select-btn');
+    selectBtn.onclick = (e) => {
+      e.stopPropagation();
+      window.selectStoryMusic(t);
+    };
+
+    item.onclick = () => window.selectStoryMusic(t);
+    resultsContainer.appendChild(item);
+  });
+};
+
+window.selectStoryMusic = function (track) {
+  if (window.HubbleMusicService && window.HubbleMusicService.stopPreview) {
+    window.HubbleMusicService.stopPreview();
+  }
+
+  if (window.StoryAudioManager) {
+    window.StoryAudioManager.load(track, 'editor');
+    if (!track.isMuted) {
+      window.StoryAudioManager.play('editor');
+    }
+  }
+
+  if (window.HubbleEditor) {
+    window.HubbleEditor.state.musicTrack = track;
+    if (!window.HubbleEditor.state.layers) window.HubbleEditor.state.layers = [];
+    // Remove existing music layer if present
+    window.HubbleEditor.state.layers = window.HubbleEditor.state.layers.filter(l => l.type !== 'music');
+    // Add Instagram-style Music sticker layer
+    window.HubbleEditor.state.layers.push({
+      id: 'music_sticker_' + Date.now(),
+      type: 'music',
+      track: track,
+      content: track.title,
+      artist: track.artist,
+      artwork: track.artwork,
+      isMuted: !!track.isMuted,
+      x: 50,
+      y: 72,
+      rotation: 0,
+      scale: 1,
+      zIndex: window.HubbleEditor.state.layers.length + 20,
+      styles: {}
+    });
+
+    if (typeof window.HubbleEditor.updateRender === 'function') {
+      window.HubbleEditor.updateRender();
+    }
+  }
+  if (window.chUploads && window.chUploads.length > 0) {
+    const idx = (window.HubbleEditor && window.HubbleEditor.activeMediaIndex) || 0;
+    if (window.chUploads[idx]) {
+      if (!window.chUploads[idx].editorState) window.chUploads[idx].editorState = {};
+      window.chUploads[idx].editorState.musicTrack = track;
+      window.chUploads[idx].editorState.layers = window.HubbleEditor ? JSON.parse(JSON.stringify(window.HubbleEditor.state.layers)) : [];
+    }
+  }
+  window.closeStoryMusicPicker();
+  window.renderAttachedStoryBadges();
+  if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+  if (window.showToast) window.showToast(`Music attached: ${track.title} 🎵`);
+};
+
+window.removeStoryMusic = function () {
+  if (window.StoryAudioManager) {
+    window.StoryAudioManager.destroy();
+  }
+  if (window.HubbleEditor) {
+    window.HubbleEditor.state.musicTrack = null;
+    if (window.HubbleEditor.state.layers) {
+      window.HubbleEditor.state.layers = window.HubbleEditor.state.layers.filter(l => l.type !== 'music');
+    }
+    if (typeof window.HubbleEditor.updateRender === 'function') {
+      window.HubbleEditor.updateRender();
+    }
+  }
+  if (window.chUploads && window.chUploads.length > 0) {
+    const idx = (window.HubbleEditor && window.HubbleEditor.activeMediaIndex) || 0;
+    if (window.chUploads[idx] && window.chUploads[idx].editorState) {
+      window.chUploads[idx].editorState.musicTrack = null;
+      if (window.chUploads[idx].editorState.layers) {
+        window.chUploads[idx].editorState.layers = window.chUploads[idx].editorState.layers.filter(l => l.type !== 'music');
+      }
+    }
+  }
+  if (window.HubbleMusicService && window.HubbleMusicService.stopPreview) {
+    window.HubbleMusicService.stopPreview();
+  }
+  const indicator = document.getElementById('ch-music-selected-indicator');
+  if (indicator) indicator.style.display = 'none';
+  window.renderAttachedStoryBadges();
+  if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+  if (window.showToast) window.showToast('Music removed.');
+};
+
+// --- LOCATION PICKER IMPLEMENTATION ---
+window.openStoryLocationPicker = function () {
+  const modal = document.getElementById('ch-location-picker-modal');
+  if (!modal) return;
+
+  const currentLoc = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.selectedLocation) || null;
+  const indicator = document.getElementById('ch-location-selected-indicator');
+  const titleEl = document.getElementById('ch-location-selected-title');
+  const subEl = document.getElementById('ch-location-selected-sub');
+
+  if (currentLoc && indicator && titleEl) {
+    titleEl.textContent = currentLoc.displayName || currentLoc.name;
+    if (subEl) subEl.textContent = currentLoc.subText || '';
+    indicator.style.display = 'flex';
+  } else if (indicator) {
+    indicator.style.display = 'none';
+  }
+
+  modal.style.display = 'flex';
+  modal.style.opacity = '1';
+  modal.style.visibility = 'visible';
+  modal.style.pointerEvents = 'auto';
+  modal.classList.add('active');
+
+  const searchInput = document.getElementById('ch-location-search-input');
+  if (searchInput) {
+    if (!searchInput.value.trim()) {
+      searchInput.value = 'Hyderabad';
+      window.searchStoryLocation('Hyderabad');
+    } else {
+      window.searchStoryLocation(searchInput.value.trim());
+    }
+    setTimeout(() => searchInput.focus(), 50);
+  }
+};
+
+window.closeStoryLocationPicker = function () {
+  const modal = document.getElementById('ch-location-picker-modal');
+  if (modal) {
+    modal.classList.remove('active');
+    modal.style.display = 'none';
+    modal.style.opacity = '0';
+    modal.style.visibility = 'hidden';
+    modal.style.pointerEvents = 'none';
+  }
+};
+
+window.openLocationPicker = window.openStoryLocationPicker;
+window.closeLocationPicker = window.closeStoryLocationPicker;
+
+window.handleStoryLocationInput = function (query) {
+  if (_storyLocationSearchTimeout) clearTimeout(_storyLocationSearchTimeout);
+  _storyLocationSearchTimeout = setTimeout(() => {
+    window.searchStoryLocation(query);
+  }, 350);
+};
+
+window.setStoryLocationPreset = function (placeName) {
+  const input = document.getElementById('ch-location-search-input');
+  if (input) input.value = placeName;
+  window.searchStoryLocation(placeName);
+};
+
+window.searchStoryLocation = async function (query) {
+  const resultsContainer = document.getElementById('ch-location-results-list');
+  if (!resultsContainer) return;
+
+  const q = (query || '').trim();
+  if (!q) {
+    resultsContainer.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 20px;">Type a location to search...</div>';
+    return;
+  }
+
+  resultsContainer.innerHTML = '<div style="display: flex; align-items: center; justify-content: center; padding: 24px; color: var(--text-muted); gap: 8px; font-size: 11px;"><div class="hubble-spinner" style="width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.1); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite;"></div> Searching OpenStreetMap...</div>';
+
+  const places = await window.HubbleLocationService.search(q);
+  if (!places || places.length === 0) {
+    resultsContainer.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 20px;">No locations found for "' + q.replace(/</g, '&lt;') + '". Try another location!</div>';
+    return;
+  }
+
+  const currentSelectedId = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.selectedLocation && window.HubbleEditor.state.selectedLocation.id) || null;
+
+  resultsContainer.innerHTML = '';
+  places.forEach(p => {
+    const isSelected = String(currentSelectedId) === String(p.id);
+    const item = document.createElement('div');
+    item.style.cssText = `display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 12px; background: ${isSelected ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.04)'}; border: 1px solid ${isSelected ? 'rgba(168,85,247,0.4)' : 'rgba(255,255,255,0.08)'}; cursor: pointer; transition: all 0.2s; box-sizing: border-box; text-align: left;`;
+    
+    item.innerHTML = `
+      <div style="width: 30px; height: 30px; border-radius: 50%; background: rgba(168,85,247,0.2); color: var(--primary, #a855f7); display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 13px;">📍</div>
+      <div style="flex: 1; min-width: 0;">
+        <div style="font-size: 12px; font-weight: 700; color: var(--text-main, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${p.displayName || p.name}</div>
+        ${p.subText ? `<div style="font-size: 10px; color: var(--text-muted, rgba(255,255,255,0.6)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px;">${p.subText}</div>` : ''}
+      </div>
+      <button type="button" style="padding: 5px 12px; border-radius: 8px; background: ${isSelected ? 'var(--primary, #a855f7)' : 'linear-gradient(135deg, var(--primary, #a855f7) 0%, #7e22ce 100%)'}; color: white; border: none; font-size: 10px; font-weight: 700; cursor: pointer; flex-shrink: 0;">${isSelected ? 'Selected' : 'Select'}</button>
+    `;
+
+    item.onclick = () => window.selectStoryLocation(p);
+    resultsContainer.appendChild(item);
+  });
+};
+
+window.selectStoryLocation = function (loc) {
+  if (window.HubbleEditor) {
+    window.HubbleEditor.state.selectedLocation = loc;
+    if (!window.HubbleEditor.state.layers) window.HubbleEditor.state.layers = [];
+    // Remove existing location layer if present
+    window.HubbleEditor.state.layers = window.HubbleEditor.state.layers.filter(l => l.type !== 'location');
+    // Add Instagram-style Location sticker layer
+    window.HubbleEditor.state.layers.push({
+      id: 'location_sticker_' + Date.now(),
+      type: 'location',
+      loc: loc,
+      content: loc.displayName || loc.name,
+      x: 50,
+      y: 25,
+      rotation: 0,
+      scale: 1,
+      zIndex: window.HubbleEditor.state.layers.length + 20,
+      styles: {}
+    });
+    if (typeof window.HubbleEditor.updateRender === 'function') {
+      window.HubbleEditor.updateRender();
+    }
+  }
+  if (window.chUploads && window.chUploads.length > 0) {
+    const idx = (window.HubbleEditor && window.HubbleEditor.activeMediaIndex) || 0;
+    if (window.chUploads[idx]) {
+      if (!window.chUploads[idx].editorState) window.chUploads[idx].editorState = {};
+      window.chUploads[idx].editorState.selectedLocation = loc;
+      window.chUploads[idx].editorState.layers = window.HubbleEditor ? JSON.parse(JSON.stringify(window.HubbleEditor.state.layers)) : [];
+    }
+  }
+  window.closeStoryLocationPicker();
+  window.renderAttachedStoryBadges();
+  if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+  if (window.showToast) window.showToast(`Location attached: ${loc.displayName || loc.name} 📍`);
+};
+
+window.removeStoryLocation = function () {
+  if (window.HubbleEditor) {
+    window.HubbleEditor.state.selectedLocation = null;
+    if (window.HubbleEditor.state.layers) {
+      window.HubbleEditor.state.layers = window.HubbleEditor.state.layers.filter(l => l.type !== 'location');
+    }
+    if (typeof window.HubbleEditor.updateRender === 'function') {
+      window.HubbleEditor.updateRender();
+    }
+  }
+  if (window.chUploads && window.chUploads.length > 0) {
+    const idx = (window.HubbleEditor && window.HubbleEditor.activeMediaIndex) || 0;
+    if (window.chUploads[idx] && window.chUploads[idx].editorState) {
+      window.chUploads[idx].editorState.selectedLocation = null;
+      if (window.chUploads[idx].editorState.layers) {
+        window.chUploads[idx].editorState.layers = window.chUploads[idx].editorState.layers.filter(l => l.type !== 'location');
+      }
+    }
+  }
+  const indicator = document.getElementById('ch-location-selected-indicator');
+  if (indicator) indicator.style.display = 'none';
+  window.renderAttachedStoryBadges();
+  if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+  if (window.showToast) window.showToast('Location removed.');
+};
+
 // --- INDEXEDDB DRAFTS WRAPPER ---
 const DraftsDB = {
   dbName: 'HiHubbleDrafts',
   dbVersion: 1,
   storeName: 'drafts',
-  init() {
+  _db: null,
+  async init() {
+    if (this._db) return this._db;
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, this.dbVersion);
       request.onupgradeneeded = (e) => {
@@ -80,7 +1475,10 @@ const DraftsDB = {
           db.createObjectStore(this.storeName, { keyPath: 'id' });
         }
       };
-      request.onsuccess = (e) => resolve(e.target.result);
+      request.onsuccess = (e) => {
+        this._db = e.target.result;
+        resolve(this._db);
+      };
       request.onerror = (e) => reject(e.target.error);
     });
   },
@@ -90,8 +1488,9 @@ const DraftsDB = {
       const tx = db.transaction(this.storeName, 'readwrite');
       const store = tx.objectStore(this.storeName);
       draft.lastModified = Date.now();
-      if (!draft.id) draft.id = 'draft_' + Date.now();
+      if (!draft.id) draft.id = 'draft_story_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
       if (!draft.createdAt) draft.createdAt = Date.now();
+      draft.type = 'story';
       const request = store.put(draft);
       request.onsuccess = () => resolve(draft);
       request.onerror = () => reject(request.error);
@@ -103,7 +1502,22 @@ const DraftsDB = {
       const tx = db.transaction(this.storeName, 'readonly');
       const store = tx.objectStore(this.storeName);
       const request = store.getAll();
-      request.onsuccess = () => resolve(request.result.sort((a, b) => b.lastModified - a.lastModified));
+      request.onsuccess = () => {
+        const results = (request.result || [])
+          .filter(d => !d.type || d.type === 'story')
+          .sort((a, b) => (b.lastModified || b.createdAt || 0) - (a.lastModified || a.createdAt || 0));
+        resolve(results);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  },
+  async getDraftById(id) {
+    const db = await this.init();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, 'readonly');
+      const store = tx.objectStore(this.storeName);
+      const request = store.get(id);
+      request.onsuccess = () => resolve(request.result || null);
       request.onerror = () => reject(request.error);
     });
   },
@@ -120,63 +1534,168 @@ const DraftsDB = {
 };
 window.DraftsDB = DraftsDB;
 
-// --- SAVE DRAFT ACTION ---
-window.saveCurrentDraft = async function () {
-  if (!window.chUploads || window.chUploads.length === 0) {
-    showToast('Please upload media first');
-    return;
+// Helper to generate a lightweight dataUrl thumbnail for persistent storage
+async function generateDraftThumbnail(item) {
+  if (!item) return '';
+  if (item.type && item.type.startsWith('video/')) {
+    return item.thumbUrl || '';
   }
-  const media = window.chUploads[0];
+  if (item.thumbUrl && item.thumbUrl.startsWith('data:')) {
+    return item.thumbUrl;
+  }
+  try {
+    const img = new Image();
+    img.crossOrigin = 'Anonymous';
+    let src = item.thumbUrl;
+    if (!src && item.file) {
+      src = URL.createObjectURL(item.file);
+    }
+    if (!src) return '';
+    img.src = src;
+    await new Promise((resolve) => {
+      if (img.complete && img.naturalWidth) return resolve();
+      img.onload = resolve;
+      img.onerror = () => resolve();
+    });
+    if (!img.naturalWidth) return item.thumbUrl || '';
+    const canvas = document.createElement('canvas');
+    const maxSize = 160;
+    let w = img.naturalWidth || 100;
+    let h = img.naturalHeight || 100;
+    if (w > h) {
+      if (w > maxSize) { h = Math.round(h * (maxSize / w)); w = maxSize; }
+    } else {
+      if (h > maxSize) { w = Math.round(w * (maxSize / h)); h = maxSize; }
+    }
+    canvas.width = Math.max(30, w);
+    canvas.height = Math.max(30, h);
+    const ctx = canvas.getContext('2d');
+    if (item.editorState && window.HubbleEditor && window.HubbleEditor.buildCSSFilterString) {
+      ctx.filter = window.HubbleEditor.buildCSSFilterString(item.editorState.filter, item.editorState.adjustments || {});
+    }
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.85);
+  } catch (_) {
+    return item.thumbUrl || '';
+  }
+}
 
-  // We must read the file into a base64 string or blob to store in IndexedDB.
-  // IndexedDB can store Blobs natively!
+// --- SAVE DRAFT ACTION ---
+window.saveCurrentDraft = async function (silent = false) {
+  const captionEl = document.getElementById('ch-caption-input') || document.querySelector('.ch-caption-input');
+  const captionVal = captionEl ? captionEl.value.trim() : '';
+
+  if ((!window.chUploads || window.chUploads.length === 0) && !captionVal) {
+    if (!silent) showToast('Please upload media or add a caption first.');
+    return null;
+  }
+
+  // Ensure current active HubbleEditor state is synced to the active media item
+  if (window.HubbleEditor && window.chUploads && window.chUploads[window.HubbleEditor.activeMediaIndex || 0]) {
+    const activeMedia = window.chUploads[window.HubbleEditor.activeMediaIndex || 0];
+    activeMedia.editorState = JSON.parse(JSON.stringify(window.HubbleEditor.state));
+    activeMedia.isMuted = !!window.HubbleEditor.state.isMuted;
+  }
+
+  const primaryItem = window.chUploads && window.chUploads[0];
+  let primaryThumb = '';
+  if (primaryItem) {
+    primaryThumb = await generateDraftThumbnail(primaryItem);
+  }
+
+  const mediaItemsToSave = await Promise.all((window.chUploads || []).map(async (m) => {
+    let itemThumb = m.thumbUrl;
+    if (m.type && !m.type.startsWith('video/')) {
+      const generated = await generateDraftThumbnail(m);
+      if (generated) itemThumb = generated;
+    }
+    const isItemMuted = !!(m.isMuted || (m.editorState && m.editorState.isMuted) || (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.isMuted));
+    return {
+      file: m.file, // Blob or File object stored directly in IndexedDB
+      type: m.type || 'image/jpeg',
+      thumbDataUrl: itemThumb,
+      thumbUrl: itemThumb,
+      duration: m.duration || 0,
+      originalWidth: m.originalWidth || 1000,
+      originalHeight: m.originalHeight || 1000,
+      name: m.name || 'media',
+      size: m.size || 0,
+      isMuted: isItemMuted,
+      editorState: m.editorState ? { ...JSON.parse(JSON.stringify(m.editorState)), isMuted: isItemMuted } : {
+        filter: 'original', rotation: 0, zoom: 1, panX: 0, panY: 0,
+        adjustments: { brightness: 100, contrast: 100, exposure: 100, highlights: 100, shadows: 100, temperature: 0, tint: 0, saturation: 100, vibrance: 100, sharpness: 0, blur: 0, opacity: 100 },
+        crop: null, layers: [], isMuted: isItemMuted, musicTrack: null, selectedLocation: null
+      }
+    };
+  }));
+
+  const draftTitle = captionVal || (primaryItem ? (primaryItem.name || 'HUBB Draft') : 'Untitled HUBB');
+
   const draft = {
-    mediaFile: media.file,
-    mediaType: media.type,
-    mediaThumbUrl: media.thumbUrl,
-    editorState: JSON.parse(JSON.stringify(window.HubbleEditor.state)),
-    caption: document.querySelector('.ch-caption-input')?.value || '',
-    collaborationEnabled: window.collaborationEnabled !== false,
-    collaborators: window.selectedCollaborators ? JSON.parse(JSON.stringify(window.selectedCollaborators)) : [],
+    id: window.currentDraftId || ('draft_story_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6)),
+    type: 'story',
+    title: draftTitle,
+    caption: captionVal,
+    thumbDataUrl: primaryThumb,
+    mediaThumbUrl: primaryThumb,
+    mediaFile: primaryItem ? primaryItem.file : null,
+    mediaType: primaryItem ? primaryItem.type : 'image',
+    mediaItems: mediaItemsToSave,
+    mediaCount: mediaItemsToSave.length,
+    editorState: window.HubbleEditor ? JSON.parse(JSON.stringify(window.HubbleEditor.state)) : null,
+    activeLayout: (window.HubbleEditor && window.HubbleEditor.activeLayout) || 'original',
+    activeMediaIndex: (window.HubbleEditor && window.HubbleEditor.activeMediaIndex) || 0,
     scheduleEnabled: document.getElementById('ch-schedule-toggle')?.checked || false,
     scheduleDate: document.getElementById('ch-schedule-date')?.value || '',
-    scheduleTime: document.getElementById('ch-schedule-time')?.value || ''
+    scheduleTime: document.getElementById('ch-schedule-time')?.value || '',
+    createdAt: window.currentDraftCreatedAt || Date.now(),
+    lastModified: Date.now()
   };
 
-  // Check if we are editing an existing draft
-  if (window.currentDraftId) {
-    draft.id = window.currentDraftId;
-    draft.createdAt = window.currentDraftCreatedAt;
-  }
+  window.currentDraftId = draft.id;
+  window.currentDraftCreatedAt = draft.createdAt;
+  window.lastDraftSavedAt = draft.lastModified;
 
   try {
     await DraftsDB.saveDraft(draft);
-    if (!window._silentDraftSave) {
+    if (!silent && !window._silentDraftSave) {
       showToast('Saved as draft! 📝');
     }
     window._silentDraftSave = false;
-    window.renderDraftsList();
+    window.updateLastSavedLabel();
+    await window.renderDraftsList();
+    if (document.getElementById('story-drafts-modal')?.classList.contains('active')) {
+      const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+      await window.renderSeeAllDrafts(searchVal);
+    }
+    window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'save', draftId: draft.id } }));
+    return draft;
   } catch (err) {
-    console.error(err);
-    if (!window._silentDraftSave) {
-      showToast('Failed to save draft');
+    console.error('Failed to save draft:', err);
+    if (!silent && !window._silentDraftSave) {
+      showToast('Failed to save draft. Please try again.');
     }
     window._silentDraftSave = false;
+    return null;
   }
 };
 
 window.renderDraftsList = async function () {
   const list = document.getElementById('ch-drafts-list');
-  const hddList = document.getElementById('hdd-list');
   const countLabel = document.getElementById('drafts-count');
   const emptyState = document.getElementById('drafts-empty-state');
-  const hddEmptyState = document.getElementById('hdd-empty-state');
   const seeAllBtn = document.getElementById('see-all-drafts-btn');
+  const hddList = document.getElementById('hdd-list');
+  const hddEmptyState = document.getElementById('hdd-empty-state');
 
   const drafts = await DraftsDB.getDrafts();
-  if (countLabel) countLabel.innerText = drafts.length;
+  const totalCount = drafts.length;
 
-  // Clear both lists (except empty states)
+  if (countLabel) countLabel.innerText = totalCount;
+  const seeAllBadge = document.getElementById('see-all-drafts-count-badge');
+  if (seeAllBadge) seeAllBadge.innerText = totalCount;
+
+  // Clear sidebar list (except empty state)
   if (list) {
     Array.from(list.children).forEach(child => {
       if (child.id !== 'drafts-empty-state') child.remove();
@@ -188,7 +1707,7 @@ window.renderDraftsList = async function () {
     });
   }
 
-  if (drafts.length === 0) {
+  if (totalCount === 0) {
     if (emptyState) emptyState.style.display = 'flex';
     if (hddEmptyState) hddEmptyState.style.display = 'flex';
     if (seeAllBtn) seeAllBtn.style.display = 'none';
@@ -197,30 +1716,43 @@ window.renderDraftsList = async function () {
     if (hddEmptyState) hddEmptyState.style.display = 'none';
     if (seeAllBtn) seeAllBtn.style.display = 'block';
 
-    drafts.slice(0, 3).forEach(d => {
-      const timeAgo = Math.round((Date.now() - d.lastModified) / 60000); // mins
-      const timeStr = timeAgo < 60 ? `${timeAgo}m ago` : `${Math.round(timeAgo / 60)}h ago`;
-      const title = d.caption || 'Untitled HUBB';
-      const imgUrl = d.mediaThumbUrl || URL.createObjectURL(d.mediaFile);
+    // Render newest 4 drafts in sidebar
+    drafts.slice(0, 4).forEach(d => {
+      const timeStr = window.formatRelativeTime(d.lastModified || d.createdAt);
+      const title = d.caption || d.title || 'Untitled HUBB';
+      const imgUrl = d.thumbDataUrl || d.mediaThumbUrl || (d.mediaFile ? URL.createObjectURL(d.mediaFile) : '');
+      const mediaCount = (d.mediaItems && d.mediaItems.length) || (d.mediaCount || 1);
+      const isVideo = (d.mediaType && d.mediaType.startsWith('video')) || (d.mediaItems && d.mediaItems[0] && d.mediaItems[0].type && d.mediaItems[0].type.startsWith('video'));
 
-      // Share HUBBs Panel Item
+      // Sidebar item in Create Hubbs view
       if (list) {
         const item = document.createElement('div');
         item.className = 'ch-draft-item';
-        item.style.cssText = 'display:flex; justify-content:space-between; align-items:center; background: rgba(255,255,255,0.03); padding: 8px; border-radius: 12px; transition: all 0.2s ease;';
+        item.style.cssText = 'display:flex; justify-content:space-between; align-items:center; background: rgba(255,255,255,0.03); padding: 10px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.06); cursor: pointer; transition: all 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; overflow: hidden;';
+        item.onmouseover = () => { item.style.background = 'rgba(255,255,255,0.07)'; item.style.borderColor = 'rgba(168,85,247,0.3)'; item.style.transform = 'translateY(-1px)'; };
+        item.onmouseout = () => { item.style.background = 'rgba(255,255,255,0.03)'; item.style.borderColor = 'rgba(255,255,255,0.06)'; item.style.transform = 'none'; };
+        item.onclick = (e) => {
+          if (e.target.closest('button')) return;
+          window.loadDraft(d.id);
+        };
+
         item.innerHTML = `
-            <div style="display:flex; gap:10px; align-items:center; cursor:pointer;" onclick="window.loadDraft('${d.id}')">
-              <img src="${imgUrl}" style="width:40px; height:40px; border-radius:8px; object-fit:contain; object-position:center;" alt="Draft">
-              <div class="ch-draft-info">
-                <div class="ch-draft-title" style="font-weight:600; font-size:0.85rem; max-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-main);">${title}</div>
-                <div class="ch-draft-time" style="color:var(--text-muted); font-size:0.75rem;">${timeStr}</div>
-              </div>
+          <div style="display:flex; gap:10px; align-items:center; min-width:0; flex:1; overflow:hidden;">
+            <div style="position:relative; width:44px; height:44px; flex-shrink:0; border-radius:10px; overflow:hidden; background:#111; border: 1px solid rgba(255,255,255,0.1);">
+              ${imgUrl ? `<img src="${imgUrl}" style="width:100%; height:100%; object-fit:cover;" alt="Thumbnail">` : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:var(--text-muted);"><i data-lucide="image" style="width:20px; height:20px;"></i></div>`}
+              ${mediaCount > 1 ? `<div style="position:absolute; bottom:2px; right:2px; background:var(--primary); color:white; font-size:0.55rem; font-weight:700; padding:1px 4px; border-radius:6px; line-height:1.1;">${mediaCount}</div>` : ''}
+              ${isVideo ? `<div style="position:absolute; top:2px; left:2px; background:rgba(0,0,0,0.6); color:white; font-size:0.5rem; padding:1px 3px; border-radius:4px;"><i data-lucide="video" style="width:8px; height:8px;"></i></div>` : ''}
             </div>
-            <div style="display: flex; gap: 4px;">
-              <button onclick="window.duplicateDraft('${d.id}')" style="background:transparent; border:none; color:var(--text-main); padding:4px; cursor:pointer; opacity: 0.6; transition: opacity 0.2s;"><i data-lucide="copy" style="width:14px; height:14px;"></i></button>
-              <button onclick="window.deleteDraft('${d.id}')" style="background:transparent; border:none; color: #ef4444; padding:4px; cursor:pointer; opacity: 0.6; transition: opacity 0.2s;"><i data-lucide="trash-2" style="width:14px; height:14px;"></i></button>
+            <div class="ch-draft-info" style="min-width:0; flex:1; overflow:hidden;">
+              <div class="ch-draft-title" style="font-weight:600; font-size:0.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text-main); max-width:100%;">${title}</div>
+              <div class="ch-draft-time" data-timestamp="${d.lastModified || d.createdAt}" style="color:var(--text-muted); font-size:0.75rem; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;">Saved ${timeStr}</div>
             </div>
-          `;
+          </div>
+          <div style="display:flex; gap:4px; flex-shrink:0; margin-left:6px;">
+            <button title="Duplicate Draft" onclick="window.duplicateDraft('${d.id}', event)" style="background:transparent; border:none; color:var(--text-muted); padding:6px; border-radius:6px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:color 0.2s;" onmouseover="this.style.color='var(--text-main)'" onmouseout="this.style.color='var(--text-muted)'"><i data-lucide="copy" style="width:14px; height:14px;"></i></button>
+            <button title="Delete Draft" onclick="window.deleteDraft('${d.id}', event)" style="background:transparent; border:none; color:#ef4444; padding:6px; border-radius:6px; cursor:pointer; opacity:0.8; display:flex; align-items:center; justify-content:center; transition:opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.8'"><i data-lucide="trash-2" style="width:14px; height:14px;"></i></button>
+          </div>
+        `;
         list.appendChild(item);
       }
 
@@ -228,102 +1760,328 @@ window.renderDraftsList = async function () {
       if (hddList) {
         const hItem = document.createElement('div');
         hItem.className = 'ch-draft-item';
-        hItem.style.cssText = 'display:flex; justify-content:space-between; align-items:center; background: rgba(255,255,255,0.03); padding: 8px; border-radius: 12px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s ease; border: 1px solid transparent;';
+        hItem.style.cssText = 'display:flex; justify-content:space-between; align-items:center; background: rgba(255,255,255,0.03); padding: 10px; border-radius: 12px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s ease; border: 1px solid transparent; box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; overflow: hidden;';
         hItem.onclick = (e) => {
-          if (e.target.closest('button')) return; // Don't trigger load if clicking delete/duplicate
+          if (e.target.closest('button')) return;
           document.getElementById('home-drafts-panel')?.classList.remove('open');
           window.loadDraft(d.id);
         };
         hItem.onmouseover = () => { hItem.style.transform = 'translateY(-2px)'; hItem.style.background = 'rgba(255,255,255,0.08)'; hItem.style.borderColor = 'rgba(168, 85, 247, 0.3)'; };
         hItem.onmouseout = () => { hItem.style.transform = 'none'; hItem.style.background = 'rgba(255,255,255,0.03)'; hItem.style.borderColor = 'transparent'; };
-        const mediaCount = window.chUploads ? window.chUploads.length : 1;
         hItem.innerHTML = `
-            <div style="display:flex; gap:12px; align-items:center;">
-              <div style="position: relative;">
-                <img src="${imgUrl}" style="width:48px; height:48px; border-radius:10px; object-fit:cover; object-position:center; box-shadow: 0 4px 12px rgba(0,0,0,0.3);" alt="Draft">
-                <div style="position: absolute; bottom: -4px; right: -4px; background: var(--primary); color: white; font-size: 0.6rem; font-weight: bold; padding: 2px 6px; border-radius: 10px; border: 2px solid rgba(20,20,25,1);">${mediaCount}</div>
-              </div>
-              <div class="ch-draft-info">
-                <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 2px;">
-                  <div class="ch-draft-title" style="font-weight:600; font-size:0.9rem; max-width: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-main);">${title}</div>
-                  <span style="font-size: 0.6rem; background: rgba(255,255,255,0.1); color: var(--text-muted); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.05);">Draft</span>
-                </div>
-                <div class="ch-draft-time" style="color:var(--text-muted); font-size:0.75rem;">Saved ${timeStr}</div>
-              </div>
+          <div style="display:flex; gap:12px; align-items:center; min-width:0; flex:1; overflow:hidden;">
+            <div style="position: relative; width:48px; height:48px; flex-shrink:0; border-radius:10px; overflow:hidden;">
+              <img src="${imgUrl}" style="width:100%; height:100%; object-fit:cover;" alt="Draft">
+              ${mediaCount > 1 ? `<div style="position: absolute; bottom: 0; right: 0; background: var(--primary); color: white; font-size: 0.6rem; font-weight: bold; padding: 2px 5px; border-radius: 6px;">${mediaCount}</div>` : ''}
             </div>
-            <div style="display: flex; gap: 4px;">
-              <button onclick="window.deleteDraft('${d.id}')" style="background:transparent; border:none; color: #ef4444; padding:8px; cursor:pointer; opacity: 0.8; transition: transform 0.2s;"><i data-lucide="trash-2" style="width:16px; height:16px;"></i></button>
+            <div class="ch-draft-info" style="min-width:0; flex:1; overflow:hidden;">
+              <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 2px;">
+                <div class="ch-draft-title" style="font-weight:600; font-size:0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-main); max-width: 100%;">${title}</div>
+                <span style="font-size: 0.6rem; background: rgba(255,255,255,0.1); color: var(--text-muted); padding: 2px 6px; border-radius: 4px; flex-shrink: 0;">HUBB</span>
+              </div>
+              <div class="ch-draft-time" data-timestamp="${d.lastModified || d.createdAt}" style="color:var(--text-muted); font-size:0.75rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Saved ${timeStr}</div>
             </div>
-          `;
+          </div>
+          <div style="display: flex; gap: 4px; flex-shrink: 0; margin-left: 6px;">
+            <button onclick="window.deleteDraft('${d.id}', event)" style="background:transparent; border:none; color: #ef4444; padding:8px; cursor:pointer; opacity: 0.8; transition: transform 0.2s;"><i data-lucide="trash-2" style="width:16px; height:16px;"></i></button>
+          </div>
+        `;
         hddList.appendChild(hItem);
       }
     });
-    if (window.lucide) window.lucide.createIcons();
   }
+
+  if (window.lucide) window.lucide.createIcons();
+};
+
+window.renderSeeAllDrafts = async function (query = '') {
+  const modalList = document.getElementById('story-drafts-list');
+  const countBadge = document.getElementById('see-all-drafts-count-badge');
+  if (!modalList) return;
+
+  const drafts = await DraftsDB.getDrafts();
+  if (countBadge) countBadge.innerText = drafts.length;
+
+  const lowerQuery = (query || '').toLowerCase().trim();
+  const filtered = drafts.filter(d => {
+    if (!lowerQuery) return true;
+    const title = (d.caption || d.title || '').toLowerCase();
+    const dateStr = new Date(d.createdAt || d.lastModified || 0).toLocaleDateString().toLowerCase();
+    return title.includes(lowerQuery) || dateStr.includes(lowerQuery);
+  });
+
+  modalList.innerHTML = '';
+
+  if (filtered.length === 0) {
+    modalList.innerHTML = `
+      <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:48px 20px; text-align:center; color:var(--text-muted);">
+        <i data-lucide="archive" style="width:48px; height:48px; color:rgba(255,255,255,0.2); margin-bottom:12px;"></i>
+        <h4 style="margin:0 0 6px 0; color:var(--text-main); font-size:1.1rem;">${query ? 'No matching drafts found' : 'No HUBBs Drafts Yet'}</h4>
+        <p style="margin:0; font-size:0.85rem; opacity:0.7;">${query ? 'Try searching for another keyword.' : 'Save your creative work as drafts to continue anytime.'}</p>
+      </div>
+    `;
+    if (window.lucide) window.lucide.createIcons();
+    return;
+  }
+
+  filtered.forEach(d => {
+    const timeStr = window.formatRelativeTime(d.lastModified || d.createdAt);
+    const createdStr = d.createdAt ? new Date(d.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown';
+    const title = d.caption || d.title || 'Untitled HUBB';
+    const imgUrl = d.thumbDataUrl || d.mediaThumbUrl || (d.mediaFile ? URL.createObjectURL(d.mediaFile) : '');
+    const mediaCount = (d.mediaItems && d.mediaItems.length) || (d.mediaCount || 1);
+    const isVideo = (d.mediaType && d.mediaType.startsWith('video')) || (d.mediaItems && d.mediaItems[0] && d.mediaItems[0].type && d.mediaItems[0].type.startsWith('video'));
+
+    const card = document.createElement('div');
+    card.className = 'see-all-draft-card';
+
+    card.innerHTML = `
+      <div style="display:flex; gap:14px; align-items:center; min-width:0; flex:1; cursor:pointer;" onclick="window.loadDraft('${d.id}')">
+        <div style="position:relative; width:64px; height:64px; flex-shrink:0; border-radius:12px; overflow:hidden; background:#111; border: 1px solid rgba(255,255,255,0.12); box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+          ${imgUrl ? `<img src="${imgUrl}" style="width:100%; height:100%; object-fit:cover;" alt="Thumbnail">` : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:var(--text-muted);"><i data-lucide="image" style="width:24px; height:24px;"></i></div>`}
+          ${mediaCount > 1 ? `<div style="position:absolute; bottom:3px; right:3px; background:var(--primary); color:white; font-size:0.65rem; font-weight:700; padding:2px 5px; border-radius:6px; box-shadow:0 2px 6px rgba(0,0,0,0.4);">${mediaCount} items</div>` : ''}
+          ${isVideo ? `<div style="position:absolute; top:3px; left:3px; background:rgba(0,0,0,0.7); color:white; font-size:0.6rem; padding:2px 4px; border-radius:4px; backdrop-filter:blur(4px);"><i data-lucide="video" style="width:10px; height:10px;"></i></div>` : ''}
+        </div>
+        <div style="min-width:0; flex:1;">
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+            <h4 class="see-all-draft-card-title" style="margin:0; font-size:0.95rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${title}</h4>
+            <span class="see-all-draft-card-badge" style="font-size:0.65rem; padding:2px 6px; border-radius:6px; font-weight:600; flex-shrink:0;">HUBB</span>
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:10px; font-size:0.75rem; color:var(--text-muted);">
+            <span class="see-all-draft-time" data-timestamp="${d.lastModified || d.createdAt}"><i data-lucide="clock" style="width:12px; height:12px; display:inline; vertical-align:middle; margin-right:3px;"></i> Saved ${timeStr}</span>
+            <span><i data-lucide="calendar" style="width:12px; height:12px; display:inline; vertical-align:middle; margin-right:3px;"></i> Created ${createdStr}</span>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+        <button class="see-all-draft-continue-btn" onclick="window.loadDraft('${d.id}')"><i data-lucide="edit-3" style="width:14px; height:14px;"></i> Continue Editing</button>
+        <button class="see-all-draft-dup-btn" title="Duplicate Draft" onclick="window.duplicateDraft('${d.id}', event)"><i data-lucide="copy" style="width:16px; height:16px;"></i></button>
+        <button class="see-all-draft-del-btn" title="Delete Draft" onclick="window.deleteDraft('${d.id}', event)"><i data-lucide="trash-2" style="width:16px; height:16px;"></i></button>
+      </div>
+    `;
+    modalList.appendChild(card);
+  });
+
+  if (window.lucide) window.lucide.createIcons();
+};
+
+window.openSeeAllDrafts = function () {
+  const modal = document.getElementById('story-drafts-modal');
+  if (!modal) return;
+  modal.classList.add('active');
+  const searchInput = document.getElementById('see-all-drafts-search');
+  if (searchInput) searchInput.value = '';
+  window.renderSeeAllDrafts();
 };
 
 window.loadDraft = async function (id) {
-  const drafts = await DraftsDB.getDrafts();
-  const d = drafts.find(x => x.id === id);
-  if (!d) return;
+  try {
+    const d = await DraftsDB.getDraftById(id);
+    if (!d) {
+      showToast('Draft not found or already deleted.');
+      return;
+    }
 
-  // Restore variables
-  window.chUploads = [{
-    file: d.mediaFile,
-    type: d.mediaType,
-    thumbUrl: d.mediaThumbUrl || URL.createObjectURL(d.mediaFile)
-  }];
+    // 0. Clean up any previous playing video/audio
+    if (typeof window.cleanupStoryMedia === 'function') {
+      window.cleanupStoryMedia();
+    }
 
-  window.currentDraftId = d.id;
-  window.currentDraftCreatedAt = d.createdAt;
+    window.currentDraftId = d.id;
+    window.currentDraftCreatedAt = d.createdAt || Date.now();
+    window.lastDraftSavedAt = d.lastModified || Date.now();
 
-  if (d.editorState) window.HubbleEditor.state = JSON.parse(JSON.stringify(d.editorState));
+    // 1. Rebuild window.chUploads with working object URLs and editorStates
+    if (d.mediaItems && d.mediaItems.length > 0) {
+      window.chUploads = d.mediaItems.map(m => {
+        let objectUrl = '';
+        if (m.file) {
+          try { objectUrl = URL.createObjectURL(m.file); } catch (_) { objectUrl = m.thumbDataUrl || m.thumbUrl; }
+        } else {
+          objectUrl = m.thumbDataUrl || m.thumbUrl || '';
+        }
+        return {
+          file: m.file,
+          type: m.type || 'image/jpeg',
+          thumbUrl: objectUrl || m.thumbDataUrl || m.thumbUrl,
+          duration: m.duration || 0,
+          originalWidth: m.originalWidth || 1000,
+          originalHeight: m.originalHeight || 1000,
+          name: m.name || 'media',
+          size: m.size || 0,
+          editorState: m.editorState ? JSON.parse(JSON.stringify(m.editorState)) : {
+            filter: 'original', rotation: 0, zoom: 1, panX: 0, panY: 0,
+            adjustments: { brightness: 100, contrast: 100, exposure: 100, highlights: 100, shadows: 100, temperature: 0, tint: 0, saturation: 100, vibrance: 100, sharpness: 0, blur: 0, opacity: 100 },
+            crop: null, layers: [], isMuted: false, musicTrack: null, selectedLocation: null
+          }
+        };
+      });
+    } else if (d.mediaFile || d.mediaThumbUrl) {
+      let objectUrl = '';
+      if (d.mediaFile) {
+        try { objectUrl = URL.createObjectURL(d.mediaFile); } catch (_) { objectUrl = d.thumbDataUrl || d.mediaThumbUrl; }
+      } else {
+        objectUrl = d.thumbDataUrl || d.mediaThumbUrl;
+      }
+      window.chUploads = [{
+        file: d.mediaFile,
+        type: d.mediaType || 'image/jpeg',
+        thumbUrl: objectUrl,
+        duration: 0,
+        originalWidth: 1000,
+        originalHeight: 1000,
+        name: 'draft_media',
+        size: 0,
+        editorState: d.editorState ? JSON.parse(JSON.stringify(d.editorState)) : {
+          filter: 'original', rotation: 0, zoom: 1, panX: 0, panY: 0,
+          adjustments: { brightness: 100, contrast: 100, exposure: 100, highlights: 100, shadows: 100, temperature: 0, tint: 0, saturation: 100, vibrance: 100, sharpness: 0, blur: 0, opacity: 100 },
+          crop: null, layers: [], isMuted: false, musicTrack: null, selectedLocation: null
+        }
+      }];
+    } else {
+      window.chUploads = [];
+    }
 
-  const captionInput = document.querySelector('.ch-caption-input');
-  if (captionInput) captionInput.value = d.caption || '';
+    // 2. Restore HubbleEditor state
+    if (window.HubbleEditor) {
+      window.HubbleEditor.activeMediaIndex = d.activeMediaIndex || 0;
+      const initialMedia = window.chUploads[window.HubbleEditor.activeMediaIndex] || window.chUploads[0];
+      if (initialMedia && initialMedia.editorState) {
+        window.HubbleEditor.state = JSON.parse(JSON.stringify(initialMedia.editorState));
+      } else if (d.editorState) {
+        window.HubbleEditor.state = JSON.parse(JSON.stringify(d.editorState));
+      } else {
+        window.HubbleEditor.state = {
+          filter: 'original', rotation: 0, zoom: 1, panX: 0, panY: 0,
+          adjustments: { brightness: 100, contrast: 100, exposure: 100, highlights: 100, shadows: 100, temperature: 0, tint: 0, saturation: 100, vibrance: 100, sharpness: 0, blur: 0, opacity: 100 },
+          crop: null, layers: [], isMuted: false, musicTrack: null, selectedLocation: null
+        };
+      }
+      window.HubbleEditor.history = [JSON.parse(JSON.stringify(window.HubbleEditor.state))];
+      window.HubbleEditor.redoStack = [];
+      window.HubbleEditor.activeSelectedLayerId = null;
+    }
 
-  // Switch view to editor
-  if (window.switchView) window.switchView('create-hubbs');
-  window.initCreateHubbsUpload();
+    // 3. Restore Caption
+    const captionEl = document.getElementById('ch-caption-input') || document.querySelector('.ch-caption-input');
+    if (captionEl) captionEl.value = d.caption || '';
 
-  // Restore collaborators
-  window.collaborationEnabled = d.collaborationEnabled !== false;
-  const toggleEl = document.getElementById('ch-collab-toggle');
-  if (toggleEl) {
-    toggleEl.checked = window.collaborationEnabled;
-    if (window.toggleCollaboration) window.toggleCollaboration(window.collaborationEnabled);
+    // 4. Restore Scheduling
+    const schedToggle = document.getElementById('ch-schedule-toggle');
+    if (schedToggle) {
+      schedToggle.checked = d.scheduleEnabled === true;
+      if (window.toggleScheduling) window.toggleScheduling(schedToggle.checked);
+    }
+    const schedDate = document.getElementById('ch-schedule-date');
+    if (schedDate) schedDate.value = d.scheduleDate || '';
+    const schedTime = document.getElementById('ch-schedule-time');
+    if (schedTime) schedTime.value = d.scheduleTime || '';
+
+    // 6. Switch view to editor
+    if (window.switchView) window.switchView('create-hubbs');
+
+    // 7. Close modals
+    document.getElementById('story-drafts-modal')?.classList.remove('active');
+    document.getElementById('home-drafts-panel')?.classList.remove('open');
+
+    // 8. Render previews & layouts
+    if (typeof window.renderMediaPreviews === 'function') {
+      window.renderMediaPreviews();
+    }
+    if (window.HubbleEditor && window.HubbleEditor.setLayout) {
+      window.HubbleEditor.setLayout(d.activeLayout || 'original');
+    }
+    if (window.HubbleEditor && window.HubbleEditor.updateRender) {
+      window.HubbleEditor.updateRender();
+    }
+
+    // 9. Ensure video elements are paused and setup restored music track audio
+    const canvasVideos = document.querySelectorAll('#he-media-layer video, #review-slider-wrapper video');
+    canvasVideos.forEach(v => {
+      v.pause();
+      v.autoplay = false;
+    });
+    const restoredMusic = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack) || null;
+    if (restoredMusic && (restoredMusic.previewUrl || restoredMusic.url) && window.StoryAudioManager) {
+      window.StoryAudioManager.load(restoredMusic, 'editor');
+      if (!restoredMusic.isMuted) {
+        window.StoryAudioManager.play('editor');
+      }
+    } else if (window.StoryAudioManager) {
+      window.StoryAudioManager.destroy();
+    }
+
+    // 10. Update attached badges (Music & Location)
+    if (window.renderAttachedStoryBadges) {
+      window.renderAttachedStoryBadges();
+    }
+
+    // 11. Update live timestamp
+    window.updateLastSavedLabel();
+    showToast('Draft restored! 📝');
+  } catch (err) {
+    console.error('Error loading draft:', err);
+    showToast('Failed to load draft. Please try again.');
   }
-
-  window.selectedCollaborators = d.collaborators || [];
-  if (window.renderCollaboratorChips) window.renderCollaboratorChips();
-
-  // Restore scheduling
-  const schedToggle = document.getElementById('ch-schedule-toggle');
-  if (schedToggle) {
-    schedToggle.checked = d.scheduleEnabled === true;
-    if (window.toggleScheduling) window.toggleScheduling(schedToggle.checked);
-  }
-  const schedDate = document.getElementById('ch-schedule-date');
-  if (schedDate) schedDate.value = d.scheduleDate || '';
-  const schedTime = document.getElementById('ch-schedule-time');
-  if (schedTime) schedTime.value = d.scheduleTime || '';
 };
 
-window.deleteDraft = async function (id) {
-  if (confirm('Delete this draft?')) {
-    await DraftsDB.deleteDraft(id);
-    window.renderDraftsList();
+window.deleteDraft = async function (id, e) {
+  if (e) e.stopPropagation();
+  if (confirm('Delete this story draft?')) {
+    try {
+      await DraftsDB.deleteDraft(id);
+      if (window.currentDraftId === id) {
+        window.currentDraftId = null;
+        window.currentDraftCreatedAt = null;
+      }
+      showToast('Draft deleted!');
+      await window.renderDraftsList();
+      if (document.getElementById('story-drafts-modal')?.classList.contains('active')) {
+        const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+        await window.renderSeeAllDrafts(searchVal);
+      }
+      window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'delete', draftId: id } }));
+    } catch (err) {
+      console.error('Failed to delete draft:', err);
+      showToast('Error deleting draft.');
+    }
   }
 };
 
-window.duplicateDraft = async function (id) {
-  const drafts = await DraftsDB.getDrafts();
-  const d = drafts.find(x => x.id === id);
-  if (!d) return;
+window.duplicateDraft = async function (id, e) {
+  if (e) e.stopPropagation();
+  try {
+    const d = await DraftsDB.getDraftById(id);
+    if (!d) return;
 
-  const clone = { ...d, id: undefined, createdAt: undefined };
-  await DraftsDB.saveDraft(clone);
-  window.renderDraftsList();
+    const clone = JSON.parse(JSON.stringify(d));
+    clone.id = 'draft_story_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    clone.createdAt = Date.now();
+    clone.lastModified = Date.now();
+    clone.title = (clone.title || 'Draft') + ' (Copy)';
+    if (clone.caption) clone.caption = clone.caption + ' (Copy)';
+
+    // Preserve Blob/File reference if available
+    if (d.mediaItems) {
+      clone.mediaItems = d.mediaItems.map((m, idx) => ({
+        ...clone.mediaItems[idx],
+        file: m.file
+      }));
+    }
+    clone.mediaFile = d.mediaFile;
+
+    await DraftsDB.saveDraft(clone);
+    showToast('Draft duplicated! 📋');
+    await window.renderDraftsList();
+    if (document.getElementById('story-drafts-modal')?.classList.contains('active')) {
+      const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+      await window.renderSeeAllDrafts(searchVal);
+    }
+    window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'duplicate', draftId: clone.id } }));
+  } catch (err) {
+    console.error('Failed to duplicate draft:', err);
+    showToast('Error duplicating draft.');
+  }
 };
 
 // --- AUTO SAVE DEBOUNCE ---
@@ -331,14 +2089,36 @@ let autoSaveTimeout = null;
 window.triggerAutoSave = function () {
   const activeHubbsView = document.getElementById('view-create-hubbs');
   const isActive = activeHubbsView && activeHubbsView.classList.contains('active');
-  if (isActive && window.chUploads && window.chUploads.length > 0) {
+  const hasUploads = window.chUploads && window.chUploads.length > 0;
+  const captionEl = document.getElementById('ch-caption-input') || document.querySelector('.ch-caption-input');
+  const hasCaption = captionEl && captionEl.value.trim().length > 0;
+
+  if (isActive && (hasUploads || hasCaption)) {
     clearTimeout(autoSaveTimeout);
     autoSaveTimeout = setTimeout(() => {
       window._silentDraftSave = true;
-      if (window.saveCurrentDraft) window.saveCurrentDraft();
-    }, 3000);
+      if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+    }, 2500);
   }
 };
+
+// Live ticker interval for relative timestamps (every 10s)
+if (!window._hihubbleDraftTickerInterval) {
+  window._hihubbleDraftTickerInterval = setInterval(() => {
+    if (typeof window.updateLastSavedLabel === 'function') {
+      window.updateLastSavedLabel();
+    }
+  }, 10000);
+}
+
+// Cross-tab and realtime event listeners
+window.addEventListener('hihubble_story_draft_change', () => {
+  if (typeof window.renderDraftsList === 'function') window.renderDraftsList();
+  if (document.getElementById('story-drafts-modal')?.classList.contains('active')) {
+    const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+    if (typeof window.renderSeeAllDrafts === 'function') window.renderSeeAllDrafts(searchVal);
+  }
+});
 
 // Run on init
 document.addEventListener('DOMContentLoaded', () => {
@@ -352,16 +2132,16 @@ document.addEventListener('DOMContentLoaded', () => {
       window.triggerAutoSave();
     }
   });
-  window.addEventListener('beforeunload', (e) => {
+  window.addEventListener('beforeunload', () => {
     if (state.activeView === 'create-hubbs' && window.chUploads && window.chUploads.length > 0) {
       window._silentDraftSave = true;
-      if (window.saveCurrentDraft) window.saveCurrentDraft();
+      if (window.saveCurrentDraft) window.saveCurrentDraft(true);
     }
   });
 
   setTimeout(() => {
     window.renderDraftsList();
-  }, 500);
+  }, 400);
 
   // Setup Home Drafts Bubble Toggle
   const draftsBtn = document.getElementById('story-drafts-container');
@@ -369,18 +2149,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const closeBtn = document.getElementById('close-hdd-btn');
   if (draftsBtn && draftsPanel) {
     draftsBtn.addEventListener('click', (e) => {
-      // Prevent toggling if clicking inside the panel
       if (e.target.closest('#home-drafts-panel')) return;
       draftsPanel.classList.toggle('open');
     });
   }
   if (closeBtn) {
     closeBtn.addEventListener('click', (e) => {
-      e.stopPropagation(); // prevent bubbling to container
+      e.stopPropagation();
       if (draftsPanel) draftsPanel.classList.remove('open');
     });
   }
-  // Close dropdown when clicking outside
   document.addEventListener('click', (e) => {
     if (draftsBtn && !draftsBtn.contains(e.target)) {
       draftsPanel.classList.remove('open');
@@ -392,7 +2170,38 @@ import './auth.css'
 import { initAuth, updateAppUI, handleLogout, supabase } from './auth.js'
 window.supabase = supabase;
 
-document.addEventListener('DOMContentLoaded', () => {
+import './audio/audio.css'
+import { initiateAudioCall, endAudioCall, listenForIncomingAudioCalls } from './audio/audio.call.js'
+import './video/video.css'
+import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './video/video.call.js'
+
+  // Calling Initialization Bridge
+  let callingSubscribedUserId = null;
+  window.ensureIncomingCallListeners = function() {
+    try {
+      const userStr = localStorage.getItem('invibe_user') || localStorage.getItem('invibeUser');
+      if (!userStr) return;
+      const u = JSON.parse(userStr);
+      const userId = u ? (u.id || u._id || '').toString() : '';
+      if (userId && callingSubscribedUserId !== userId) {
+        console.warn('[Calling System] Actively subscribing listeners for user:', userId);
+        callingSubscribedUserId = userId;
+        listenForIncomingAudioCalls(userId);
+        listenForIncomingVideoCalls(userId);
+      }
+    } catch (err) {
+      console.error('[Calling Setup Error]:', err);
+    }
+  };
+
+  // Run immediately and also set polling check to guarantee it registers even if auth is delayed
+  window.ensureIncomingCallListeners();
+  setInterval(() => {
+    window.ensureIncomingCallListeners();
+  }, 2000);
+
+  document.addEventListener('DOMContentLoaded', () => {
+
   const API_URL = (
     window.location.hostname === 'localhost' ||
     window.location.hostname === '127.0.0.1' ||
@@ -405,7 +2214,42 @@ document.addEventListener('DOMContentLoaded', () => {
   ) ? `${window.location.protocol}//${window.location.hostname}:3000`
     : window.location.origin;
 
-  window.savedHubbs = window.savedHubbs || [];
+  try {
+    const storedSaved = localStorage.getItem('invibe_saved_hubbs');
+    window.savedHubbs = storedSaved ? JSON.parse(storedSaved) : [];
+  } catch (err) {
+    window.savedHubbs = [];
+  }
+
+  window.updateSavedBadgeCount = function() {
+    const badge = document.querySelector('.saved-count-badge');
+    if (badge) {
+      badge.textContent = (window.savedHubbs || []).length;
+    }
+  };
+
+  window.fetchSavedHubbs = async function() {
+    const token = window.getAuthToken ? window.getAuthToken() : localStorage.getItem('invibe_jwt_token');
+    if (!token) return;
+    try {
+      const [postsRes, reelsRes] = await Promise.all([
+        fetch(`${API_URL}/api/posts/saved`, { headers: { 'Authorization': `Bearer ${token}` } }),
+        fetch(`${API_URL}/api/reels/saved`, { headers: { 'Authorization': `Bearer ${token}` } })
+      ]);
+      
+      let allSaved = [];
+      if (postsRes.ok) {
+        allSaved = allSaved.concat(await postsRes.json());
+      }
+      if (reelsRes.ok) {
+        allSaved = allSaved.concat(await reelsRes.json());
+      }
+      window.savedHubbs = allSaved;
+      window.updateSavedBadgeCount();
+    } catch (e) {
+      console.error("Failed to fetch saved hubbs:", e);
+    }
+  };
 
   function getAuthToken() {
     let tok = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || localStorage.getItem('invibeToken') || localStorage.getItem('token');
@@ -424,11 +2268,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   initAuth();
   updateAppUI();
-  window.addEventListener('auth-changed', updateAppUI);
+  window.fetchSavedHubbs();
+  window.addEventListener('auth-changed', () => {
+    updateAppUI();
+    window.fetchSavedHubbs();
+  });
 
-  // Global Logout Handling (Applies to sidebar logout, mobile logout, profile header avatar)
+  // Global Logout Handling (Applies to sidebar logout, mobile logout)
   document.addEventListener('click', (e) => {
-    const logoutBtn = e.target.closest('#logout-btn, .logout-btn, [data-action="logout"], #header-profile-avatar');
+    const logoutBtn = e.target.closest('#logout-btn, .logout-btn, [data-action="logout"]');
     if (logoutBtn) {
       e.preventDefault();
       if (confirm('Are you sure you want to log out of Hi-Hubble?')) {
@@ -538,10 +2386,59 @@ document.addEventListener('DOMContentLoaded', () => {
 
   debouncedCreateIcons();
 
+  // --- CENTRAL THEME MANAGEMENT & PERSISTENCE ---
+  function getStoredTheme() {
+    try {
+      const raw = localStorage.getItem('hihubble_theme') || localStorage.getItem('invibe_theme');
+      if (typeof raw === 'string') {
+        const clean = raw.trim().toLowerCase();
+        if (clean === 'light' || clean === 'dark') {
+          return clean;
+        }
+      }
+    } catch (e) {}
+    return 'dark'; // default theme
+  }
+
+  function applyTheme(theme, save = true) {
+    const validTheme = (theme === 'light') ? 'light' : 'dark';
+    state.theme = validTheme;
+
+    if (validTheme === 'light') {
+      document.documentElement.classList.remove('dark-theme');
+      document.documentElement.classList.add('light-theme');
+      if (document.body) {
+        document.body.classList.remove('dark-theme');
+        document.body.classList.add('light-theme');
+      }
+    } else {
+      document.documentElement.classList.remove('light-theme');
+      document.documentElement.classList.add('dark-theme');
+      if (document.body) {
+        document.body.classList.remove('light-theme');
+        document.body.classList.add('dark-theme');
+      }
+    }
+
+    if (save) {
+      try {
+        localStorage.setItem('hihubble_theme', validTheme);
+      } catch (e) {}
+    }
+
+    const appearanceToggle = document.getElementById('appearance-toggle-checkbox');
+    if (appearanceToggle) {
+      appearanceToggle.checked = (validTheme === 'light');
+    }
+  }
+  window.applyAppTheme = applyTheme;
+  window.getAppTheme = getStoredTheme;
+
   // --- STATE SYSTEM ---
   const state = {
-    theme: 'dark',
+    theme: window.__INITIAL_THEME__ || getStoredTheme(),
     activeView: 'home',
+    viewingProfileUserId: null,
     currentChatThread: null,
     chatMode: 'chat', // chat, watch, call, game, media
     callTimerInterval: null,
@@ -557,11 +2454,41 @@ document.addEventListener('DOMContentLoaded', () => {
     storyGroups: [],
     activeGroupIndex: 0,
     activeStoryIndex: 0,
+    activeMediaIndex: 0,
     storyProgressInterval: null,
     storyProgressPercent: 0,
     isStoryPaused: false,
+    isStoryViewsOpen: false,
     isLudoRolling: false
   };
+
+  // Ensure DOM is immediately in sync with state theme
+  applyTheme(state.theme, false);
+
+  // Safe Universal User ID extraction helper
+  function getUserIdentifier(userOrAuthor) {
+    if (!userOrAuthor) return null;
+    if (typeof userOrAuthor === 'string') {
+      const clean = userOrAuthor.trim();
+      return clean.length > 0 ? clean : null;
+    }
+    if (typeof userOrAuthor === 'object') {
+      return userOrAuthor.id || userOrAuthor._id || userOrAuthor.userId || userOrAuthor.authorId || userOrAuthor.username || null;
+    }
+    return null;
+  }
+  window.getUserIdentifier = getUserIdentifier;
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+  window.escapeHtml = escapeHtml;
 
   // --- STICKY HEADER progressive BLUR ---
   const header = document.getElementById('main-header');
@@ -582,17 +2509,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- THEME TOGGLE CONTROLLER ---
   const themeToggleBtn = document.getElementById('theme-toggle-btn');
-  themeToggleBtn.addEventListener('click', () => {
-    if (document.body.classList.contains('dark-theme')) {
-      document.body.classList.replace('dark-theme', 'light-theme');
-      state.theme = 'light';
-      showToast('Switched to Light Theme ☀️');
-    } else {
-      document.body.classList.replace('light-theme', 'dark-theme');
-      state.theme = 'dark';
-      showToast('Switched to Dark Theme 🌌');
-    }
-  });
+  if (themeToggleBtn) {
+    themeToggleBtn.addEventListener('click', () => {
+      const currentTheme = document.body.classList.contains('light-theme') ? 'light' : 'dark';
+      const newTheme = (currentTheme === 'light') ? 'dark' : 'light';
+      applyTheme(newTheme, true);
+      showToast(newTheme === 'light' ? 'Switched to Light Mode ☀️' : 'Switched to Dark Mode 🌙');
+    });
+  }
 
   // --- TOAST HELPER ---
   const toast = document.getElementById('toast-notif');
@@ -625,8 +2549,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     createPostRoot.render(
       React.createElement(CreatePost, {
-        onNavigateBack: () => {
+        onNavigateBack: (shouldRefresh) => {
           switchView('home');
+          if (shouldRefresh && typeof window.loadFeedPosts === 'function') {
+            window.loadFeedPosts();
+          }
         }
       })
     );
@@ -637,6 +2564,31 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (typeof window.stopAllPostMusic === 'function') {
       window.stopAllPostMusic();
+    }
+
+    // Stop all Story / Share HUBBs audio and video if leaving stories
+    if (viewName !== 'create-hubbs' && viewName !== 'review-hubbs') {
+      if (typeof window.cleanupStoryMedia === 'function') {
+        window.cleanupStoryMedia();
+      }
+    } else if (viewName === 'create-hubbs') {
+      // If returning back from review to create-hubbs, halt review slider videos
+      const reviewVideos = document.querySelectorAll('#review-slider-wrapper video, #review-before-container video, #review-after-container video');
+      reviewVideos.forEach(v => {
+        try {
+          v.pause();
+          v.muted = true;
+          v.currentTime = 0;
+          v.removeAttribute('src');
+          v.load();
+        } catch (_) {}
+        try { v.remove(); } catch (_) {}
+      });
+      if (window.StoryAudioManager && window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack) {
+        if (!window.HubbleEditor.state.musicTrack.isMuted) {
+          window.StoryAudioManager.play('editor');
+        }
+      }
     }
 
     if (viewName === 'create-post') {
@@ -666,8 +2618,9 @@ document.addEventListener('DOMContentLoaded', () => {
     state.activeView = viewName;
 
     if (viewName === 'profile') {
+      const resolvedTarget = getUserIdentifier(userId);
       const currentUserStr = localStorage.getItem('invibeUser');
-      let targetId = userId;
+      let targetId = resolvedTarget;
       if (!targetId && currentUserStr) {
         try {
           const currentUser = JSON.parse(currentUserStr);
@@ -679,43 +2632,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Maintain unified 3-column layout frame across all views
     document.body.classList.remove('chats-view-active');
-    if (viewName === 'chats') {
-      if (appContainer) appContainer.classList.remove('chatting');
+    if (viewName === 'chats' || viewName === 'chat' || viewName === 'messages') {
       const emptyState = document.getElementById('chat-empty-state');
       const chatHeader = document.getElementById('chat-window-header');
       const chatViewport = document.querySelector('.chat-dynamic-viewport');
       const chatFooter = document.getElementById('chat-global-footer');
 
       if (userId) {
-        state.currentChatThread = userId;
-        if (emptyState) emptyState.style.display = 'none';
-        if (chatHeader) chatHeader.style.display = '';
-        if (chatViewport) chatViewport.style.display = '';
-        if (chatFooter) chatFooter.style.display = '';
-
-        const token = getAuthToken();
-        if (token) {
-          fetch(`${API_URL}/api/chats/direct/${userId}`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` }
-          }).then(r => r.json()).then(data => {
-            if (data && data.targetUser) {
-              const u = data.targetUser;
-              if (chatHeaderName) chatHeaderName.textContent = u.fullName;
-              if (chatHeaderAvatar) chatHeaderAvatar.src = u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
-            }
-          }).catch(() => {});
-        }
-
-        fetchMessages(userId, true);
-        loadChatThreads();
+        selectConversation(userId);
+        loadChatThreads(false);
       } else {
+        // General entry to Messages: ALWAYS start in the idle "Select a conversation" state
         state.currentChatThread = null;
+        dmState.activeConversationId = null;
+        const grid = document.querySelector('.chats-layout-grid');
+        if (grid) grid.classList.remove('chatting');
+        document.body.classList.remove('chat-active-mobile');
+        if (chatThreadsList) {
+          chatThreadsList.querySelectorAll('.thread-item').forEach(t => t.classList.remove('active'));
+        }
         if (emptyState) emptyState.style.display = 'flex';
         if (chatHeader) chatHeader.style.display = 'none';
         if (chatViewport) chatViewport.style.display = 'none';
         if (chatFooter) chatFooter.style.display = 'none';
-        loadChatThreads();
+        loadChatThreads(false);
       }
     }
 
@@ -724,9 +2664,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if ((viewName === 'reels' || viewName === 'explore') && typeof loadFeedReels === 'function') {
       loadFeedReels();
-    }
-    if ((viewName === 'chat' || viewName === 'messages') && typeof loadChatThreads === 'function') {
-      loadChatThreads();
     }
 
     // Update active view panels dynamically
@@ -774,10 +2711,9 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    // Pause explore reels videos if we leave Explore View
-    if (viewName !== 'explore') {
-      const reelVideos = document.querySelectorAll('.reel-video');
-      reelVideos.forEach(vid => vid.pause());
+    // Notify Hubbing Playback Controller of view change
+    if (window.hubbingPlaybackController) {
+      window.hubbingPlaybackController.onViewChange(viewName);
     }
 
     // Scroll to top
@@ -788,6 +2724,123 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   window.switchView = switchView;
+
+  window.navigateToPost = function(postId, hubType = 'post') {
+    if (!postId) return;
+    
+    // Close active chats
+    const grid = document.querySelector('.chats-layout-grid');
+    if (grid) grid.classList.remove('chatting');
+    document.body.classList.remove('chat-active-mobile');
+
+    if (hubType === 'story') {
+      switchView('home');
+
+      const tryOpenStory = () => {
+        let foundGroupIdx = -1;
+        let foundStoryIdx = -1;
+        
+        if (state.storyGroups) {
+          state.storyGroups.forEach((group, gIdx) => {
+            (group.stories || []).forEach((story, sIdx) => {
+              const sId = story._id || story.id;
+              if (sId && sId.toString() === postId.toString()) {
+                foundGroupIdx = gIdx;
+                foundStoryIdx = sIdx;
+              }
+            });
+          });
+        }
+
+        if (foundGroupIdx !== -1 && foundStoryIdx !== -1) {
+          openStoryViewer(foundGroupIdx, foundStoryIdx);
+          return true;
+        }
+        return false;
+      };
+
+      setTimeout(() => {
+        if (!tryOpenStory()) {
+          if (typeof loadStories === 'function') {
+            loadStories().then(() => {
+              if (!tryOpenStory()) {
+                if (typeof showToast === 'function') {
+                  showToast('This HUBB has expired or is no longer available.');
+                }
+              }
+            });
+          } else {
+            if (typeof showToast === 'function') {
+              showToast('This HUBB has expired or is no longer available.');
+            }
+          }
+        }
+      }, 150);
+
+    } else if (hubType === 'reel') {
+      switchView('explore');
+
+      const tryScrollReel = () => {
+        const reelEl = document.querySelector(`.reel-card[data-reel-id="${postId}"]`);
+        if (reelEl) {
+          reelEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          
+          // Play the video via central controller
+          const video = reelEl.querySelector('.reel-video');
+          if (video && window.hubbingPlaybackController) {
+            window.hubbingPlaybackController.activateReel(postId, video, reelEl, true);
+          }
+          return true;
+        }
+        return false;
+      };
+
+      setTimeout(() => {
+        if (!tryScrollReel()) {
+          if (typeof loadFeedReels === 'function') {
+            loadFeedReels().then(() => {
+              setTimeout(tryScrollReel, 500);
+            });
+          }
+        }
+      }, 150);
+
+    } else {
+      // Switch view to home (feed)
+      switchView('home');
+
+      const tryScroll = () => {
+        const postEl = document.getElementById(`post-${postId}`);
+        if (postEl) {
+          postEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          
+          // Glow effect
+          postEl.style.transition = 'box-shadow 0.4s ease, border-color 0.4s ease, transform 0.4s ease';
+          postEl.style.boxShadow = '0 0 25px rgba(168, 85, 247, 0.7)';
+          postEl.style.borderColor = 'var(--primary, #a855f7)';
+          postEl.style.transform = 'scale(1.01)';
+          
+          setTimeout(() => {
+            postEl.style.boxShadow = '';
+            postEl.style.borderColor = '';
+            postEl.style.transform = '';
+          }, 2000);
+          return true;
+        }
+        return false;
+      };
+
+      setTimeout(() => {
+        if (!tryScroll()) {
+          if (typeof loadFeedPosts === 'function') {
+            loadFeedPosts().then(() => {
+              setTimeout(tryScroll, 400);
+            });
+          }
+        }
+      }, 150);
+    }
+  };
 
   // Bind view selectors
   sidebarNavItems.forEach(item => {
@@ -819,9 +2872,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Profile avatar returns Profile
-  document.getElementById('header-profile-avatar').addEventListener('click', () => {
-    switchView('profile');
-  });
+  const headerProfileAvatar = document.getElementById('header-profile-avatar');
+  if (headerProfileAvatar) {
+    headerProfileAvatar.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      switchView('profile');
+    });
+  }
 
   // Messages badge shortcut
   document.getElementById('messages-shortcut-btn').addEventListener('click', () => {
@@ -1225,16 +3283,22 @@ document.addEventListener('DOMContentLoaded', () => {
       if (tabName === 'reels') {
         exploreReelsContainer.classList.add('active');
         explorePostsContainer.classList.remove('active');
-        if (typeof loadFeedReels === 'function') loadFeedReels();
-        // Autoplay first reel
-        const firstVideo = exploreReelsContainer.querySelector('.reel-video');
-        if (firstVideo) firstVideo.play().catch(() => { });
+        if (window.hubbingPlaybackController) {
+          window.hubbingPlaybackController.onViewChange('explore');
+        }
+        if (typeof loadFeedReels === 'function') {
+          loadFeedReels().then(() => {
+            if (window.hubbingPlaybackController) {
+              window.hubbingPlaybackController.scheduleSettleEvaluation(80);
+            }
+          }).catch(() => { });
+        }
       } else {
         exploreReelsContainer.classList.remove('active');
         explorePostsContainer.classList.add('active');
-        // Pause all reels
-        const videos = exploreReelsContainer.querySelectorAll('.reel-video');
-        videos.forEach(v => v.pause());
+        if (window.hubbingPlaybackController) {
+          window.hubbingPlaybackController.deactivateCurrentReel('tab_switch');
+        }
       }
     });
   });
@@ -1353,6 +3417,21 @@ document.addEventListener('DOMContentLoaded', () => {
       document.querySelectorAll('.post-options-dropdown').forEach(d => d.remove());
     }
 
+    // Post comment button click
+    const commentPostBtn = e.target.closest('.comment-post-btn');
+    if (commentPostBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const pid = commentPostBtn.getAttribute('data-post-id');
+      const input = document.getElementById(`comment-input-${pid}`);
+      if (input) {
+        const text = input.value.trim();
+        if (text) {
+          await submitComment(pid, text, input);
+        }
+      }
+    }
+
     // Like button
     const likeBtn = e.target.closest('.like-btn-action');
     if (likeBtn) {
@@ -1373,35 +3452,69 @@ document.addEventListener('DOMContentLoaded', () => {
       const icon = btnEl.querySelector('i, svg') || bookmarkBtn.querySelector('i, svg');
 
       const mediaContainer = bookmarkBtn.closest('.feed-card, .reel-card, .post-media-container') || bookmarkBtn.closest('article, .post-media-container');
+      const cardEl = bookmarkBtn.closest('.feed-card, .reel-card') || bookmarkBtn.closest('article') || mediaContainer;
       let mediaData = null;
       if (mediaContainer) {
-        const id = mediaContainer.id || mediaContainer.getAttribute('data-post-id') || mediaContainer.getAttribute('data-reel-id') || Math.random().toString();
-        const img = mediaContainer.querySelector('img');
-        const video = mediaContainer.querySelector('video');
+        const id = bookmarkBtn.getAttribute('data-post-id') || bookmarkBtn.getAttribute('data-reel-id') || (cardEl ? (cardEl.getAttribute('data-post-id') || cardEl.getAttribute('data-reel-id') || cardEl.id.replace('post-', '')) : null) || Math.random().toString();
+        const img = mediaContainer.querySelector('.post-media-img') || mediaContainer.querySelector('img:not(.author-avatar)');
+        const video = mediaContainer.querySelector('.post-media-video') || mediaContainer.querySelector('video');
+        const captionEl = cardEl ? cardEl.querySelector('.post-caption') : null;
+        const captionText = captionEl ? captionEl.textContent : '';
+        const authorNameEl = cardEl ? (cardEl.querySelector('.author-name') || cardEl.querySelector('.author-username')) : null;
+        const authorName = authorNameEl ? authorNameEl.textContent.trim().replace(/^@/, '') : 'Hubber';
+        
         if (img) mediaData = { id, type: 'image', url: img.src };
         else if (video) mediaData = { id, type: 'video', url: video.src };
+        else mediaData = { id, type: 'text', text: captionText, author: authorName };
       }
 
-      const isSaved = btnEl.classList.contains('saved');
-      if (isSaved) {
-        btnEl.classList.remove('saved');
-        if (icon) { icon.style.fill = 'none'; icon.style.stroke = ''; }
-        if (mediaData) {
-          window.savedHubbs = window.savedHubbs.filter(s => s.id !== mediaData.id);
-        }
-        showToast('Removed from Saved');
-      } else {
-        btnEl.classList.add('saved');
-        if (icon) { icon.style.fill = '#FBBF24'; icon.style.stroke = '#FBBF24'; }
-        if (mediaData && !window.savedHubbs.find(s => s.id === mediaData.id)) {
-          window.savedHubbs.push(mediaData);
-        }
-        showToast('Saved to collection ⭐');
+      const isReel = bookmarkBtn.hasAttribute('data-reel-id') || (cardEl && cardEl.hasAttribute('data-reel-id')) || (cardEl && cardEl.classList.contains('reel-card'));
+      const endpoint = isReel ? `/api/reels/${mediaData.id}/save` : `/api/posts/${mediaData.id}/save`;
+
+      const token = window.getAuthToken ? window.getAuthToken() : localStorage.getItem('invibe_jwt_token');
+      if (!token) {
+        showToast('Please login to save');
+        return;
       }
 
-      const savedGrid = document.getElementById('profile-saved-grid');
-      if (savedGrid && savedGrid.classList.contains('active')) {
-        renderSavedHubbs();
+      try {
+        const res = await fetch(`${API_URL}${endpoint}`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error('Failed to save');
+        const data = await res.json();
+
+        if (data.isSaved) {
+          btnEl.classList.add('saved');
+          if (icon) { icon.style.fill = '#FBBF24'; icon.style.stroke = '#FBBF24'; }
+          if (mediaData && !window.savedHubbs.find(s => s.id === mediaData.id)) {
+            window.savedHubbs.push(mediaData);
+          }
+          showToast('Saved to collection ⭐');
+        } else {
+          btnEl.classList.remove('saved');
+          if (icon) { icon.style.fill = 'none'; icon.style.stroke = ''; }
+          if (mediaData) {
+            window.savedHubbs = window.savedHubbs.filter(s => s.id !== mediaData.id);
+          }
+          showToast('Removed from Saved');
+        }
+
+        if (typeof window.updateSavedBadgeCount === 'function') {
+          window.updateSavedBadgeCount();
+        }
+
+        const savedGrid = document.getElementById('profile-saved-grid');
+        if (savedGrid && savedGrid.classList.contains('active')) {
+          if (typeof window.fetchSavedHubbs === 'function') {
+            await window.fetchSavedHubbs();
+          }
+          renderSavedHubbs();
+        }
+      } catch (err) {
+        console.error(err);
+        showToast(err.message);
       }
     }
   });
@@ -1421,15 +3534,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const storyPrev = document.getElementById('story-prev-btn');
   const storyNext = document.getElementById('story-next-btn');
 
-  function openStoryViewer(groupIndex, storyIndex = 0) {
+  function openStoryViewer(groupIndex, storyIndex = 0, mediaIndex = 0) {
     if (!state.storyGroups[groupIndex]) return;
     state.activeGroupIndex = groupIndex;
     state.activeStoryIndex = storyIndex;
+    state.activeMediaIndex = mediaIndex;
     if (storyViewer) {
       storyViewer.style.display = 'flex';
       storyViewer.classList.add('active');
     }
-    loadStoryContent(groupIndex, storyIndex);
+    loadStoryContent(groupIndex, storyIndex, mediaIndex);
   }
 
   async function deleteCurrentStory() {
@@ -1446,16 +3560,72 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       if (!res.ok) throw new Error('Failed to delete story');
-      showToast('Story deleted successfully!');
+      showToast('HUBB deleted successfully!');
       closeStoryViewer();
       loadStories();
     } catch (err) {
       console.error(err);
-      showToast('Failed to delete story.');
+      showToast('Failed to delete HUBB.');
     }
   }
 
-  function loadStoryContent(groupIndex, storyIndex) {
+  // Story Header Ticker (Rotating Timestamp, Music, Location)
+  let _storyHeaderTickerTimer = null;
+  function startStoryHeaderTicker(items) {
+    stopStoryHeaderTicker();
+    if (!items || items.length <= 1) return;
+
+    let currentIndex = 0;
+    _storyHeaderTickerTimer = setInterval(() => {
+      const prevItem = items[currentIndex];
+      currentIndex = (currentIndex + 1) % items.length;
+      const nextItem = items[currentIndex];
+
+      if (prevItem) {
+        prevItem.style.opacity = '0';
+        prevItem.style.transform = 'translateY(-6px)';
+        setTimeout(() => {
+          if (prevItem.style.opacity === '0') {
+            prevItem.style.display = 'none';
+            prevItem.style.transform = 'translateY(6px)';
+          }
+        }, 350);
+      }
+      if (nextItem) {
+        nextItem.style.display = 'inline-flex';
+        nextItem.style.transform = 'translateY(6px)';
+        requestAnimationFrame(() => {
+          nextItem.style.opacity = '1';
+          nextItem.style.transform = 'translateY(0)';
+        });
+      }
+    }, 2800);
+  }
+
+  function stopStoryHeaderTicker() {
+    if (_storyHeaderTickerTimer) {
+      clearInterval(_storyHeaderTickerTimer);
+      _storyHeaderTickerTimer = null;
+    }
+  }
+
+  function formatViewerRelativeTime(timestamp) {
+    if (!timestamp) return 'Just now';
+    const diff = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
+    if (isNaN(diff) || diff < 60) return 'Just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return `${Math.floor(diff / 86400)}d ago`;
+  }
+
+  function loadStoryContent(groupIndex, storyIndex, mediaIndex = 0) {
+    console.log(`[STAGE 3: loadStoryContent()] Init | Group: ${groupIndex}, Story: ${storyIndex}, Media: ${mediaIndex}`);
+    
+    // Close views panel if open
+    const storyViewsPanel = document.getElementById('story-views-panel');
+    if (storyViewsPanel) storyViewsPanel.classList.remove('active');
+    state.isStoryViewsOpen = false;
+
     const group = state.storyGroups[groupIndex];
     if (!group || !group.stories[storyIndex]) {
       closeStoryViewer();
@@ -1463,13 +3633,72 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const data = group.stories[storyIndex];
 
+    const mediaList = (data.mediaItems && data.mediaItems.length > 0) ? data.mediaItems : [{ mediaUrl: data.img, mediaType: data.mediaType || 'image' }];
+    if (mediaIndex >= mediaList.length) mediaIndex = mediaList.length - 1;
+    if (mediaIndex < 0) mediaIndex = 0;
+    state.activeMediaIndex = mediaIndex;
+    const currentMediaItem = mediaList[mediaIndex];
+
+    // Immediately mark currently displayed story as viewed
+    if (data && (data._id || data.id)) {
+      markStorySeen(data._id || data.id);
+    }
+
     if (storyViewerAvatar) storyViewerAvatar.src = data.avatar;
     if (storyViewerName) storyViewerName.textContent = data.name;
     if (storyViewerTime) {
       storyViewerTime.textContent = formatStoryTime(data.createdAt || data.created_at || data.time);
+      storyViewerTime.style.display = 'inline-flex';
+      storyViewerTime.style.opacity = '1';
+      storyViewerTime.style.transform = 'translateY(0)';
     }
+
+    // Render Location Badge in Story Viewer
+    const locBadge = document.getElementById('story-viewer-location-badge');
+    const locText = document.getElementById('story-viewer-location-text');
+    const locVal = data.location || (data.locationData && (data.locationData.displayName || data.locationData.name)) || (data.selectedLocation && (data.selectedLocation.displayName || data.selectedLocation.name)) || (currentMediaItem.editorState && currentMediaItem.editorState.selectedLocation && (currentMediaItem.editorState.selectedLocation.displayName || currentMediaItem.editorState.selectedLocation.name));
+    if (locBadge && locText) {
+      if (locVal) {
+        locText.textContent = typeof locVal === 'string' ? locVal : (locVal.displayName || locVal.name || 'Location');
+        locBadge.style.display = 'none';
+        locBadge.style.opacity = '0';
+      } else {
+        locBadge.style.display = 'none';
+      }
+    }
+
+    // Render Music Badge in Story Viewer
+    const musicBadge = document.getElementById('story-viewer-music-badge');
+    const musicText = document.getElementById('story-viewer-music-text');
+    const musicVal = data.music || data.musicTrack || (currentMediaItem.editorState && currentMediaItem.editorState.musicTrack);
+    if (musicBadge && musicText) {
+      if (musicVal && (musicVal.title || typeof musicVal === 'string')) {
+        const titleStr = typeof musicVal === 'string' ? musicVal : `${musicVal.title}${musicVal.artist ? ' • ' + musicVal.artist : ''}`;
+        musicText.textContent = titleStr;
+        musicBadge.style.display = 'none';
+        musicBadge.style.opacity = '0';
+      } else {
+        musicBadge.style.display = 'none';
+      }
+    }
+
+    // Setup rotating header ticker
+    stopStoryHeaderTicker();
+    const tickerItems = [];
+    if (storyViewerTime) tickerItems.push(storyViewerTime);
+    if (musicVal && musicBadge) tickerItems.push(musicBadge);
+    if (locVal && locBadge) tickerItems.push(locBadge);
+    if (tickerItems.length > 1) {
+      startStoryHeaderTicker(tickerItems);
+    }
+
+    if (window.lucide) window.lucide.createIcons();
+
+    const srcUrl = currentMediaItem.mediaUrl || currentMediaItem.media_url || data.img;
+    const typeStr = currentMediaItem.mediaType || currentMediaItem.media_type || data.mediaType || 'image';
+
     if (storyViewerImg) {
-      storyViewerImg.src = data.img;
+      storyViewerImg.src = srcUrl;
       storyViewerImg.style.display = 'block';
     }
 
@@ -1481,12 +3710,126 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const mediaContainer = document.getElementById('story-viewer-media-container');
-    if (mediaContainer && data.img) {
-      const isVideo = data.mediaType ? data.mediaType.includes('video') : (typeof data.img === 'string' && (data.img.endsWith('.mp4') || data.img.startsWith('data:video')));
+    const isVideo = typeStr.includes('video') || (typeof srcUrl === 'string' && (srcUrl.endsWith('.mp4') || srcUrl.startsWith('data:video') || srcUrl.includes('/video/') || srcUrl.includes('format=mp4')));
+    if (mediaContainer && srcUrl) {
       if (isVideo) {
-        mediaContainer.innerHTML = `<video src="${data.img}" autoplay controls style="max-width:100%; max-height:100%; object-fit:contain; border-radius:12px;"></video>`;
+        mediaContainer.innerHTML = '';
+        const video = document.createElement('video');
+        video.src = srcUrl;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.style.cssText = 'max-width:100%; max-height:100%; object-fit:contain; border-radius:12px;';
+        mediaContainer.appendChild(video);
       } else {
-        mediaContainer.innerHTML = `<img src="${data.img}" id="story-viewer-img" alt="Story content" style="max-width:100%; max-height:100%; object-fit:contain; border-radius:12px;">`;
+        mediaContainer.innerHTML = `<img src="${srcUrl}" id="story-viewer-img" alt="Story content" style="max-width:100%; max-height:100%; object-fit:contain; border-radius:12px;">`;
+      }
+    }
+
+    // Render interactive stickers overlay onto Story Viewer
+    let stickersContainer = document.getElementById('story-viewer-stickers-container');
+    if (!stickersContainer) {
+      stickersContainer = document.createElement('div');
+      stickersContainer.id = 'story-viewer-stickers-container';
+      stickersContainer.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; overflow: hidden;';
+      if (storyContentBox) storyContentBox.appendChild(stickersContainer);
+    }
+    stickersContainer.innerHTML = '';
+
+    const storyLayers = data.layers || (currentMediaItem.editorState && currentMediaItem.editorState.layers) || [];
+    let hasMusicSticker = false;
+    let hasLocationSticker = false;
+
+    if (storyLayers && storyLayers.length > 0) {
+      storyLayers.forEach(layer => {
+        const el = document.createElement('div');
+        el.style.cssText = `position: absolute; left: ${layer.x}%; top: ${layer.y}%; transform: translate(-50%, -50%) rotate(${layer.rotation || 0}deg) scale(${layer.scale || 1}); z-index: ${layer.zIndex || 10}; pointer-events: none;`;
+
+        if (layer.type === 'music') {
+          hasMusicSticker = true;
+          const track = layer.track || data.music || data.musicTrack || (currentMediaItem.editorState && currentMediaItem.editorState.musicTrack) || {};
+          const artwork = track.artwork || layer.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80';
+          const title = track.title || layer.content || 'Music';
+          const artist = track.artist || layer.artist || '';
+
+          el.innerHTML = `
+            <div class="story-music-sticker-card" style="display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: rgba(20, 20, 25, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.2); border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: white; min-width: 140px; max-width: 260px; user-select: none;">
+              <div style="position: relative; width: 32px; height: 32px; flex-shrink: 0;">
+                <img src="${artwork}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(255,255,255,0.4); animation: rotateDisc 8s linear infinite;" alt="Artwork" />
+                <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.3); border-radius: 50%;">
+                  <span style="font-size: 11px;">🎵</span>
+                </div>
+              </div>
+              <div style="display: flex; flex-direction: column; min-width: 0; text-align: left;">
+                <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2;">${title}</span>
+                <span style="font-size: 10px; color: rgba(255,255,255,0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;">${artist}</span>
+              </div>
+            </div>
+          `;
+        } else if (layer.type === 'location') {
+          hasLocationSticker = true;
+          const loc = layer.loc || data.locationData || data.selectedLocation || {};
+          const locName = typeof loc === 'string' ? loc : (loc.displayName || loc.name || layer.content || 'Location');
+
+          el.innerHTML = `
+            <div class="story-location-sticker-card" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; background: linear-gradient(135deg, rgba(168,85,247,0.85) 0%, rgba(126,34,206,0.9) 100%); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.25); border-radius: 20px; box-shadow: 0 6px 20px rgba(168,85,247,0.35); color: white; user-select: none;">
+              <span style="font-size: 13px;">📍</span>
+              <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">${locName}</span>
+            </div>
+          `;
+        } else if (layer.type === 'text') {
+          el.innerHTML = `<div style="color: ${layer.styles?.color || layer.color || 'white'}; font-family: ${layer.styles?.font || layer.fontFamily || 'inherit'}; font-size: ${layer.styles?.size || layer.fontSize || 24}px; font-weight: ${(layer.styles?.bold || layer.bold) ? 'bold' : 'normal'}; font-style: ${(layer.styles?.italic || layer.italic) ? 'italic' : 'normal'}; text-shadow: 0 2px 10px rgba(0,0,0,0.6); text-align: center; white-space: pre-wrap;">${layer.content || layer.text || ''}</div>`;
+        } else if (layer.type === 'sticker') {
+          el.innerHTML = `<div style="font-size: ${layer.styles?.size || 80}px; pointer-events: none;">${layer.content || layer.emoji || ''}</div>`;
+        }
+        stickersContainer.appendChild(el);
+      });
+    }
+
+    // Default stickers fallback if metadata exists but wasn't in layers
+    if (!hasMusicSticker && musicVal && (musicVal.title || typeof musicVal === 'string')) {
+      const track = typeof musicVal === 'string' ? { title: musicVal, artist: '' } : musicVal;
+      const el = document.createElement('div');
+      el.style.cssText = `position: absolute; left: 50%; top: 72%; transform: translate(-50%, -50%); z-index: 10; pointer-events: none;`;
+      el.innerHTML = `
+        <div class="story-music-sticker-card" style="display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: rgba(20, 20, 25, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.2); border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: white; min-width: 140px; max-width: 260px; user-select: none;">
+          <div style="position: relative; width: 32px; height: 32px; flex-shrink: 0;">
+            <img src="${track.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80'}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(255,255,255,0.4); animation: rotateDisc 8s linear infinite;" alt="Artwork" />
+            <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.3); border-radius: 50%;">
+              <span style="font-size: 11px;">🎵</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; min-width: 0; text-align: left;">
+            <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2;">${track.title}</span>
+            <span style="font-size: 10px; color: rgba(255,255,255,0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;">${track.artist || ''}</span>
+          </div>
+        </div>
+      `;
+      stickersContainer.appendChild(el);
+    }
+
+    if (!hasLocationSticker && locVal) {
+      const locName = typeof locVal === 'string' ? locVal : (locVal.displayName || locVal.name || 'Location');
+      const el = document.createElement('div');
+      el.style.cssText = `position: absolute; left: 50%; top: 25%; transform: translate(-50%, -50%); z-index: 10; pointer-events: none;`;
+      el.innerHTML = `
+        <div class="story-location-sticker-card" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; background: linear-gradient(135deg, rgba(168,85,247,0.85) 0%, rgba(126,34,206,0.9) 100%); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.25); border-radius: 20px; box-shadow: 0 6px 20px rgba(168,85,247,0.35); color: white; user-select: none;">
+          <span style="font-size: 13px;">📍</span>
+          <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">${locName}</span>
+        </div>
+      `;
+      stickersContainer.appendChild(el);
+    }
+
+    // Story Viewer Background Music Playback via Singleton StoryAudioManager
+    if (window.StoryAudioManager) {
+      window.StoryAudioManager.destroy();
+    }
+    const isMusicMuted = !!(musicVal && (musicVal.isMuted || musicVal.muted));
+    const audioUrl = (musicVal && (musicVal.previewUrl || musicVal.url)) || null;
+    if (audioUrl && window.StoryAudioManager) {
+      window.StoryAudioManager.load(musicVal, 'viewer');
+      if (!isMusicMuted) {
+        window.StoryAudioManager.play('viewer');
       }
     }
 
@@ -1499,16 +3842,44 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     console.log(`[STAGE 5: renderStoryViewer / loadStoryContent()] Group: ${groupIndex}, Story: ${storyIndex} | StoryId: ${data._id} | isLiked: ${data.isLiked} | likesCount: ${data.likesCount} | time: ${formatStoryTime(data.createdAt || data.created_at)}`);
-    updateStoryLikeUI(data.isLiked || false, data.likesCount || 0);
+
+    const storyFooter = document.querySelector('.story-viewer-footer');
+    if (storyFooter) storyFooter.style.display = 'flex';
 
     const storyReplyInput = document.getElementById('story-reply-input');
+    const storyLikeBtn = document.getElementById('story-like-btn');
     const storyShareBtn = document.getElementById('story-share-btn');
     const storyReplySend = document.getElementById('story-reply-send');
     const storyLikeCount = document.getElementById('story-like-count');
-    if (storyLikeCount) storyLikeCount.textContent = data.likesCount || 0;
-    if (storyReplyInput) storyReplyInput.style.display = 'block';
-    if (storyShareBtn) storyShareBtn.style.display = 'flex';
+    const storyInsightsBtn = document.getElementById('story-insights-trigger-btn');
+    const storyInsightsViews = document.getElementById('story-insights-views');
+    const storyInsightsLikes = document.getElementById('story-insights-likes');
+
+    if (storyReplyInput) {
+      storyReplyInput.style.display = 'block';
+      storyReplyInput.value = '';
+    }
+    if (storyLikeBtn) storyLikeBtn.style.display = 'flex';
     if (storyReplySend) storyReplySend.style.display = 'flex';
+
+    if (data.authorId === currentUserId) {
+      if (storyInsightsBtn) {
+        storyInsightsBtn.style.display = 'flex';
+        if (storyInsightsViews) storyInsightsViews.textContent = data.viewsCount || 0;
+      }
+    } else {
+      if (storyInsightsBtn) storyInsightsBtn.style.display = 'none';
+    }
+
+    if (storyShareBtn) storyShareBtn.style.display = 'flex';
+    if (storyLikeCount) storyLikeCount.textContent = data.likesCount || 0;
+
+    updateStoryLikeUI(data.isLiked || false, data.likesCount || 0);
+
+    // Refresh icons inside action bar
+    if (window.lucide && typeof window.lucide.createIcons === 'function') {
+      window.lucide.createIcons();
+    }
 
     storyProgressBars.innerHTML = '';
     for (let i = 0; i < group.stories.length; i++) {
@@ -1528,53 +3899,167 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     state.isStoryPaused = false;
-    startStoryTimer();
+    startStoryTimer(isVideo);
   }
 
-  function startStoryTimer() {
-    if (state.storyProgressInterval) return;
+  function advanceNextStory() {
+    stopStoryTimer();
+    if (window.StoryAudioManager) {
+      window.StoryAudioManager.destroy();
+    }
+    state.storyProgressPercent = 0;
+    const group = state.storyGroups?.[state.activeGroupIndex];
+    if (!group) {
+      closeStoryViewer();
+      return;
+    }
+    const currentStory = group.stories?.[state.activeStoryIndex];
+    const mediaLen = (currentStory && currentStory.mediaItems && currentStory.mediaItems.length > 0) ? currentStory.mediaItems.length : 1;
+
+    if (state.activeMediaIndex < mediaLen - 1) {
+      openStoryViewer(state.activeGroupIndex, state.activeStoryIndex, state.activeMediaIndex + 1);
+    } else if (state.activeStoryIndex < group.stories.length - 1) {
+      openStoryViewer(state.activeGroupIndex, state.activeStoryIndex + 1, 0);
+    } else if (state.activeGroupIndex < state.storyGroups.length - 1) {
+      openStoryViewer(state.activeGroupIndex + 1, 0, 0);
+    } else {
+      closeStoryViewer();
+    }
+  }
+
+  function advancePrevStory() {
+    stopStoryTimer();
+    if (window.StoryAudioManager) {
+      window.StoryAudioManager.destroy();
+    }
+    state.storyProgressPercent = 0;
+    const group = state.storyGroups?.[state.activeGroupIndex];
+    if (!group) return;
+
+    if (state.activeMediaIndex > 0) {
+      openStoryViewer(state.activeGroupIndex, state.activeStoryIndex, state.activeMediaIndex - 1);
+    } else if (state.activeStoryIndex > 0) {
+      const prevStory = group.stories[state.activeStoryIndex - 1];
+      const prevMediaLen = (prevStory.mediaItems && prevStory.mediaItems.length > 0) ? prevStory.mediaItems.length : 1;
+      openStoryViewer(state.activeGroupIndex, state.activeStoryIndex - 1, prevMediaLen - 1);
+    } else if (state.activeGroupIndex > 0) {
+      const prevGroup = state.storyGroups[state.activeGroupIndex - 1];
+      const prevStory = prevGroup.stories[prevGroup.stories.length - 1];
+      const prevMediaLen = (prevStory.mediaItems && prevStory.mediaItems.length > 0) ? prevStory.mediaItems.length : 1;
+      openStoryViewer(state.activeGroupIndex - 1, prevGroup.stories.length - 1, prevMediaLen - 1);
+    }
+  }
+
+  function startStoryTimer(isVideo = false) {
+    stopStoryTimer();
 
     const activeFill = storyProgressBars.children[state.activeStoryIndex]?.querySelector('.story-progress-bar-fill');
+    if (activeFill) activeFill.style.width = '0%';
+    state.storyProgressPercent = 0;
+
     let tickCount = 0;
 
-    state.storyProgressInterval = setInterval(() => {
-      if (state.isStoryPaused) return;
-      state.storyProgressPercent += 0.4;
-      if (activeFill) activeFill.style.width = `${state.storyProgressPercent}%`;
+    if (isVideo) {
+      const mediaContainer = document.getElementById('story-viewer-media-container');
+      const video = mediaContainer ? mediaContainer.querySelector('video') : null;
 
-      tickCount++;
-      // Live dynamic relative time update every 1 second (50 * 20ms = 1000ms)
-      if (tickCount % 50 === 0) {
-        const group = state.storyGroups?.[state.activeGroupIndex];
-        const data = group?.stories?.[state.activeStoryIndex];
-        if (data && storyViewerTime) {
-          storyViewerTime.textContent = formatStoryTime(data.createdAt || data.created_at || data.time);
+      if (video) {
+        let hasEnded = false;
 
-          // Live 24-hour expiry check
-          const createdMs = new Date(data.createdAt || data.created_at).getTime();
-          if (!isNaN(createdMs) && (Date.now() - createdMs >= 24 * 60 * 60 * 1000)) {
-            console.log(`[LIVE EXPIRY] Story ${data._id} reached 24 hours while watching.`);
-            if (typeof purgeExpiredStories === 'function') {
-              purgeExpiredStories();
+        const onTimeUpdate = () => {
+          if (hasEnded) return;
+          if (video.duration && !isNaN(video.duration) && isFinite(video.duration) && video.duration > 0) {
+            const pct = Math.min(100, (video.currentTime / video.duration) * 100);
+            state.storyProgressPercent = pct;
+            if (activeFill) activeFill.style.width = `${pct}%`;
+          }
+        };
+
+        const onEnded = () => {
+          if (hasEnded) return;
+          hasEnded = true;
+          if (activeFill) activeFill.style.width = '100%';
+          advanceNextStory();
+        };
+
+        const onError = () => {
+          console.warn('[Story Viewer] Video failed to load/play, advancing');
+          if (!hasEnded) {
+            hasEnded = true;
+            advanceNextStory();
+          }
+        };
+
+        video.addEventListener('timeupdate', onTimeUpdate);
+        video.addEventListener('ended', onEnded);
+        video.addEventListener('error', onError);
+
+        state._storyVideoCleanup = () => {
+          try {
+            video.removeEventListener('timeupdate', onTimeUpdate);
+            video.removeEventListener('ended', onEnded);
+            video.removeEventListener('error', onError);
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+          } catch (_) {}
+        };
+
+        const playPromise = video.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(err => {
+            console.warn('[Story Viewer Video Autoplay notice]:', err.message);
+          });
+        }
+      }
+
+      // Live ticker for 24-hour expiry check and relative timestamp updates
+      state.storyProgressInterval = setInterval(() => {
+        if (state.isStoryPaused || state.isStoryViewsOpen) return;
+        tickCount++;
+        if (tickCount % 50 === 0) {
+          const group = state.storyGroups?.[state.activeGroupIndex];
+          const data = group?.stories?.[state.activeStoryIndex];
+          if (data && storyViewerTime) {
+            storyViewerTime.textContent = formatStoryTime(data.createdAt || data.created_at || data.time);
+            const createdMs = new Date(data.createdAt || data.created_at).getTime();
+            if (!isNaN(createdMs) && (Date.now() - createdMs >= 24 * 60 * 60 * 1000)) {
+              if (typeof purgeExpiredStories === 'function') {
+                purgeExpiredStories();
+              }
             }
-            return;
           }
         }
-      }
+      }, 20);
 
-      if (state.storyProgressPercent >= 100) {
-        stopStoryTimer();
-        state.storyProgressPercent = 0;
-        const group = state.storyGroups[state.activeGroupIndex];
-        if (state.activeStoryIndex < group.stories.length - 1) {
-          openStoryViewer(state.activeGroupIndex, state.activeStoryIndex + 1);
-        } else if (state.activeGroupIndex < state.storyGroups.length - 1) {
-          openStoryViewer(state.activeGroupIndex + 1, 0);
-        } else {
-          closeStoryViewer();
+    } else {
+      // Standard image timer (5 seconds)
+      state.storyProgressInterval = setInterval(() => {
+        if (state.isStoryPaused || state.isStoryViewsOpen) return;
+        state.storyProgressPercent += 0.4;
+        if (activeFill) activeFill.style.width = `${state.storyProgressPercent}%`;
+
+        tickCount++;
+        if (tickCount % 50 === 0) {
+          const group = state.storyGroups?.[state.activeGroupIndex];
+          const data = group?.stories?.[state.activeStoryIndex];
+          if (data && storyViewerTime) {
+            storyViewerTime.textContent = formatStoryTime(data.createdAt || data.created_at || data.time);
+            const createdMs = new Date(data.createdAt || data.created_at).getTime();
+            if (!isNaN(createdMs) && (Date.now() - createdMs >= 24 * 60 * 60 * 1000)) {
+              if (typeof purgeExpiredStories === 'function') {
+                purgeExpiredStories();
+              }
+              return;
+            }
+          }
         }
-      }
-    }, 20);
+
+        if (state.storyProgressPercent >= 100) {
+          advanceNextStory();
+        }
+      }, 20);
+    }
   }
 
   function stopStoryTimer() {
@@ -1582,20 +4067,73 @@ document.addEventListener('DOMContentLoaded', () => {
       clearInterval(state.storyProgressInterval);
       state.storyProgressInterval = null;
     }
+    if (typeof state._storyVideoCleanup === 'function') {
+      state._storyVideoCleanup();
+      state._storyVideoCleanup = null;
+    }
+    stopStoryHeaderTicker();
   }
 
   function closeStoryViewer() {
     stopStoryTimer();
+    if (window.StoryAudioManager) {
+      window.StoryAudioManager.destroy();
+    }
     state.storyProgressPercent = 0;
+    state.isStoryViewsOpen = false;
+    const mediaContainer = document.getElementById('story-viewer-media-container');
+    if (mediaContainer) {
+      const v = mediaContainer.querySelector('video');
+      if (v) {
+        try {
+          v.pause();
+          v.removeAttribute('src');
+          v.load();
+        } catch (_) {}
+      }
+      mediaContainer.innerHTML = '';
+    }
+    const stickersContainer = document.getElementById('story-viewer-stickers-container');
+    if (stickersContainer) stickersContainer.innerHTML = '';
+
+    const storyViewsPanel = document.getElementById('story-views-panel');
+    if (storyViewsPanel) {
+      storyViewsPanel.classList.remove('active');
+      storyViewsPanel.style.transform = '';
+    }
+
     if (storyViewer) {
       storyViewer.classList.remove('active');
       storyViewer.style.display = 'none';
     }
+    if (typeof updateStoryRingsUI === 'function') {
+      updateStoryRingsUI();
+    }
   }
 
   // Tap to Pause implementation
-  const pauseStory = () => { state.isStoryPaused = true; };
-  const resumeStory = () => { state.isStoryPaused = false; };
+  const pauseStory = () => {
+    state.isStoryPaused = true;
+    const mediaContainer = document.getElementById('story-viewer-media-container');
+    const video = mediaContainer ? mediaContainer.querySelector('video') : null;
+    if (video && !video.paused) {
+      video.pause();
+    }
+    if (window.StoryAudioManager) {
+      window.StoryAudioManager.pause();
+    }
+  };
+  const resumeStory = () => {
+    state.isStoryPaused = false;
+    const mediaContainer = document.getElementById('story-viewer-media-container');
+    const video = mediaContainer ? mediaContainer.querySelector('video') : null;
+    if (video && video.paused && !state.isStoryViewsOpen) {
+      video.play().catch(() => {});
+    }
+    if (window.StoryAudioManager && !state.isStoryViewsOpen) {
+      window.StoryAudioManager.resume();
+    }
+  };
   if (storyContentBox) {
     storyContentBox.addEventListener('mousedown', pauseStory);
     storyContentBox.addEventListener('mouseup', resumeStory);
@@ -1607,54 +4145,88 @@ document.addEventListener('DOMContentLoaded', () => {
   if (storyViewerClose) storyViewerClose.addEventListener('click', closeStoryViewer);
   if (storyViewerDelete) storyViewerDelete.addEventListener('click', deleteCurrentStory);
 
+  if (storyViewerAvatar) {
+    storyViewerAvatar.style.cursor = 'pointer';
+    storyViewerAvatar.addEventListener('click', () => {
+      const group = state.storyGroups?.[state.activeGroupIndex];
+      const data = group?.stories?.[state.activeStoryIndex];
+      const authorId = getUserIdentifier(data?.author) || data?.authorId || getUserIdentifier(group?.user);
+      if (authorId) {
+        closeStoryViewer();
+        switchView('profile', authorId);
+      }
+    });
+  }
+
+  if (storyViewerName) {
+    storyViewerName.style.cursor = 'pointer';
+    storyViewerName.addEventListener('click', () => {
+      const group = state.storyGroups?.[state.activeGroupIndex];
+      const data = group?.stories?.[state.activeStoryIndex];
+      const authorId = getUserIdentifier(data?.author) || data?.authorId || getUserIdentifier(group?.user);
+      if (authorId) {
+        closeStoryViewer();
+        switchView('profile', authorId);
+      }
+    });
+  }
+
   if (storyPrev) {
     storyPrev.addEventListener('click', (e) => {
       e.stopPropagation();
-      stopStoryTimer();
-      state.storyProgressPercent = 0;
-      if (state.activeStoryIndex > 0) {
-        openStoryViewer(state.activeGroupIndex, state.activeStoryIndex - 1);
-      } else if (state.activeGroupIndex > 0) {
-        const prevGroup = state.storyGroups[state.activeGroupIndex - 1];
-        openStoryViewer(state.activeGroupIndex - 1, prevGroup.stories.length - 1);
-      }
+      advancePrevStory();
     });
   }
   if (storyNext) {
     storyNext.addEventListener('click', (e) => {
       e.stopPropagation();
-      stopStoryTimer();
-      state.storyProgressPercent = 0;
-      const group = state.storyGroups[state.activeGroupIndex];
-      if (state.activeStoryIndex < group.stories.length - 1) {
-        openStoryViewer(state.activeGroupIndex, state.activeStoryIndex + 1);
-      } else if (state.activeGroupIndex < state.storyGroups.length - 1) {
-        openStoryViewer(state.activeGroupIndex + 1, 0);
-      } else {
-        closeStoryViewer();
+      advanceNextStory();
+    });
+  }
+
+  const storyReplyInput = document.getElementById('story-reply-input');
+  if (storyReplyInput) {
+    storyReplyInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const txt = storyReplyInput.value.trim();
+        if (txt) {
+          showToast('Hubs reply sent! 💬');
+          storyReplyInput.value = '';
+          closeStoryViewer();
+        } else {
+          showToast('Please type a message before sending.');
+        }
       }
     });
   }
 
-  // Reply Story simulation
-  const storyReplySend = document.getElementById('story-reply-send');
-  const storyReplyInput = document.getElementById('story-reply-input');
-  if (storyReplySend) {
-    storyReplySend.addEventListener('click', (e) => {
+  // Story Share Button Handler
+  const storyShareBtn = document.getElementById('story-share-btn');
+  if (storyShareBtn) {
+    storyShareBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const txt = storyReplyInput.value.trim();
-      if (txt) {
-        showToast('Hubs reply sent! 💬');
-        storyReplyInput.value = '';
-        closeStoryViewer();
-      } else {
-        pauseStory();
-        const group = state.storyGroups[state.activeGroupIndex];
-        const storyData = group?.stories[state.activeStoryIndex];
-        if (storyData && storyData._id) {
-          if (typeof openShare === 'function') {
-            openShare('story_' + storyData._id);
-          }
+      pauseStory();
+      const group = state.storyGroups[state.activeGroupIndex];
+      const storyData = group?.stories[state.activeStoryIndex];
+      if (storyData && (storyData._id || storyData.id)) {
+        const storyId = storyData._id || storyData.id;
+        if (typeof openShare === 'function') {
+          openShare('story_' + storyId);
+        } else if (typeof window.openShareModal === 'function') {
+          window.openShareModal({
+            title: storyData.name || 'HUBB on Hi-Hubble',
+            text: storyData.caption || 'Check out this HUBB on Hi-Hubble!',
+            url: window.location.origin + '?story=' + storyId
+          });
+        } else if (navigator.share) {
+          navigator.share({
+            title: storyData.name || 'HUBB on Hi-Hubble',
+            text: storyData.caption || 'Check out this HUBB on Hi-Hubble!',
+            url: window.location.origin + '?story=' + storyId
+          }).catch(() => {});
+        } else {
+          showToast('Share link copied to clipboard! 🔗');
         }
       }
     });
@@ -1735,21 +4307,281 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Remove obsolete storyShareBtn logic
+  // Story Insights Modal Click Handler
+  const storyInsightsTrigger = document.getElementById('story-insights-trigger-btn');
+  const storyViewsPanel = document.getElementById('story-views-panel');
+  const storyInsightsList = document.getElementById('story-insights-list');
+  const storyInsightsViewsPanelText = document.getElementById('story-insights-views-panel');
+  const storyViewsCloseBtn = document.getElementById('story-views-close-btn');
 
-  // --- LOCAL STORAGE VIEWED STATE ---
+  function closeStoryViewsPanel() {
+    if (!storyViewsPanel) return;
+    storyViewsPanel.classList.remove('active');
+    storyViewsPanel.style.transform = '';
+    state.isStoryViewsOpen = false;
+    const mediaContainer = document.getElementById('story-viewer-media-container');
+    if (mediaContainer) {
+      const video = mediaContainer.querySelector('video');
+      if (video && video.dataset.wasPlaying === 'true') {
+        video.play().catch(e => console.warn(e));
+        video.dataset.wasPlaying = 'false';
+      }
+    }
+    if (window.StoryAudioManager && !state.isStoryPaused) {
+      window.StoryAudioManager.resume();
+    }
+  }
+
+  // Close panel on drag handle click or close button
+  const storyViewsDragHandle = document.querySelector('.story-views-drag-handle');
+  if (storyViewsDragHandle) {
+    storyViewsDragHandle.addEventListener('click', closeStoryViewsPanel);
+  }
+  if (storyViewsCloseBtn) {
+    storyViewsCloseBtn.addEventListener('click', closeStoryViewsPanel);
+  }
+
+  // Draggable gesture on storyViewsPanel
+  if (storyViewsPanel) {
+    let startY = 0;
+    let currentY = 0;
+    let isDragging = false;
+
+    storyViewsPanel.addEventListener('touchstart', (e) => {
+      if (e.target === storyViewsDragHandle || e.target.closest('.story-views-title') || storyViewsPanel.scrollTop === 0) {
+        isDragging = true;
+        startY = e.touches[0].clientY;
+        currentY = startY;
+        storyViewsPanel.style.transition = 'none';
+      }
+    }, { passive: true });
+
+    storyViewsPanel.addEventListener('touchmove', (e) => {
+      if (!isDragging) return;
+      currentY = e.touches[0].clientY;
+      const deltaY = currentY - startY;
+      if (deltaY > 0) {
+        storyViewsPanel.style.transform = `translateY(${deltaY}px)`;
+      }
+    }, { passive: true });
+
+    storyViewsPanel.addEventListener('touchend', () => {
+      if (!isDragging) return;
+      isDragging = false;
+      storyViewsPanel.style.transition = 'transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.1)';
+      const deltaY = currentY - startY;
+      if (deltaY > 70) {
+        closeStoryViewsPanel();
+      } else {
+        storyViewsPanel.style.transform = 'translateY(0)';
+      }
+    });
+
+    // Close on click outside panel
+    if (storyContentBox) {
+      storyContentBox.addEventListener('click', (e) => {
+        if (state.isStoryViewsOpen && !e.target.closest('#story-views-panel') && !e.target.closest('#story-insights-trigger-btn')) {
+          closeStoryViewsPanel();
+        }
+      });
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && state.isStoryViewsOpen) {
+        closeStoryViewsPanel();
+      }
+    });
+  }
+
+  async function fetchStoryInsights(storyData) {
+    if (!storyViewsPanel || !storyInsightsList || !storyData) return;
+    const storyId = storyData._id || storyData.id;
+    if (!storyId) return;
+
+    storyInsightsList.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 30px 20px;"><div class="hubble-spinner" style="width: 22px; height: 22px; border: 2px solid rgba(255,255,255,0.1); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 10px auto;"></div>Loading viewers...</div>';
+    if (window.lucide) window.lucide.createIcons();
+
+    const token = localStorage.getItem('invibe_jwt_token');
+    if (!token) {
+      storyInsightsList.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px;">Please log in to view insights.</div>';
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_URL}/api/stories/${storyId}/insights`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      
+      storyInsightsList.innerHTML = '';
+      const viewers = data.viewers || [];
+      if (storyInsightsViewsPanelText) {
+        storyInsightsViewsPanelText.textContent = viewers.length;
+      }
+
+      if (viewers.length > 0) {
+        viewers.forEach(user => {
+          const row = document.createElement('div');
+          row.className = 'insights-user-card';
+          row.style.cssText = 'display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); margin-bottom: 8px;';
+          
+          const heartHtml = user.liked ? '<div class="insights-heart-badge" style="position: absolute; bottom: -2px; right: -2px; width: 18px; height: 18px; border-radius: 50%; background: #ef4444; color: white; display: flex; align-items: center; justify-content: center; font-size: 10px; border: 2px solid #1a1a24;"><i data-lucide="heart" style="width: 10px; height: 10px; fill: white;"></i></div>' : '';
+          const timeStr = user.viewedAt ? formatViewerRelativeTime(user.viewedAt) : (user.liked ? 'Liked your story' : 'Viewed recently');
+          
+          row.innerHTML = `
+            <div class="insights-avatar-wrap" style="position: relative; width: 40px; height: 40px; flex-shrink: 0;">
+              <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${user.fullName}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
+              ${heartHtml}
+            </div>
+            <div style="display: flex; flex-direction: column; flex-grow: 1; min-width: 0;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 13px; font-weight: 600; color: var(--text-main, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${user.fullName || user.username}</span>
+                <span style="font-size: 11px; color: var(--text-muted); flex-shrink: 0;">${timeStr}</span>
+              </div>
+              <span style="font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">@${user.username}</span>
+            </div>
+          `;
+          storyInsightsList.appendChild(row);
+        });
+        if (window.lucide) window.lucide.createIcons();
+      } else {
+        storyInsightsList.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 40px 20px; font-size: 13px;">No viewers yet.</div>';
+      }
+    } catch (err) {
+      console.error('Error fetching story insights:', err);
+      storyInsightsList.innerHTML = `
+        <div style="text-align: center; color: var(--text-muted); padding: 30px 20px; font-size: 13px;">
+          <p style="margin: 0 0 10px 0;">Failed to load insights.</p>
+          <button id="story-insights-retry-btn" style="padding: 6px 16px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; color: white; background: var(--primary, #a855f7); border: none;">Retry</button>
+        </div>
+      `;
+      const retryBtn = document.getElementById('story-insights-retry-btn');
+      if (retryBtn) {
+        retryBtn.onclick = () => fetchStoryInsights(storyData);
+      }
+    }
+  }
+
+  if (storyInsightsTrigger) {
+    storyInsightsTrigger.addEventListener('click', async () => {
+      if (!storyViewsPanel || !storyInsightsList) return;
+      
+      const group = state.storyGroups[state.activeGroupIndex];
+      if (!group) return;
+      const storyData = group.stories[state.activeStoryIndex];
+      if (!storyData || (!storyData._id && !storyData.id)) return;
+
+      if (storyInsightsViewsPanelText) {
+        storyInsightsViewsPanelText.textContent = storyData.viewsCount || 0;
+      }
+
+      storyViewsPanel.classList.add('active');
+      state.isStoryViewsOpen = true;
+
+      const mediaContainer = document.getElementById('story-viewer-media-container');
+      if (mediaContainer) {
+        const video = mediaContainer.querySelector('video');
+        if (video && !video.paused) {
+          video.pause();
+          video.dataset.wasPlaying = 'true';
+        }
+      }
+      if (window.StoryAudioManager) {
+        window.StoryAudioManager.pause();
+      }
+
+      await fetchStoryInsights(storyData);
+    });
+  }
+
+  // --- LOCAL STORAGE & BACKEND VIEWED STATE ---
   function getSeenStories() {
     try { return JSON.parse(localStorage.getItem('hihubble_seen_stories') || '[]'); }
     catch (e) { return []; }
   }
-  function markStorySeen(id) {
+
+  function markStorySeen(id, syncBackend = true) {
     if (!id) return;
     const seen = getSeenStories();
     if (!seen.includes(id)) {
       seen.push(id);
       localStorage.setItem('hihubble_seen_stories', JSON.stringify(seen));
     }
+
+    if (syncBackend) {
+      const token = localStorage.getItem('invibe_jwt_token');
+      if (token) {
+        fetch(`${API_URL}/api/stories/${id}/view`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          }
+        }).catch(err => console.warn('Failed to sync story view with backend:', err));
+      }
+    }
+
+    updateStoryRingsUI();
   }
+
+  function updateStoryRingsUI() {
+    const seen = getSeenStories();
+    const currentUser = getCurrentUser();
+    const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+    const currentUserIdStr = currentUserId ? currentUserId.toString() : '';
+
+    const storyScroll = document.getElementById('stories-scroll');
+    if (storyScroll && state.storyGroups && state.storyGroups.length > 0) {
+      const cards = storyScroll.querySelectorAll('.story-card.active-story');
+      cards.forEach(card => {
+        const groupIdx = parseInt(card.getAttribute('data-group-index'), 10);
+        const group = state.storyGroups[groupIdx];
+        if (group && group.stories && group.stories.length > 0) {
+          const isSeen = group.stories.every(s => seen.includes(s._id || s.id));
+          const groupAuthorId = (group.authorId || group.author?._id || group.author?.id || '').toString();
+          const isOwnGroup = currentUserIdStr && groupAuthorId === currentUserIdStr;
+
+          // If own story has now been viewed, remove it from the separate story strip
+          if (isOwnGroup && isSeen) {
+            card.remove();
+            return;
+          }
+
+          if (isSeen) {
+            card.classList.add('story-seen');
+          } else {
+            card.classList.remove('story-seen');
+          }
+        }
+      });
+    }
+
+    // Also update current user story button
+    const yourVibeBtn = document.getElementById('story-btn-current');
+    if (yourVibeBtn) {
+      const myGroup = state.storyGroups ? state.storyGroups.find(g => {
+        const gAuthorId = (g.authorId || g.author?._id || g.author?.id || '').toString();
+        return currentUserIdStr && gAuthorId === currentUserIdStr;
+      }) : null;
+
+      if (myGroup && myGroup.stories && myGroup.stories.length > 0) {
+        const mySeen = myGroup.stories.every(s => seen.includes(s._id || s.id));
+        if (mySeen) {
+          yourVibeBtn.classList.add('story-seen');
+        } else {
+          yourVibeBtn.classList.remove('story-seen');
+        }
+      } else {
+        yourVibeBtn.classList.add('story-seen');
+      }
+    }
+  }
+
+  window.markStorySeen = markStorySeen;
+  window.markStoryAsViewed = markStorySeen;
+  window.updateStoryRingsUI = updateStoryRingsUI;
+  window.closeStoryViewer = closeStoryViewer;
 
   // Render story rings cleanly from state.storyGroups
   function renderStoryRings() {
@@ -1757,11 +4589,26 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!storyScroll) return;
 
     storyScroll.innerHTML = '';
-    if (!state.storyGroups || state.storyGroups.length === 0) return;
+    if (!state.storyGroups || state.storyGroups.length === 0) {
+      updateStoryRingsUI();
+      return;
+    }
+
+    const currentUser = getCurrentUser();
+    const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+    const currentUserIdStr = currentUserId ? currentUserId.toString() : '';
 
     state.storyGroups.forEach((group, idx) => {
       if (!group.stories || group.stories.length === 0) return;
-      const isSeen = group.stories.every(s => getSeenStories().includes(s._id));
+      const isSeen = group.stories.every(s => getSeenStories().includes(s._id || s.id));
+      const groupAuthorId = (group.authorId || group.author?._id || group.author?.id || '').toString();
+      const isOwnGroup = currentUserIdStr && groupAuthorId === currentUserIdStr;
+
+      // For the logged-in user's own story:
+      // The user's profile circle (#story-btn-current) represents their story.
+      // Do NOT render the own story as a separate item in the story strip if it is already viewed.
+      if (isOwnGroup && isSeen) return;
+
       const card = document.createElement('div');
       card.className = `story-card active-story ${isSeen ? 'story-seen' : ''}`;
       card.setAttribute('data-group-index', idx);
@@ -1772,20 +4619,19 @@ document.addEventListener('DOMContentLoaded', () => {
           <img src="${group.avatar}" alt="${group.name}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 50%; border: 2px solid rgba(0,0,0,0.1);" />
         </div>
         <div style="display: flex; flex-direction: column; align-items: center; text-align: center; width: 100%; overflow: hidden;">
-          <span class="story-username" style="font-weight: 600; color: #fff; font-size: 0.85rem; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${group.name}</span>
+          <span class="story-username" style="font-weight: 600; color: var(--text-main); font-size: 0.85rem; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${group.name}</span>
           <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 2px;">${hubCount} hub${hubCount > 1 ? 's' : ''}</span>
         </div>
       `;
 
       card.addEventListener('click', () => {
         openStoryViewer(idx, 0);
-        group.stories.forEach(s => markStorySeen(s._id));
-        card.classList.add('story-seen');
       });
 
       storyScroll.appendChild(card);
     });
 
+    updateStoryRingsUI();
     debouncedCreateIcons();
   }
   window.renderStoryRings = renderStoryRings;
@@ -1853,12 +4699,20 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.target.closest('#add-story-file-trigger')) return;
             const currentUser = getCurrentUser();
             const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+            const currentUserIdStr = currentUserId ? currentUserId.toString() : '';
             if (state.storyGroups && state.storyGroups.length > 0) {
-              const myGroupIdx = state.storyGroups.findIndex(g => g.authorId === currentUserId);
+              const myGroupIdx = state.storyGroups.findIndex(g => {
+                const gAuthorId = (g.authorId || g.author?._id || g.author?.id || '').toString();
+                return currentUserIdStr && gAuthorId === currentUserIdStr;
+              });
               if (myGroupIdx !== -1) {
-                openStoryViewer(myGroupIdx, 0);
+                const myGroup = state.storyGroups[myGroupIdx];
+                const seen = getSeenStories();
+                let firstUnviewedIdx = myGroup.stories.findIndex(s => !seen.includes(s._id || s.id));
+                if (firstUnviewedIdx === -1) firstUnviewedIdx = 0;
+                openStoryViewer(myGroupIdx, firstUnviewedIdx);
               } else {
-                openStoryViewer(0, 0);
+                switchView('create-hubbs');
               }
             } else {
               switchView('create-hubbs');
@@ -1902,20 +4756,39 @@ document.addEventListener('DOMContentLoaded', () => {
             stories: []
           };
         }
+        
+        const storyId = story._id || story.id;
+        
+        if (story.isViewed) {
+          markStorySeen(storyId, false);
+        }
+
+        const itemsToPush = (story.mediaItems && story.mediaItems.length > 0) ? story.mediaItems : [{
+          mediaUrl: story.mediaUrl,
+          mediaType: story.mediaType || story.media_type || 'image'
+        }];
+
         groupedStories[authorId].stories.push({
-          _id: story._id || story.id,
+          _id: storyId,
           authorId: authorId,
           name: (story.author && story.author.fullName) || 'User',
           avatar: (story.author && story.author.profileImage) || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80',
-          img: story.mediaUrl,
+          img: itemsToPush[0].mediaUrl || itemsToPush[0].media_url || story.mediaUrl,
           caption: story.caption || '',
-          mediaType: story.mediaType || story.media_type || 'image',
+          mediaType: itemsToPush[0].mediaType || itemsToPush[0].media_type || story.mediaType || 'image',
+          mediaItems: itemsToPush, // Persist the nested media array
+          music: story.music || story.musicTrack || null,
+          musicTrack: story.music || story.musicTrack || null,
+          location: story.location || (story.locationData ? (story.locationData.displayName || story.locationData.name) : null),
+          locationData: story.locationData || null,
+          layers: story.layers || [],
           createdAt: rawCreatedAt,
           created_at: rawCreatedAt,
           time: formatStoryTime(rawCreatedAt),
           likesCount: likesCount,
           isLiked: isLiked,
-          likes: likes
+          likes: likes,
+          viewsCount: story.viewsCount || 0
         });
       });
 
@@ -2038,21 +4911,54 @@ document.addEventListener('DOMContentLoaded', () => {
           console.log('⚡ Realtime comment change event received from Supabase!');
           if (typeof loadFeedPosts === 'function') loadFeedPosts();
         })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'reels' }, () => {
-          console.log('⚡ Realtime reel change event received from Supabase!');
-          if (typeof loadFeedReels === 'function') loadFeedReels();
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'reels' }, (payload) => {
+          console.log('⚡ Realtime reel change event received from Supabase!', payload);
+          // Only refresh on INSERT or DELETE when not actively in middle of reel playback
+          if (payload.eventType === 'INSERT' || payload.eventType === 'DELETE') {
+            const exploreView = document.getElementById('view-explore');
+            if (!exploreView || !exploreView.classList.contains('active')) {
+              if (typeof loadFeedReels === 'function') loadFeedReels();
+            }
+          }
         })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'reel_likes' }, () => {
-          console.log('⚡ Realtime reel_likes change event received from Supabase!');
-          if (typeof loadFeedReels === 'function') loadFeedReels();
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'reel_likes' }, (payload) => {
+          console.log('⚡ Realtime reel_likes change event received from Supabase!', payload);
+          const reelId = payload.new?.reel_id || payload.old?.reel_id;
+          if (reelId) {
+            const card = document.querySelector(`.reel-card[data-reel-id="${reelId}"]`);
+            if (card) {
+              fetch(`${API_URL}/api/reels`).then(r => r.json()).then(reels => {
+                if (Array.isArray(reels)) {
+                  const target = reels.find(r => (r._id || r.id) === reelId);
+                  if (target) {
+                    const countSpan = card.querySelector('.reel-like-action .action-count');
+                    if (countSpan) countSpan.textContent = target.formattedLikes || target.likeCount || '0';
+                  }
+                }
+              }).catch(() => {});
+            }
+          }
         })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'reel_comments' }, () => {
-          console.log('⚡ Realtime reel_comments change event received from Supabase!');
-          if (typeof loadFeedReels === 'function') loadFeedReels();
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'reel_comments' }, (payload) => {
+          console.log('⚡ Realtime reel_comments change event received from Supabase!', payload);
+          const reelId = payload.new?.reel_id || payload.old?.reel_id;
+          if (reelId) {
+            const card = document.querySelector(`.reel-card[data-reel-id="${reelId}"]`);
+            if (card) {
+              fetch(`${API_URL}/api/reels`).then(r => r.json()).then(reels => {
+                if (Array.isArray(reels)) {
+                  const target = reels.find(r => (r._id || r.id) === reelId);
+                  if (target) {
+                    const countSpan = card.querySelector('.reel-comment-sim .action-count');
+                    if (countSpan) countSpan.textContent = target.formattedComments || target.commentCount || '0';
+                  }
+                }
+              }).catch(() => {});
+            }
+          }
         })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'reel_views' }, () => {
           console.log('⚡ Realtime reel_views change event received from Supabase!');
-          if (typeof loadFeedReels === 'function') loadFeedReels();
         })
         .subscribe();
     } catch (rtErr) {
@@ -2116,8 +5022,8 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ mediaUrl: window.currentStoryImageBase64 || currentStoryImageBase64, mediaType: 'image', isDraft })
       });
-      if (!res.ok) throw new Error('Failed to save story');
-      showToast(isDraft ? 'Draft saved!' : 'Story published successfully! 📸✨');
+      if (!res.ok) throw new Error('Failed to save HUBBS');
+      showToast(isDraft ? 'Draft saved!' : 'HUBBS Posted successfully! 📸✨');
       closeStoryCreation();
       loadStories();
     } catch (err) {
@@ -2132,63 +5038,15 @@ document.addEventListener('DOMContentLoaded', () => {
   if (storyCreationDraft) storyCreationDraft.addEventListener('click', () => submitStory(true));
 
   async function loadDrafts() {
-    const token = localStorage.getItem('invibe_jwt_token');
-    if (!token) return;
-    try {
-      const res = await fetch(`${API_URL}/api/stories/drafts`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error('Failed to fetch drafts');
-      const drafts = await res.json();
-      if (storyDraftsList) {
-        storyDraftsList.innerHTML = '';
-        if (drafts.length === 0) {
-          storyDraftsList.innerHTML = '<p style="color: white; text-align: center;">No drafts saved.</p>';
-          return;
-        }
-        drafts.forEach(draft => {
-          const div = document.createElement('div');
-          div.style = 'display: flex; gap: 12px; align-items: center; background: rgba(255,255,255,0.05); padding: 12px; border-radius: 12px;';
-          div.innerHTML = `
-            <img src="${draft.mediaUrl}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;" />
-            <div style="flex: 1; color: white;">
-              <p style="margin: 0; font-size: 14px; color: var(--text-muted);">${formatTimeAgo(draft.createdAt)}</p>
-            </div>
-            <button class="btn btn-primary publish-draft-btn" data-id="${draft._id}" style="padding: 6px 12px; font-size: 12px;">Publish</button>
-            <button class="btn btn-secondary delete-draft-btn" data-id="${draft._id}" style="padding: 6px 12px; font-size: 12px; background: rgba(255,0,0,0.2);">Delete</button>
-          `;
-          storyDraftsList.appendChild(div);
-        });
-
-        document.querySelectorAll('.publish-draft-btn').forEach(btn => {
-          btn.addEventListener('click', async (e) => {
-            const id = e.target.getAttribute('data-id');
-            await fetch(`${API_URL}/api/stories/${id}/publish`, { method: 'PUT', headers: { 'Authorization': `Bearer ${token}` } });
-            showToast('Draft published!');
-            loadDrafts();
-            loadStories();
-          });
-        });
-        document.querySelectorAll('.delete-draft-btn').forEach(btn => {
-          btn.addEventListener('click', async (e) => {
-            const id = e.target.getAttribute('data-id');
-            await fetch(`${API_URL}/api/stories/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
-            showToast('Draft deleted!');
-            loadDrafts();
-          });
-        });
-      }
-    } catch (err) {
-      console.error(err);
+    if (typeof window.renderSeeAllDrafts === 'function') {
+      const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+      await window.renderSeeAllDrafts(searchVal);
     }
   }
 
   if (storyDraftsBtn) {
     storyDraftsBtn.addEventListener('click', () => {
-      if (storyDraftsModal) {
-        storyDraftsModal.classList.add('active');
-        loadDrafts();
-      }
+      if (typeof window.openSeeAllDrafts === 'function') window.openSeeAllDrafts();
     });
   }
   if (storyDraftsClose) {
@@ -2395,7 +5253,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       } catch (err) {
         console.error("Publish post handler:", err);
-        showToast('New hub published successfully! 📸✨');
+        showToast(`Failed to publish post: ${err.message || err} ❌`);
       } finally {
         createPostSubmitBtn.innerHTML = '<i data-lucide="send" style="width:14px; height:14px;"></i> Share Your Hubs';
         debouncedCreateIcons();
@@ -2564,25 +5422,226 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function getChatSecretKey(userA_Id, userB_Id) {
+    if (!userA_Id || !userB_Id) return '';
     return [userA_Id.toString(), userB_Id.toString()].sort().join('_');
   }
 
   function getCurrentUser() {
-    const userStr = localStorage.getItem('invibeUser');
+    const userStr = localStorage.getItem('invibe_user') || localStorage.getItem('invibeUser');
     if (!userStr) return null;
     try { return JSON.parse(userStr); } catch { return null; }
   }
 
   // --- DYNAMIC CHAT LOGS AND FEEDS ---
+  // --- CLEAN DIRECT MESSAGING STATE MODEL (Phase 1) ---
+  const dmState = {
+    activeConversationId: null, // stores targetUserId (key for messagesByConversation)
+    conversationIdByUser: new Map(), // targetUserId -> actual conversations.id from DB
+    messagesByConversation: new Map(), // targetUserId -> array of msg objects
+    loadingConversations: new Set(),
+    loadedConversations: new Set(),
+    realtimeChannel: null,
+    initialized: false
+  };
+  window.dmState = dmState;
+
+  // [DM DOM DEBUG] log helper
+  function logDMDomDebug() {
+    const dmRoots = document.querySelectorAll('#view-chats, #chat-mesh-container').length;
+    const inboxCount = document.querySelectorAll('.chat-inbox-sidebar').length;
+    const panelCount = document.querySelectorAll('.chat-window-main').length;
+    const composerCount = document.querySelectorAll('#chat-message-input').length;
+    console.warn('[DM DOM DEBUG] DM root count:', document.querySelectorAll('#view-chats').length);
+    console.warn('[DM DOM DEBUG] Inbox count:', inboxCount);
+    console.warn('[DM DOM DEBUG] Conversation panel count:', panelCount);
+    console.warn('[DM DOM DEBUG] Composer count:', composerCount);
+    return { dmRoots, inboxCount, panelCount, composerCount };
+  }
+  window.logDMDomDebug = logDMDomDebug;
+
+  // Backward compatibility proxy for existing helpers
+  const chatFeeds = new Proxy({}, {
+    get(target, prop) {
+      return dmState.messagesByConversation.get(prop) || [];
+    },
+    set(target, prop, value) {
+      dmState.messagesByConversation.set(prop, value);
+      return true;
+    }
+  });
+  window.chatFeeds = chatFeeds;
+
+  // Global instrumentation counters for runtime debugging
+  window.__dmLoadMessagesCount = 0;
+  window.__dmRenderMessagesCount = 0;
+
+  // --- DYNAMIC CHAT DOM ELEMENTS ---
   const chatHeaderName = document.querySelector('.chat-header-name');
   const chatHeaderAvatar = document.querySelector('.chat-header-avatar');
+  const chatHeaderStatus = document.getElementById('chat-header-status') || document.querySelector('.chat-header-status');
   const messagesScroll = document.getElementById('chat-messages-container');
   const chatThreadsList = document.querySelector('.chat-threads-list');
 
-  const chatFeeds = {}; // Dynamic local memory: { targetUserId: [messages] }
   let chatThreads = []; // List of active thread items from backend
 
-  // Load chat threads from server
+  // --- CENTRALIZED PRODUCTION-GRADE PRESENCE MANAGER ---
+  const presenceManager = {
+    onlineUserIds: new Set(),
+    activeUsersList: [],
+    onlineCount: 0,
+    isInitialized: false,
+    _realtimeChannel: null,
+    _heartbeatTimer: null,
+
+    isUserOnline(userIdOrIdentifier) {
+      if (!userIdOrIdentifier) return false;
+      const cleanId = (getUserIdentifier(userIdOrIdentifier) || String(userIdOrIdentifier)).trim();
+      return this.onlineUserIds.has(cleanId);
+    },
+
+    updateDMHeader(targetUserId) {
+      const statusEl = document.getElementById('chat-header-status') || document.querySelector('.chat-header-status');
+      if (!statusEl) return;
+      if (!targetUserId) {
+        statusEl.innerHTML = '<span class="dot-offline"></span> Offline';
+        return;
+      }
+      const isOnline = this.isUserOnline(targetUserId);
+      if (isOnline) {
+        statusEl.innerHTML = '<span class="dot-green"></span> Online';
+      } else {
+        statusEl.innerHTML = '<span class="dot-offline"></span> Offline';
+      }
+    },
+
+    syncAllPresenceUI() {
+      // 1. Sync Active Hubbers Widget
+      const activeVibersCount = document.getElementById('active-vibers-count');
+      const activeVibersList = document.getElementById('active-vibers-list');
+      if (activeVibersCount) {
+        activeVibersCount.textContent = `${this.onlineCount} online`;
+      }
+      if (activeVibersList) {
+        activeVibersList.innerHTML = '';
+        if (this.activeUsersList.length === 0) {
+          activeVibersList.innerHTML = '<p style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; width: 100%;">No hubbers online</p>';
+        } else {
+          this.activeUsersList.slice(0, 5).forEach(user => {
+            const circle = document.createElement('div');
+            circle.className = 'face-circle online';
+            circle.style.position = 'relative';
+            circle.style.cursor = 'pointer';
+            circle.title = `${user.fullName} (@${user.username})`;
+            circle.innerHTML = `
+              <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${escapeHtml(user.fullName)}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover;" />
+              <span class="online-indicator-dot" style="position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #22c55e; border: 2px solid #1a1a24; border-radius: 50%;"></span>
+            `;
+            circle.addEventListener('click', () => {
+              switchView('profile', getUserIdentifier(user));
+            });
+            activeVibersList.appendChild(circle);
+          });
+        }
+      }
+
+      // 2. Sync active DM Conversation Header
+      const activeChatUserId = dmState.activeConversationId || state.currentChatThread;
+      if (activeChatUserId) {
+        this.updateDMHeader(activeChatUserId);
+      }
+
+      // 3. Sync Chat Inbox Thread items
+      if (chatThreadsList) {
+        chatThreadsList.querySelectorAll('.thread-item[data-thread]').forEach(item => {
+          const tUserId = item.getAttribute('data-thread');
+          const indicator = item.querySelector('.online-indicator');
+          if (indicator && tUserId) {
+            const isOnline = this.isUserOnline(tUserId);
+            indicator.className = `online-indicator ${isOnline ? 'online' : 'offline'}`;
+          }
+        });
+      }
+    },
+
+    async fetchOnlineUsers() {
+      const token = getAuthToken();
+      if (!token) return;
+      try {
+        const res = await fetch(`${API_URL}/api/online-users`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const rawOnlineIds = Array.isArray(data.onlineUserIds) ? data.onlineUserIds : [];
+        this.onlineUserIds = new Set(rawOnlineIds.map(String));
+        this.onlineCount = typeof data.onlineCount === 'number' ? data.onlineCount : 0;
+        this.activeUsersList = Array.isArray(data.users) ? data.users : [];
+        this.isInitialized = true;
+        this.syncAllPresenceUI();
+      } catch (err) {
+        console.warn('[PresenceManager fetchOnlineUsers Warning]:', err.message);
+      }
+    },
+
+    sendHeartbeat() {
+      const token = getAuthToken();
+      if (!token) return;
+      fetch(`${API_URL}/api/presence/heartbeat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      }).then(() => {
+        const currentUser = getCurrentUser();
+        const myId = currentUser ? (currentUser.id || currentUser._id) : null;
+        if (myId) {
+          this.onlineUserIds.add(myId.toString());
+        }
+      }).catch(() => {});
+    },
+
+    init() {
+      this.sendHeartbeat();
+      this.fetchOnlineUsers();
+
+      if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = setInterval(() => {
+        this.sendHeartbeat();
+        this.fetchOnlineUsers();
+      }, 30000);
+
+      this.setupRealtime();
+    },
+
+    setupRealtime() {
+      if (!window.supabase) return;
+      try {
+        if (this._realtimeChannel) {
+          window.supabase.removeChannel(this._realtimeChannel);
+        }
+        this._realtimeChannel = window.supabase
+          .channel('global_online_users_presence')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'online_users' }, (payload) => {
+            const rec = payload.new || payload.old;
+            if (rec && rec.user_id) {
+              const uId = rec.user_id.toString();
+              if (payload.eventType === 'DELETE' || (payload.new && payload.new.status === 'offline')) {
+                this.onlineUserIds.delete(uId);
+              } else if (payload.new && payload.new.status === 'online') {
+                this.onlineUserIds.add(uId);
+              }
+            }
+            this.fetchOnlineUsers();
+          })
+          .subscribe();
+      } catch (err) {
+        console.warn('[Presence Realtime Subscribe Warning]:', err.message);
+      }
+    }
+  };
+  window.presenceManager = presenceManager;
+
   // Helper to sync unread message badges globally
   function updateGlobalUnreadBadges(count) {
     const badges = [
@@ -2604,14 +5663,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function loadChatThreads() {
+  async function loadChatThreads(autoSelectFirst = false) {
     const token = getAuthToken();
     if (!token) return;
 
     // Check if the user is actively searching in the inbox sidebar
     const inboxSearchInput = document.getElementById('inbox-search-input');
     if (inboxSearchInput && inboxSearchInput.value.trim() !== '') {
-      return; // Do not overwrite search results with polling updates
+      return;
     }
 
     try {
@@ -2622,9 +5681,103 @@ document.addEventListener('DOMContentLoaded', () => {
       chatThreads = await res.json();
 
       renderChatThreadsList();
+
+      const emptyState = document.getElementById('chat-empty-state');
+      const chatHeader = document.getElementById('chat-window-header');
+      const chatViewport = document.querySelector('.chat-dynamic-viewport');
+      const chatFooter = document.getElementById('chat-global-footer');
+
+      if (!Array.isArray(chatThreads) || chatThreads.length === 0) {
+        // Zero conversations: show empty placeholder
+        state.currentChatThread = null;
+        dmState.activeConversationId = null;
+        if (emptyState) emptyState.style.display = 'flex';
+        if (chatHeader) chatHeader.style.display = 'none';
+        if (chatViewport) chatViewport.style.display = 'none';
+        if (chatFooter) chatFooter.style.display = 'none';
+      } else {
+        // Conversations exist: only keep active conversation if already explicitly selected
+        const activeUserId = dmState.activeConversationId || state.currentChatThread;
+        if (activeUserId) {
+          selectConversation(activeUserId);
+        } else {
+          if (emptyState) emptyState.style.display = 'flex';
+          if (chatHeader) chatHeader.style.display = 'none';
+          if (chatViewport) chatViewport.style.display = 'none';
+          if (chatFooter) chatFooter.style.display = 'none';
+        }
+      }
     } catch (err) {
       console.error('Error loading chat threads:', err);
     }
+  }
+
+  function formatConversationPreviewText(lastMsg, secretKey) {
+    if (!lastMsg) return 'Start chatting...';
+    const effectiveMediaType = (lastMsg.mediaType || lastMsg.media_type || (lastMsg.attachment && lastMsg.attachment.file_type) || '').toLowerCase();
+    
+    if (effectiveMediaType === 'image' || effectiveMediaType.includes('image')) {
+      return '📷 Photo';
+    }
+    if (effectiveMediaType === 'video' || effectiveMediaType.includes('video')) {
+      return '📹 Video';
+    }
+    if (effectiveMediaType === 'audio' || effectiveMediaType === 'voice' || effectiveMediaType.includes('audio') || effectiveMediaType.includes('voice')) {
+      return '🎙️ Voice Note';
+    }
+    if (effectiveMediaType === 'file' || effectiveMediaType === 'document') {
+      return '📄 Document';
+    }
+
+    if (!lastMsg.content) {
+      if (lastMsg.mediaUrl || lastMsg.media_url) return '📷 Photo';
+      return 'Start chatting...';
+    }
+
+    let decrypted = secretKey ? decryptMessage(lastMsg.content, secretKey) : lastMsg.content;
+    if (!decrypted) return 'Start chatting...';
+
+    // Check if decrypted string contains media tags or base64 data URLs
+    if (decrypted.startsWith('data:image/') || decrypted.includes('<img')) {
+      return '📷 Photo';
+    }
+    if (decrypted.startsWith('data:video/') || decrypted.includes('<video')) {
+      return '📹 Video';
+    }
+    if (decrypted.startsWith('data:audio/') || decrypted.includes('<audio')) {
+      return '🎙️ Voice Note';
+    }
+
+    try {
+      const parsed = JSON.parse(decrypted);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.type === 'image') return '📷 Photo';
+        if (parsed.type === 'video') return '📹 Video';
+        if (parsed.type === 'audio') return '🎙️ Voice Note';
+        if (parsed.hubType === 'story') {
+          const isStoryStillActive = isStoryActive(parsed.hubId, parsed.timestamp || lastMsg.createdAt || lastMsg.created_at);
+          return isStoryStillActive ? (parsed.text || 'Shared a Hub Story') : 'Shared a Story · Expired';
+        }
+        if (parsed.hubType === 'post' || parsed.hubType === 'reel') {
+          return parsed.text || (parsed.hubType === 'reel' ? 'Shared a Reel' : 'Shared a Post');
+        }
+        if (parsed.text !== undefined) {
+          decrypted = parsed.text;
+        }
+      }
+    } catch (e) {}
+
+    // Strip any remaining HTML tags from preview text
+    const cleanText = decrypted.replace(/<[^>]*>/g, '').trim();
+    if (!cleanText) {
+      if (effectiveMediaType) {
+        if (effectiveMediaType.includes('image')) return '📷 Photo';
+        if (effectiveMediaType.includes('video')) return '📹 Video';
+      }
+      return 'Start chatting...';
+    }
+
+    return cleanText.length > 30 ? cleanText.substring(0, 27) + '...' : cleanText;
   }
 
   function renderChatThreadsList() {
@@ -2640,11 +5793,14 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
+    const activeUserId = dmState.activeConversationId || state.currentChatThread;
+
     chatThreads.forEach(thread => {
       const u = thread.user;
       if (!u) return;
+      const uId = getUserIdentifier(u);
 
-      const isCurrent = state.currentChatThread === u._id;
+      const isCurrent = activeUserId && activeUserId.toString() === uId.toString();
       const lastMsg = thread.lastMessage;
       let lastTextPreview = 'Start chatting...';
       let lastTimeText = '';
@@ -2652,96 +5808,189 @@ document.addEventListener('DOMContentLoaded', () => {
       if (lastMsg) {
         const currentUser = getCurrentUser();
         if (currentUser) {
-          const secretKey = getChatSecretKey(currentUser.id || currentUser._id, u._id);
-          const decrypted = decryptMessage(lastMsg.content, secretKey);
-          lastTextPreview = decrypted.length > 30 ? decrypted.substring(0, 27) + '...' : decrypted;
+          const secretKey = getChatSecretKey(currentUser.id || currentUser._id, uId);
+          lastTextPreview = formatConversationPreviewText(lastMsg, secretKey);
 
-          const msgDate = new Date(lastMsg.createdAt);
+          const rawDate = lastMsg.createdAt || lastMsg.created_at;
+          const msgDate = rawDate ? new Date(rawDate) : new Date();
           lastTimeText = msgDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         }
       }
 
-      const isOnline = (new Date() - new Date(u.lastActive)) < 120000;
-      const statusClass = isOnline ? 'blue-diamond-status' : 'black-diamond-status';
+      const isOnline = presenceManager.isUserOnline(uId) || !!u.isOnline;
+      const statusClass = isOnline ? 'online' : 'offline';
 
       const item = document.createElement('div');
       item.className = `thread-item ${isCurrent ? 'active' : ''}`;
-      item.setAttribute('data-thread', u._id);
+      item.setAttribute('data-thread', uId);
 
       item.innerHTML = `
         <div class="thread-avatar">
-          <img src="${u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${u.fullName}" />
+          <img src="${u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${escapeHtml(u.fullName || u.username)}" />
           <span class="online-indicator ${statusClass}"></span>
         </div>
         <div class="thread-details">
           <div class="thread-meta">
-            <span class="thread-name">${u.fullName}</span>
+            <span class="thread-name">${escapeHtml(u.fullName || u.username)}</span>
             <span class="thread-time">${lastTimeText}</span>
           </div>
           <div class="thread-preview">
-            <span class="preview-text">${lastTextPreview}</span>
+            <span class="preview-text">${escapeHtml(lastTextPreview)}</span>
             ${thread.unreadCount > 0 ? `<span class="unread-count">${thread.unreadCount}</span>` : ''}
           </div>
         </div>
       `;
 
       item.addEventListener('click', () => {
-        state.currentChatThread = u._id;
-        document.querySelectorAll('.thread-item').forEach(t => t.classList.remove('active'));
-        item.classList.add('active');
-
-        // Show chat panels, hide empty state
-        const emptyState = document.getElementById('chat-empty-state');
-        const chatHeader = document.getElementById('chat-window-header');
-        const chatViewport = document.querySelector('.chat-dynamic-viewport');
-        const chatFooter = document.getElementById('chat-global-footer');
-        if (emptyState) emptyState.style.display = 'none';
-        if (chatHeader) chatHeader.style.display = '';
-        if (chatViewport) chatViewport.style.display = '';
-        if (chatFooter) chatFooter.style.display = '';
-
-        if (chatHeaderName) chatHeaderName.textContent = u.fullName;
-        if (chatHeaderAvatar) chatHeaderAvatar.src = u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
-
-        const headerIsOnline = (new Date() - new Date(u.lastActive)) < 120000;
-        const statusHtml = headerIsOnline
-          ? `<span class="online-indicator blue-diamond-status" style="position:static; display:inline-block; margin-right:4px; width:8px; height:8px;"></span> Online`
-          : `<span class="online-indicator black-diamond-status" style="position:static; display:inline-block; margin-right:4px; width:8px; height:8px;"></span> Offline`;
-        const headerStatus = document.querySelector('.chat-header-status');
-        if (headerStatus) headerStatus.innerHTML = statusHtml;
-
-        // Optimistically clear the unread count in UI
-        if (thread.unreadCount > 0) {
-          thread.unreadCount = 0;
-          const badgeEl = item.querySelector('.unread-count');
-          if (badgeEl) badgeEl.remove();
-          // Recalculate total
-          const totalUnread = chatThreads.reduce((sum, t) => sum + (t.unreadCount || 0), 0);
-          updateGlobalUnreadBadges(totalUnread);
+        // Pre-populate conversationIdByUser so selectConversation knows the DB conversation ID
+        if (thread.conversationId && uId) {
+          dmState.conversationIdByUser.set(uId, thread.conversationId);
         }
-
-        fetchMessages(u._id, true);
-        markMessagesAsRead(u._id);
-
-        // Mobile responsive layout trigger
-        if (window.innerWidth <= 680) {
-          const grid = document.querySelector('.chats-layout-grid');
-          if (grid) grid.classList.add('chatting');
-          const mainChat = document.querySelector('.chat-window-main');
-          if (mainChat) mainChat.style.display = 'flex';
-        }
+        selectConversation(u);
       });
 
       chatThreadsList.appendChild(item);
     });
   }
 
-  // Fetch messages between current user and target user
-  async function fetchMessages(targetUserId, forceRender = true) {
+  function updateThreadLastMessageInPlace(targetUserId, msg) {
+    if (!targetUserId || !msg) return;
+    const threadEl = chatThreadsList?.querySelector(`.thread-item[data-thread="${targetUserId}"]`);
+    const currentUser = getCurrentUser();
+    if (!currentUser) return;
+
+    const secretKey = getChatSecretKey(currentUser.id || currentUser._id, targetUserId);
+    const previewText = formatConversationPreviewText(msg, secretKey);
+
+    const msgDate = msg.createdAt ? new Date(msg.createdAt) : new Date();
+    const timeText = msgDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    if (threadEl) {
+      const prevSpan = threadEl.querySelector('.preview-text');
+      if (prevSpan) prevSpan.textContent = previewText;
+      const timeSpan = threadEl.querySelector('.thread-time');
+      if (timeSpan) timeSpan.textContent = timeText;
+
+      const isActive = dmState.activeConversationId && dmState.activeConversationId.toString() === targetUserId.toString();
+      if (!isActive) {
+        const threadObj = chatThreads.find(t => t.user && (getUserIdentifier(t.user) === targetUserId.toString()));
+        if (threadObj) {
+          threadObj.unreadCount = (threadObj.unreadCount || 0) + 1;
+          let countBadge = threadEl.querySelector('.unread-count');
+          if (!countBadge) {
+            countBadge = document.createElement('span');
+            countBadge.className = 'unread-count';
+            threadEl.querySelector('.thread-preview')?.appendChild(countBadge);
+          }
+          countBadge.textContent = threadObj.unreadCount;
+          const totalUnread = chatThreads.reduce((sum, t) => sum + (t.unreadCount || 0), 0);
+          updateGlobalUnreadBadges(totalUnread);
+        }
+      }
+    }
+  }
+
+  // Unified conversation selection handler
+  function selectConversation(targetUserOrId) {
+    const targetUserId = getUserIdentifier(targetUserOrId);
+    if (!targetUserId) return;
+
+    if (typeof clearVoiceNoteState === 'function') {
+      clearVoiceNoteState();
+    }
+
+    state.currentChatThread = targetUserId;
+    dmState.activeConversationId = targetUserId;
+
+    const selectedConversationId = dmState.conversationIdByUser.get(targetUserId) || null;
+    console.warn('[DM DEBUG] selectedUserId:', targetUserId);
+    console.warn('[DM DEBUG] selectedConversationId:', selectedConversationId);
+    console.warn('[DM DEBUG] activeConversationId:', dmState.activeConversationId);
+    console.warn('[DM-RUNTIME] conversation selected:', targetUserId, Date.now());
+
+    // Highlight active thread item in sidebar without wiping the list
+    if (chatThreadsList) {
+      chatThreadsList.querySelectorAll('.thread-item').forEach(t => {
+        if (t.getAttribute('data-thread') === targetUserId) {
+          t.classList.add('active');
+        } else {
+          t.classList.remove('active');
+        }
+      });
+    }
+
+    // Show chat window header, viewport, composer; hide empty placeholder
+    const emptyState = document.getElementById('chat-empty-state');
+    const chatHeader = document.getElementById('chat-window-header');
+    const chatViewport = document.querySelector('.chat-dynamic-viewport');
+    const chatFooter = document.getElementById('chat-global-footer');
+
+    if (emptyState) emptyState.style.display = 'none';
+    if (chatHeader) chatHeader.style.display = '';
+    if (chatViewport) chatViewport.style.display = '';
+    if (chatFooter) chatFooter.style.display = '';
+
+    // Resolve user object for avatar / full name
+    let userObj = typeof targetUserOrId === 'object' ? targetUserOrId : null;
+    if (!userObj && Array.isArray(chatThreads)) {
+      const found = chatThreads.find(t => t.user && (getUserIdentifier(t.user) === targetUserId));
+      if (found) userObj = found.user;
+    }
+
+    if (userObj) {
+      if (chatHeaderName) chatHeaderName.textContent = userObj.fullName || userObj.username || 'Hubble User';
+      if (chatHeaderAvatar) chatHeaderAvatar.src = userObj.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
+    }
+
+    // Dynamically update the online presence indicator in the DM header
+    presenceManager.updateDMHeader(targetUserId);
+
+    if (chatHeaderName) {
+      chatHeaderName.style.cursor = 'pointer';
+      chatHeaderName.onclick = () => {
+        if (targetUserId) switchView('profile', targetUserId);
+      };
+    }
+    if (chatHeaderAvatar) {
+      chatHeaderAvatar.style.cursor = 'pointer';
+      chatHeaderAvatar.onclick = () => {
+        if (targetUserId) switchView('profile', targetUserId);
+      };
+    }
+
+    // 1. If messages already exist in memory: render them immediately (zero flicker)
+    if (dmState.messagesByConversation.has(targetUserId)) {
+      renderChatMessages(targetUserId);
+    }
+    // 2. Always sync latest messages in background (shows skeleton only on very first fetch if not cached)
+    loadMessages(targetUserId);
+
+    markMessagesAsRead(targetUserId);
+
+    // Global layout trigger — show chat view, hide inbox
+    const grid = document.querySelector('.chats-layout-grid');
+    if (grid) grid.classList.add('chatting');
+    document.body.classList.add('chat-active-mobile');
+  }
+
+  // Load messages from backend into dmState
+  async function loadMessages(targetUserId) {
     const token = getAuthToken();
     if (!token || !targetUserId) return;
 
-    if (messagesScroll && (!chatFeeds[targetUserId] || chatFeeds[targetUserId].length === 0)) {
+    if (dmState.loadingConversations.has(targetUserId)) return;
+
+    // Request token to prevent stale async responses overwriting active conversation
+    const requestToken = Date.now() + '_' + Math.random();
+    dmState._activeLoadToken = dmState._activeLoadToken || {};
+    dmState._activeLoadToken[targetUserId] = requestToken;
+
+    window.__dmLoadMessagesCount = (window.__dmLoadMessagesCount || 0) + 1;
+    console.warn('[DM-RUNTIME] loadMessages:', window.__dmLoadMessagesCount, targetUserId, Date.now());
+
+    // Show skeleton loading state ONLY if this conversation has never been loaded
+    if (!dmState.loadedConversations.has(targetUserId) && messagesScroll) {
+      console.warn('[DM-RUNTIME] loading ON:', targetUserId, Date.now());
       messagesScroll.innerHTML = `
         <div class="chat-messages-skeleton" style="display:flex; flex-direction:column; gap:12px; padding:20px;">
           <div style="width:40%; height:36px; background:rgba(255,255,255,0.06); border-radius:16px; align-self:flex-start; animation:pulse 1.5s infinite;"></div>
@@ -2751,21 +6000,75 @@ document.addEventListener('DOMContentLoaded', () => {
       `;
     }
 
+    dmState.loadingConversations.add(targetUserId);
+
+    let querySucceeded = false;
+    let queryError = null;
+
     try {
       const res = await fetch(`${API_URL}/api/chats/messages/${targetUserId}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
-      if (!res.ok) throw new Error('Failed to fetch messages');
-      const messages = await res.json();
 
-      chatFeeds[targetUserId] = Array.isArray(messages) ? messages : [];
-      renderChatMessages(targetUserId);
+      // Race condition guard: if user switched away, discard this response
+      if (dmState._activeLoadToken?.[targetUserId] !== requestToken) {
+        console.warn('[DM-RUNTIME] stale response discarded for:', targetUserId);
+        return;
+      }
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch messages`);
+
+      // Capture the resolved conversationId from the server header
+      const resolvedConvId = res.headers.get('X-Conversation-Id') || targetUserId;
+      dmState.conversationIdByUser.set(targetUserId, resolvedConvId);
+
+      const messages = await res.json();
+      querySucceeded = true;
+
+      console.warn('[DM DEBUG] messagesQueryConversationId:', resolvedConvId);
+      console.warn('[DM DEBUG] messagesReturned:', Array.isArray(messages) ? messages.length : 'not-array');
+      console.warn('[DM DEBUG] messagesQueryError:', null);
+      console.warn('[DM DEBUG] activeConversationId:', dmState.activeConversationId);
+
+      dmState.messagesByConversation.set(targetUserId, Array.isArray(messages) ? messages : []);
+      dmState.loadedConversations.add(targetUserId);
     } catch (err) {
-      console.error('Error fetching messages:', err);
-      if (messagesScroll) {
-        renderChatMessages(targetUserId);
+      queryError = err;
+      console.error('[DM DEBUG] messagesQueryError:', err.message);
+      console.warn('[DM DEBUG] messagesQueryConversationId:', targetUserId);
+      console.warn('[DM DEBUG] messagesReturned:', 0);
+      console.error('Error loading messages:', err);
+      // On error, do NOT set empty array — preserve existing messages if any
+      if (!dmState.messagesByConversation.has(targetUserId)) {
+        // Leave unset so UI shows error state, not false empty state
+      }
+    } finally {
+      dmState.loadingConversations.delete(targetUserId);
+      console.warn('[DM-RUNTIME] loading OFF:', targetUserId, Date.now());
+
+      // Only render if user is still looking at this conversation
+      if (dmState.activeConversationId === targetUserId) {
+        if (querySucceeded) {
+          renderChatMessages(targetUserId);
+        } else if (queryError) {
+          // Show error state — NOT the empty conversation placeholder
+          if (messagesScroll) {
+            messagesScroll.innerHTML = `
+              <div class="chat-empty-messages" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; min-height:280px; color:var(--text-muted); text-align:center; padding:40px 20px;">
+                <div style="font-size:42px; margin-bottom:12px;">⚠️</div>
+                <h4 style="font-size:16px; font-weight:600; color:#ff6b6b; margin:0 0 6px 0;">Failed to load messages</h4>
+                <p style="font-size:13px; color:rgba(255,255,255,0.6); max-width:240px; margin:0;">Please try again.</p>
+              </div>
+            `;
+          }
+        }
       }
     }
+  }
+
+  // Helper alias for backward compatibility across other handlers
+  async function fetchMessages(targetUserId) {
+    await loadMessages(targetUserId);
   }
 
   function getChatDateSeparatorText(dateInput) {
@@ -2792,22 +6095,484 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // Resolves a browser-loadable image URL from various message fields (URL, relative storage path, or attachment)
+  function resolveBrowserMediaUrl(msg) {
+    if (!msg) return '';
+    let candidate = msg.mediaUrl || msg.media_url || '';
+    if (!candidate && msg.attachment) {
+      candidate = msg.attachment.storagePath || msg.attachment.storage_path || '';
+    }
+    if (!candidate && msg.attachments && msg.attachments.length > 0) {
+      candidate = msg.attachments[0].storagePath || msg.attachments[0].storage_path || '';
+    }
+    if (!candidate && msg.content && typeof msg.content === 'string') {
+      const raw = msg.content.trim();
+      if (raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('data:')) {
+        candidate = raw;
+      } else {
+        const srcMatch = raw.match(/src=["']([^"']+)["']/i);
+        if (srcMatch && srcMatch[1]) {
+          candidate = srcMatch[1];
+        }
+      }
+    }
+    if (!candidate || typeof candidate !== 'string') return '';
+    const trimmed = candidate.trim();
+    if (!trimmed) return '';
+
+    // If already an HTTP(S) URL or data URL
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:')) {
+      return trimmed;
+    }
+
+    // Hub keys like "story_...", "reel_...", "post_..." are logical reference IDs
+    if (trimmed.startsWith('story_') || trimmed.startsWith('reel_') || trimmed.startsWith('post_') || trimmed.startsWith('reel')) {
+      return trimmed;
+    }
+
+    // If it's a relative storage path (e.g. "chat-media/convId/..." or "convId/userId/filename.png")
+    if (window.supabase) {
+      try {
+        const cleanPath = trimmed.replace(/^\/?(chat-media|chat-attachments)\//, '');
+        const { data } = window.supabase.storage.from('chat-media').getPublicUrl(cleanPath);
+        if (data?.publicUrl) return data.publicUrl;
+      } catch (_) {}
+    }
+
+    return trimmed;
+  }
+
+  function formatMediaDuration(seconds) {
+    if (!seconds || isNaN(seconds) || !isFinite(seconds) || seconds <= 0) return '';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
+  // Helper to determine if a shared story is still active or expired/unavailable
+  function isStoryActive(hubId, storyTimestamp) {
+    if (!hubId) return false;
+    const cleanId = hubId.toString().replace(/^story_/, '');
+
+    // 1. Check if timestamp is older than 24 hours (24h story lifecycle)
+    if (storyTimestamp) {
+      const sTime = new Date(storyTimestamp).getTime();
+      if (!isNaN(sTime) && (Date.now() - sTime) > 24 * 60 * 60 * 1000) {
+        return false;
+      }
+    }
+
+    // 2. Check if story is present in loaded active storyGroups
+    if (state.storyGroups && Array.isArray(state.storyGroups) && state.storyGroups.length > 0) {
+      let found = false;
+      state.storyGroups.forEach(group => {
+        (group.stories || []).forEach(s => {
+          const sId = (s._id || s.id || '').toString();
+          if (sId && (sId === cleanId || sId === hubId.toString() || ('story_' + sId) === hubId.toString())) {
+            const sCreatedAt = s.createdAt || s.created_at;
+            if (sCreatedAt) {
+              const t = new Date(sCreatedAt).getTime();
+              if (!isNaN(t) && (Date.now() - t) <= 24 * 60 * 60 * 1000) {
+                found = true;
+              }
+            } else {
+              found = true;
+            }
+          }
+        });
+      });
+      return found;
+    }
+
+    // 3. Fallback to timestamp if storyGroups not yet loaded
+    if (storyTimestamp) {
+      const sTime = new Date(storyTimestamp).getTime();
+      return !isNaN(sTime) && (Date.now() - sTime) <= 24 * 60 * 60 * 1000;
+    }
+
+    return true;
+  }
+
+  // Builds a single message bubble DOM element
+  function createMessageBubbleElement(msg, currentUserId, targetUserId, secretKey) {
+    const rawDate = msg.createdAt || msg.created_at || msg.timestamp;
+    const msgDate = rawDate ? new Date(rawDate) : new Date();
+    const validDate = isNaN(msgDate.getTime()) ? new Date() : msgDate;
+
+    let decryptedText = decryptMessage(msg.content, secretKey);
+
+    let hubInfo = null;
+    let parsedMediaType = null;
+    let parsedMediaUrl = null;
+
+    try {
+      const parsed = JSON.parse(decryptedText);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.type === 'image' || parsed.type === 'video' || parsed.type === 'audio') {
+          parsedMediaType = parsed.type;
+          parsedMediaUrl = parsed.url;
+          decryptedText = parsed.caption || parsed.text || '';
+        } else if (parsed.text !== undefined) {
+          decryptedText = parsed.text;
+          msg.replyTo = parsed.replyTo;
+        }
+        if (parsed.hubType) {
+          hubInfo = parsed;
+        }
+      }
+    } catch (e) {
+      if (typeof decryptedText === 'string') {
+        const imgMatch = decryptedText.match(/^<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+        const videoMatch = decryptedText.match(/^<video[^>]+src=["']([^"']+)["'][^>]*>/i);
+        if (imgMatch) {
+          parsedMediaType = 'image';
+          parsedMediaUrl = imgMatch[1];
+          decryptedText = '';
+        } else if (videoMatch) {
+          parsedMediaType = 'video';
+          parsedMediaUrl = videoMatch[1];
+          decryptedText = '';
+        }
+      }
+    }
+
+    const time = validDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    // Robust sender ID resolution
+    const msgSenderId = typeof msg.sender === 'object' 
+      ? (msg.sender._id || msg.sender.id || '') 
+      : (msg.sender || msg.sender_id || '');
+
+    const isSent = msgSenderId.toString() === currentUserId.toString();
+
+    // Linkify standard text content
+    const urlRegex = /(\b(https?):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
+    const linkifiedText = (decryptedText || '').replace(urlRegex, (url) => {
+      return `<a href="${url}" target="_blank" style="color: #6c3bff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+    });
+
+    const rawMediaType = (msg.mediaType || msg.media_type || (msg.attachment && msg.attachment.file_type) || parsedMediaType || '').toLowerCase();
+    const mimeTypeCandidate = ((msg.attachment && msg.attachment.mime_type) || msg.mimeType || msg.mime_type || '').toLowerCase();
+    const nameCandidate = (msg.mediaName || msg.media_name || (msg.attachment && msg.attachment.file_name) || '').toLowerCase();
+    const isVideo = rawMediaType === 'video' || rawMediaType.includes('video') || (parsedMediaType === 'video') || (msg.type === 'video') || mimeTypeCandidate.startsWith('video/') || nameCandidate.endsWith('.mp4') || nameCandidate.endsWith('.webm') || nameCandidate.endsWith('.mov');
+    const isAudio = rawMediaType === 'audio' || rawMediaType === 'voice' || rawMediaType.includes('audio') || rawMediaType.includes('voice') || (parsedMediaType === 'audio') || mimeTypeCandidate.startsWith('audio/') || nameCandidate.endsWith('.mp3') || nameCandidate.endsWith('.ogg') || nameCandidate.endsWith('.wav');
+    const isImage = (rawMediaType === 'image' || rawMediaType.includes('image') || (parsedMediaType === 'image') || mimeTypeCandidate.startsWith('image/') || (!rawMediaType && (msg.mediaUrl || msg.media_url))) && !isVideo && !isAudio;
+    const isHub = rawMediaType === 'hub' || !!hubInfo || (msg.mediaName && (msg.mediaName.includes('Hub Story') || msg.mediaName.includes('Shared Story')));
+    const hasMedia = (rawMediaType && rawMediaType !== 'text') || isVideo || isAudio || isImage || isHub;
+    let displayContent = `<div class="bubble-content">${linkifiedText}</div>`;
+
+    if (isHub) {
+      const info = hubInfo || {
+        hubId: msg.mediaUrl ? msg.mediaUrl.replace(/^(story_|reel_|post_)/, '') : '',
+        hubType: msg.mediaUrl ? (msg.mediaUrl.startsWith('story_') ? 'story' : (msg.mediaUrl.startsWith('reel') ? 'reel' : 'post')) : (msg.mediaName?.includes('Story') ? 'story' : 'post'),
+        thumbnail: '',
+        authorName: isSent ? 'You' : (document.querySelector('.chat-header-name')?.textContent || 'Hubber'),
+        authorAvatar: isSent ? '' : (document.querySelector('.chat-header-avatar')?.src || ''),
+        text: decryptedText || 'Shared a Post'
+      };
+
+      const hubId = info.hubId || (msg.mediaUrl ? msg.mediaUrl.replace(/^(story_|reel_|post_)/, '') : '');
+      const hubType = info.hubType || (msg.mediaUrl ? (msg.mediaUrl.startsWith('story_') ? 'story' : (msg.mediaUrl.startsWith('reel') ? 'reel' : 'post')) : (msg.mediaName?.includes('Story') ? 'story' : 'post'));
+      const thumbnail = info.thumbnail || '';
+      const authorName = info.authorName || 'Hubber';
+      const authorAvatar = info.authorAvatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80';
+      const postText = info.text || 'Shared a Post';
+
+      if (hubType === 'story') {
+        const storyTime = info.timestamp || rawDate || msg.createdAt || msg.created_at;
+        const isExpired = !isStoryActive(hubId, storyTime);
+
+        console.log('[DM STORY DEBUG] PersonalChat:', {
+          eventId: msg._id || msg.id,
+          type: 'story_share',
+          storyId: hubId,
+          expired: isExpired,
+          read: msg.status === 'read' || msg.is_read || msg.read,
+          render: true
+        });
+
+        if (isExpired) {
+          displayContent = `
+            <div class="bubble-content chat-shared-hub-card chat-expired-story-card">
+              <!-- Post Author Header -->
+              <div class="expired-author-header">
+                <img class="expired-author-avatar" src="${authorAvatar}" alt="${authorName}" />
+                <span class="expired-author-name">${authorName}</span>
+              </div>
+
+              <!-- Expired Notice Details -->
+              <div class="expired-notice-box">
+                <div class="expired-icon-wrap">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary, #a855f7);"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                </div>
+                <div class="expired-text-col">
+                  <span class="expired-title">${authorName} shared a HUBB</span>
+                  <span class="expired-desc">This HUBB has expired — you missed it.</span>
+                </div>
+              </div>
+
+              <!-- Expired Status Indicator -->
+              <div class="expired-footer-status">
+                <span class="expired-status-dot"></span> HUBB Expired
+              </div>
+            </div>
+          `;
+        } else {
+          // Active Story Card
+          const isVideoThumbnail = info.isVideo || (thumbnail && (thumbnail.endsWith('.mp4') || thumbnail.endsWith('.webm') || thumbnail.endsWith('.mov') || thumbnail.includes('/video/')));
+
+          displayContent = `
+            <div class="bubble-content chat-shared-hub-card" 
+                 onclick="if(typeof window.navigateToPost === 'function') { window.navigateToPost('${hubId}', 'story') } else { console.warn('navigateToPost not found') }">
+              
+              <!-- Post Author Header -->
+              <div class="hub-author-header">
+                <img class="hub-author-avatar" src="${authorAvatar}" alt="${authorName}" />
+                <span class="hub-author-name">${authorName}</span>
+              </div>
+
+              <!-- Post Thumbnail -->
+              ${thumbnail ? `
+                <div style="position: relative; width: 100%; border-radius: 8px; overflow: hidden; background: #000; display: flex; justify-content: center; align-items: center;">
+                  ${isVideoThumbnail ? `
+                    <video src="${thumbnail}" muted playsinline loop autoplay style="width: 100%; max-height: 180px; object-fit: cover; display: block;"></video>
+                    <div style="position: absolute; right: 8px; top: 8px; background: rgba(0,0,0,0.6); padding: 4px; border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #fff;"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                    </div>
+                  ` : `
+                    <img src="${thumbnail}" alt="HUBB Preview" loading="lazy" style="width: 100%; max-height: 180px; object-fit: cover; display: block;" />
+                  `}
+                </div>
+              ` : `
+                <!-- Placeholder/No media fallback -->
+                <div style="width: 100%; height: 60px; border-radius: 8px; background: rgba(255, 255, 255, 0.03); display: flex; align-items: center; justify-content: center; border: 1px dashed rgba(255, 255, 255, 0.1);">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-muted);"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+                </div>
+              `}
+
+              <!-- Post Content text -->
+              <div class="hub-post-text">
+                ${postText}
+              </div>
+
+              <!-- View Story Link -->
+              <div style="font-size: 11px; color: var(--primary, #a855f7); font-weight: 600; text-align: right; display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 2px;">
+                View Story <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+              </div>
+            </div>
+          `;
+        }
+      } else {
+        // Reel or Post Card
+        const isVideoThumbnail = info.isVideo || (thumbnail && (thumbnail.endsWith('.mp4') || thumbnail.endsWith('.webm') || thumbnail.endsWith('.mov') || thumbnail.includes('/video/')));
+
+        displayContent = `
+          <div class="bubble-content chat-shared-hub-card" 
+               onclick="if(typeof window.navigateToPost === 'function') { window.navigateToPost('${hubId}', '${hubType}') } else { console.warn('navigateToPost not found') }">
+            
+            <!-- Post Author Header -->
+            <div class="hub-author-header">
+              <img class="hub-author-avatar" src="${authorAvatar}" alt="${authorName}" />
+              <span class="hub-author-name">${authorName}</span>
+            </div>
+
+            <!-- Post Thumbnail -->
+            ${thumbnail ? `
+              <div style="position: relative; width: 100%; border-radius: 8px; overflow: hidden; background: #000; display: flex; justify-content: center; align-items: center;">
+                ${isVideoThumbnail ? `
+                  <video src="${thumbnail}" muted playsinline loop autoplay style="width: 100%; max-height: 180px; object-fit: cover; display: block;"></video>
+                  <div style="position: absolute; right: 8px; top: 8px; background: rgba(0,0,0,0.6); padding: 4px; border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #fff;"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                  </div>
+                ` : `
+                  <img src="${thumbnail}" alt="Post Preview" loading="lazy" style="width: 100%; max-height: 180px; object-fit: cover; display: block;" />
+                `}
+              </div>
+            ` : `
+              <!-- Placeholder/No media fallback -->
+              <div style="width: 100%; height: 60px; border-radius: 8px; background: rgba(255, 255, 255, 0.03); display: flex; align-items: center; justify-content: center; border: 1px dashed rgba(255, 255, 255, 0.1);">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-muted);"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+              </div>
+            `}
+
+            <!-- Post Content text -->
+            <div class="hub-post-text">
+              ${postText}
+            </div>
+
+            <!-- View Post Link -->
+            <div style="font-size: 11px; color: var(--primary, #a855f7); font-weight: 600; text-align: right; display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 2px;">
+              ${hubType === 'reel' ? 'View Reel' : 'View Post'} <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </div>
+          </div>
+        `;
+      }
+    } else if (hasMedia || isImage || isVideo || isAudio) {
+      if (isImage) {
+        const imageUrl = resolveBrowserMediaUrl(msg) || parsedMediaUrl || (decryptedText.startsWith('http') || decryptedText.startsWith('data:') ? decryptedText : '');
+        const hasText = decryptedText && !decryptedText.startsWith('http') && !decryptedText.startsWith('data:') && decryptedText !== '[Decryption Failed]';
+        const imgName = msg.mediaName || msg.media_name || 'Shared Image';
+
+        if (imageUrl) {
+          displayContent = `
+            <div class="bubble-content chat-shared-media-card" style="padding: 4px; background: rgba(255,255,255,0.06); border-radius: var(--radius-md); overflow: hidden; cursor: pointer; max-width: 270px;">
+              <img src="${imageUrl}" alt="${imgName}" loading="lazy" style="display: block; max-width: 260px; max-height: 260px; width: 100%; height: auto; border-radius: var(--radius-sm); object-fit: cover;" onclick="openMediaViewer('${msg._id || msg.id}')" onerror="console.warn('[IMAGE_LOAD_FAILED]', '${msg._id || msg.id}', '${imageUrl}'); this.onerror=null; this.parentElement.innerHTML='<div style=\\'padding:12px; font-size:12px; color:var(--text-muted); text-align:center;\\'>⚠️ Image unavailable</div>';" />
+              ${hasText ? `<div style="padding: 6px 4px 2px; font-size: 13px; word-break: break-word;">${linkifiedText}</div>` : ''}
+            </div>
+          `;
+        }
+      } else if (isVideo) {
+        const videoUrl = resolveBrowserMediaUrl(msg) || parsedMediaUrl || (decryptedText.startsWith('http') || decryptedText.startsWith('data:') ? decryptedText : '');
+        const videoName = msg.mediaName || msg.media_name || (msg.attachment && msg.attachment.file_name) || 'Shared Video';
+        const mimeType = (msg.attachment && msg.attachment.mime_type) || msg.mimeType || msg.mime_type || (videoName.endsWith('.webm') ? 'video/webm' : (videoName.endsWith('.ogg') ? 'video/ogg' : 'video/mp4'));
+        const hasText = decryptedText && !decryptedText.startsWith('http') && !decryptedText.startsWith('data:') && decryptedText !== '[Decryption Failed]';
+        const rawDur = msg.durationSeconds || (msg.attachment && msg.attachment.durationSeconds) || msg.duration || 0;
+        const initialDurStr = formatMediaDuration(rawDur);
+
+        if (videoUrl) {
+          displayContent = `
+            <div class="bubble-content chat-shared-media-card" style="padding: 4px; background: rgba(255,255,255,0.06); border-radius: var(--radius-md); overflow: hidden; max-width: 280px; position: relative;">
+              <div style="position: relative; width: 100%; border-radius: var(--radius-sm); overflow: hidden; background: #000;">
+                <video src="${videoUrl}" controls preload="metadata" playsinline style="display: block; max-width: 270px; max-height: 260px; width: 100%; height: auto; border-radius: var(--radius-sm); object-fit: cover;" onclick="event.stopPropagation();" onloadedmetadata="if(this.duration === Infinity || isNaN(this.duration) || this.duration === 0){ const p = this.currentTime; this.currentTime = 1e101; this.addEventListener('timeupdate', function f(){ this.removeEventListener('timeupdate', f); this.currentTime = p || 0; }, { once: true }); } const d = this.duration; if(d && isFinite(d) && d > 0){ const b = this.parentElement.querySelector('.video-duration-pill'); if(b){ const m = Math.floor(d / 60); const s = Math.floor(d % 60).toString().padStart(2, '0'); b.textContent = m + ':' + s; b.style.display = 'inline-flex'; } }" ondurationchange="const d = this.duration; if(d && isFinite(d) && d > 0){ const b = this.parentElement.querySelector('.video-duration-pill'); if(b){ const m = Math.floor(d / 60); const s = Math.floor(d % 60).toString().padStart(2, '0'); b.textContent = m + ':' + s; b.style.display = 'inline-flex'; } }">
+                  <source src="${videoUrl}" type="${mimeType}">
+                  <p style="font-size: 11px; padding: 8px; color: var(--text-muted);">Your browser does not support HTML5 video.</p>
+                </video>
+                <span class="video-duration-pill" style="position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.72); color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; font-family: monospace; letter-spacing: 0.5px; display: ${initialDurStr ? 'inline-flex' : 'none'}; align-items: center; gap: 3px; pointer-events: none; z-index: 2; backdrop-filter: blur(4px);"><i data-lucide="play" style="width: 8px; height: 8px; fill: currentColor;"></i>${initialDurStr}</span>
+              </div>
+              <div style="padding: 4px 6px 2px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                <span style="font-size: 11px; opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px;" title="${videoName}">${videoName}</span>
+                <button type="button" class="icon-btn" onclick="openMediaViewer('${msg._id || msg.id}')" style="background: none; border: none; color: var(--primary); cursor: pointer; padding: 2px;" title="Expand Video"><i data-lucide="maximize-2" style="width: 14px; height: 14px;"></i></button>
+              </div>
+              ${hasText ? `<div style="padding: 4px 6px; font-size: 13px; word-break: break-word;">${linkifiedText}</div>` : ''}
+            </div>
+          `;
+        }
+      } else if (isAudio) {
+        const audioUrl = resolveBrowserMediaUrl(msg) || parsedMediaUrl || (decryptedText.startsWith('http') || decryptedText.startsWith('data:') ? decryptedText : '');
+        const audioName = msg.mediaName || msg.media_name || (msg.attachment && msg.attachment.file_name) || 'Voice Message';
+        const mimeType = (msg.attachment && msg.attachment.mime_type) || msg.mimeType || msg.mime_type || (audioName.endsWith('.mp3') ? 'audio/mpeg' : (audioName.endsWith('.ogg') ? 'audio/ogg' : 'audio/webm'));
+        const hasText = decryptedText && !decryptedText.startsWith('http') && !decryptedText.startsWith('data:') && decryptedText !== '[Decryption Failed]';
+
+        if (audioUrl) {
+          displayContent = `
+            <div class="bubble-content chat-shared-media-card" style="padding: 8px 12px; background: rgba(255,255,255,0.06); border-radius: var(--radius-md); max-width: 280px; min-width: 220px; display: flex; flex-direction: column; gap: 6px; position: relative;">
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+                  <i data-lucide="mic" style="width: 14px; height: 14px; color: var(--primary); flex-shrink: 0;"></i>
+                  <span style="font-size: 11px; font-weight: 500; opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${audioName}">${audioName}</span>
+                </div>
+              </div>
+              <audio src="${audioUrl}" controls preload="metadata" style="width: 100%; height: 36px; outline: none; border-radius: var(--radius-sm);" onclick="event.stopPropagation();">
+                <source src="${audioUrl}" type="${mimeType}">
+                Your browser does not support playing audio notes.
+              </audio>
+              ${hasText ? `<div style="padding: 2px 4px; font-size: 13px; word-break: break-word;">${linkifiedText}</div>` : ''}
+            </div>
+          `;
+        }
+      } else if (msg.mediaType === 'file') {
+        displayContent = `
+          <div class="chat-shared-file-container" style="display: flex; justify-content: space-between; align-items: center; width: 100%; gap: 12px;">
+            <div onclick="openMediaViewer('${msg._id || msg.id}')" style="display: flex; align-items: center; gap: 8px; flex-grow: 1; cursor: pointer;">
+              <i data-lucide="file-text" style="width:24px; height:24px; color:var(--primary); min-width:24px;"></i>
+              <div class="chat-shared-file-info" style="text-align: left;">
+                <span class="chat-shared-file-title" style="word-break: break-all; display: block;">${msg.mediaName || 'Document'}</span>
+                <span class="chat-shared-file-size" style="font-size: 10px; opacity: 0.7; display: block;">${msg.mediaSize || ''}</span>
+              </div>
+            </div>
+            <a href="${decryptedText}" download="${msg.mediaName || 'file'}" class="icon-btn" style="color: var(--primary); display: flex; align-items: center; justify-content: center; min-width: 32px; height: 32px; background: rgba(255,255,255,0.05); border-radius: 50%; border: none; cursor: pointer;" title="Download File">
+              <i data-lucide="download" style="width: 16px; height: 16px;"></i>
+            </a>
+          </div>
+        `;
+      }
+    }
+
+    let replyPreviewHtml = '';
+    if (msg.replyTo) {
+      let rSender = msg.replyTo.senderName || 'User';
+      let rText = msg.replyTo.text || 'Message';
+      replyPreviewHtml = `
+        <div class="replied-message-box">
+          <div class="replied-sender">${rSender}</div>
+          <div class="replied-text">${rText}</div>
+        </div>
+      `;
+      displayContent = replyPreviewHtml + displayContent;
+    }
+
+    let tickHtml = '';
+    if (isSent) {
+      const isRead = msg.status === 'read' || msg.is_read || msg.read;
+      if (isRead) {
+        tickHtml = '<span class="msg-status-diamond-receipt read" title="Read"><svg class="msg-diamond-svg" viewBox="0 0 12 12" width="10" height="10" aria-hidden="true"><polygon points="6,1.2 10.8,6 6,10.8 1.2,6"></polygon></svg></span>';
+      } else {
+        tickHtml = '<span class="msg-status-diamond-receipt unread" title="Sent"><svg class="msg-diamond-svg" viewBox="0 0 12 12" width="10" height="10" aria-hidden="true"><polygon points="6,1.2 10.8,6 6,10.8 1.2,6"></polygon></svg></span>';
+      }
+    }
+
+    const msgId = msg._id || msg.id || '';
+    const msgIdAttr = msgId ? `data-msg-id="${msgId}"` : '';
+    const rawTextAttr = `data-raw-text="${(decryptedText || '').replace(/"/g, '&quot;')}"`;
+    const senderNameAttr = `data-sender-name="${isSent ? 'You' : (document.querySelector('.chat-header-name')?.textContent || 'User')}"`;
+
+    const bubbleHtml = `
+      <div class="${isSent ? 'chat-bubble sent' : 'chat-bubble received'}" ${msgIdAttr} ${rawTextAttr} ${senderNameAttr}>
+        ${displayContent}
+        <div class="bubble-time">${time} ${tickHtml}</div>
+      </div>
+    `;
+
+    const actionsHtml = `
+      <div style="position: relative;">
+        <button class="message-action-trigger"><i data-lucide="chevron-down"></i></button>
+        <div class="message-action-dropdown">
+          <button class="message-action-item action-reply"><i data-lucide="corner-up-left"></i> Reply</button>
+          <button class="message-action-item action-copy"><i data-lucide="copy"></i> Copy</button>
+          <button class="message-action-item action-forward"><i data-lucide="forward"></i> Forward</button>
+          ${isSent ? `<button class="message-action-item action-delete"><i data-lucide="trash-2"></i> Delete</button>` : ''}
+        </div>
+      </div>
+    `;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = isSent ? 'message-bubble-wrapper sent-wrapper' : 'message-bubble-wrapper received-wrapper';
+
+    if (isSent) {
+      wrapper.innerHTML = actionsHtml + bubbleHtml;
+    } else {
+      wrapper.innerHTML = bubbleHtml + actionsHtml;
+    }
+
+    return wrapper;
+  }
+
+  // Renders the messages from state for targetUserId (NO FETCHING ALLOWED HERE)
   function renderChatMessages(targetUserId) {
     if (!messagesScroll) return;
+
+    window.__dmRenderMessagesCount = (window.__dmRenderMessagesCount || 0) + 1;
+    console.warn('[DM-RUNTIME] renderMessages:', window.__dmRenderMessagesCount, targetUserId, Date.now());
+
     messagesScroll.innerHTML = '';
 
-    const messages = chatFeeds[targetUserId] || [];
+    const messages = dmState.messagesByConversation.get(targetUserId) || [];
     const currentUser = getCurrentUser();
     if (!currentUser) return;
     const currentUserId = (currentUser.id || currentUser._id || '').toString();
     const secretKey = getChatSecretKey(currentUserId, targetUserId);
 
+    // Only show "No messages yet" if we know the query completed successfully AND returned 0 messages
     if (messages.length === 0) {
+      if (!dmState.loadedConversations.has(targetUserId)) {
+        // Query hasn't completed yet — leave skeleton/loading state in place
+        return;
+      }
       messagesScroll.innerHTML = `
         <div class="chat-empty-messages" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; min-height:280px; color:var(--text-muted); text-align:center; padding:40px 20px;">
           <div style="font-size:42px; margin-bottom:12px; filter:drop-shadow(0 0 12px rgba(108,59,255,0.4));">👋</div>
-          <h4 style="font-size:16px; font-weight:600; color:#ffffff; margin:0 0 6px 0;">No messages yet</h4>
-          <p style="font-size:13px; color:rgba(255,255,255,0.6); max-width:240px; margin:0;">Start the conversation 👋</p>
+          <h4 style="font-size:16px; font-weight:600; color:var(--text-main); margin:0 0 6px 0;">No messages yet</h4>
+          <p style="font-size:13px; color:var(--text-muted); max-width:240px; margin:0;">Start the conversation 👋</p>
         </div>
       `;
       return;
@@ -2829,129 +6594,7 @@ document.addEventListener('DOMContentLoaded', () => {
         messagesScroll.appendChild(separator);
       }
 
-      let decryptedText = decryptMessage(msg.content, secretKey);
-
-      // Attempt to parse embedded reply info from text
-      try {
-        const parsed = JSON.parse(decryptedText);
-        if (parsed && typeof parsed === 'object' && parsed.text !== undefined) {
-          decryptedText = parsed.text;
-          msg.replyTo = parsed.replyTo;
-        }
-      } catch (e) {
-        // Normal text message, ignore parsing error
-      }
-
-      const time = validDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-      // Robust sender ID resolution
-      const msgSenderId = typeof msg.sender === 'object' 
-        ? (msg.sender._id || msg.sender.id || '') 
-        : (msg.sender || msg.sender_id || '');
-
-      const isSent = msgSenderId.toString() === currentUserId;
-
-      // Linkify standard text content
-      const urlRegex = /(\b(https?):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
-      const linkifiedText = (decryptedText || '').replace(urlRegex, (url) => {
-        return `<a href="${url}" target="_blank" style="color: #6c3bff; text-decoration: underline; word-break: break-all;">${url}</a>`;
-      });
-
-      let displayContent = `<div class="bubble-content">${linkifiedText}</div>`;
-
-      if (msg.mediaType && msg.mediaType !== 'text') {
-        if (msg.mediaType === 'image') {
-          displayContent = `
-            <div class="bubble-content chat-shared-media-card" onclick="openMediaViewer('${msg._id || msg.id}')">
-              <img src="${decryptedText}" style="max-width: 240px; border-radius: var(--radius-md); max-height: 200px; object-fit: cover;" />
-            </div>
-          `;
-        } else if (msg.mediaType === 'video') {
-          displayContent = `
-            <div class="bubble-content chat-shared-media-card" style="padding: 0; background: none; max-width: 240px; position: relative;">
-              <video src="${decryptedText}" style="width: 100%; border-radius: var(--radius-md); max-height: 200px; display: block;" controls></video>
-            </div>
-          `;
-        } else if (msg.mediaType === 'file') {
-          displayContent = `
-            <div class="chat-shared-file-container" style="display: flex; justify-content: space-between; align-items: center; width: 100%; gap: 12px;">
-              <div onclick="openMediaViewer('${msg._id || msg.id}')" style="display: flex; align-items: center; gap: 8px; flex-grow: 1; cursor: pointer;">
-                <i data-lucide="file-text" style="width:24px; height:24px; color:var(--primary); min-width:24px;"></i>
-                <div class="chat-shared-file-info" style="text-align: left;">
-                  <span class="chat-shared-file-title" style="word-break: break-all; display: block;">${msg.mediaName || 'Document'}</span>
-                  <span class="chat-shared-file-size" style="font-size: 10px; opacity: 0.7; display: block;">${msg.mediaSize || ''}</span>
-                </div>
-              </div>
-              <a href="${decryptedText}" download="${msg.mediaName || 'file'}" class="icon-btn" style="color: var(--primary); display: flex; align-items: center; justify-content: center; min-width: 32px; height: 32px; background: rgba(255,255,255,0.05); border-radius: 50%; border: none; cursor: pointer;" title="Download File">
-                <i data-lucide="download" style="width: 16px; height: 16px;"></i>
-              </a>
-            </div>
-          `;
-        } else if (msg.mediaType === 'voice') {
-          displayContent = `
-            <div class="bubble-content chat-shared-media-card" style="background: none; padding: 0; max-width: 240px; display: flex; align-items: center; gap: 8px; position: relative;">
-              <audio src="${decryptedText}" controls style="flex-grow: 1; display: block; max-width: calc(100% - 36px); height: 40px;"></audio>
-            </div>
-          `;
-        }
-      }
-
-      let replyPreviewHtml = '';
-      if (msg.replyTo) {
-        let rSender = msg.replyTo.senderName || 'User';
-        let rText = msg.replyTo.text || 'Message';
-        replyPreviewHtml = `
-          <div class="replied-message-box">
-            <div class="replied-sender">${rSender}</div>
-            <div class="replied-text">${rText}</div>
-          </div>
-        `;
-        displayContent = replyPreviewHtml + displayContent;
-      }
-
-      let tickHtml = '';
-      if (isSent) {
-        if (msg.status === 'read' || msg.is_read || msg.read) {
-          tickHtml = '<span style="color: #38bdf8; font-weight: bold; font-size: 12px; margin-left: 4px;" title="Read">✓✓</span>';
-        } else if (msg.status === 'delivered') {
-          tickHtml = '<span style="color: rgba(255,255,255,0.7); font-size: 12px; margin-left: 4px;" title="Delivered">✓✓</span>';
-        } else {
-          tickHtml = '<span style="color: rgba(255,255,255,0.7); font-size: 12px; margin-left: 4px;" title="Sent">✓</span>';
-        }
-      }
-
-      const msgIdAttr = (msg._id || msg.id) ? `data-msg-id="${msg._id || msg.id}"` : '';
-      const rawTextAttr = `data-raw-text="${(decryptedText || '').replace(/"/g, '&quot;')}"`;
-      const senderNameAttr = `data-sender-name="${isSent ? 'You' : (document.querySelector('.chat-header-name')?.textContent || 'User')}"`;
-
-      const bubbleHtml = `
-        <div class="${isSent ? 'chat-bubble sent' : 'chat-bubble received'}" ${msgIdAttr} ${rawTextAttr} ${senderNameAttr}>
-          ${displayContent}
-          <div class="bubble-time">${time} ${tickHtml}</div>
-        </div>
-      `;
-
-      const actionsHtml = `
-        <div style="position: relative;">
-          <button class="message-action-trigger"><i data-lucide="chevron-down"></i></button>
-          <div class="message-action-dropdown">
-            <button class="message-action-item action-reply"><i data-lucide="corner-up-left"></i> Reply</button>
-            <button class="message-action-item action-copy"><i data-lucide="copy"></i> Copy</button>
-            <button class="message-action-item action-forward"><i data-lucide="forward"></i> Forward</button>
-            ${isSent ? `<button class="message-action-item action-delete"><i data-lucide="trash-2"></i> Delete</button>` : ''}
-          </div>
-        </div>
-      `;
-
-      const wrapper = document.createElement('div');
-      wrapper.className = isSent ? 'message-bubble-wrapper sent-wrapper' : 'message-bubble-wrapper received-wrapper';
-
-      if (isSent) {
-        wrapper.innerHTML = actionsHtml + bubbleHtml;
-      } else {
-        wrapper.innerHTML = bubbleHtml + actionsHtml;
-      }
-
+      const wrapper = createMessageBubbleElement(msg, currentUserId, targetUserId, secretKey);
       messagesScroll.appendChild(wrapper);
     });
 
@@ -2959,20 +6602,69 @@ document.addEventListener('DOMContentLoaded', () => {
       if (messagesScroll) {
         messagesScroll.scrollTop = messagesScroll.scrollHeight;
       }
-    }, 50);
+    }, 20);
 
+    debouncedCreateIcons();
+  }
+
+  // Appends a single message smoothly without wiping the message viewport
+  function appendSingleMessage(targetUserId, msg) {
+    if (!msg || !targetUserId) return;
+    const msgId = msg._id || msg.id;
+
+    // Check if message is already stored in state
+    let convList = dmState.messagesByConversation.get(targetUserId);
+    if (!convList) {
+      convList = [];
+      dmState.messagesByConversation.set(targetUserId, convList);
+    }
+    const alreadyStored = convList.some(m => (m._id || m.id) === msgId);
+    if (!alreadyStored) {
+      convList.push(msg);
+    }
+
+    // Only update DOM if this conversation is currently open
+    if (dmState.activeConversationId !== targetUserId || !messagesScroll) return;
+
+    // Deduplicate in DOM
+    if (msgId && messagesScroll.querySelector(`[data-msg-id="${msgId}"]`)) {
+      return;
+    }
+
+    console.warn('[DM-RUNTIME] renderSingleMessage:', msgId, Date.now());
+
+    // Remove empty placeholder if present
+    const emptyEl = messagesScroll.querySelector('.chat-empty-messages');
+    if (emptyEl) emptyEl.remove();
+
+    const currentUser = getCurrentUser();
+    if (!currentUser) return;
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
+    const secretKey = getChatSecretKey(currentUserId, targetUserId);
+
+    const wrapper = createMessageBubbleElement(msg, currentUserId, targetUserId, secretKey);
+    messagesScroll.appendChild(wrapper);
+
+    messagesScroll.scrollTop = messagesScroll.scrollHeight;
     debouncedCreateIcons();
   }
 
   async function markMessagesAsRead(targetUserId) {
     const token = getAuthToken();
     if (!token) return;
+    
+    // Optimistically update local state immediately
+    const threadIndex = chatThreads.findIndex(t => t.user && (t.user._id === targetUserId || t.user.id === targetUserId));
+    if (threadIndex !== -1 && chatThreads[threadIndex].unreadCount > 0) {
+      chatThreads[threadIndex].unreadCount = 0;
+      renderChatThreadsList();
+    }
+    
     try {
       await fetch(`${API_URL}/api/chats/${targetUserId}/read`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` }
       });
-      loadChatThreads();
     } catch (err) {
       console.error('Error marking messages as read:', err);
     }
@@ -2983,8 +6675,13 @@ document.addEventListener('DOMContentLoaded', () => {
     backToInboxBtn.addEventListener('click', () => {
       const grid = document.querySelector('.chats-layout-grid');
       if (grid) grid.classList.remove('chatting');
-      const mainChat = document.querySelector('.chat-window-main');
-      if (mainChat) mainChat.style.display = 'none';
+      document.body.classList.remove('chat-active-mobile');
+      // Clear active conversation state
+      state.currentChatThread = null;
+      dmState.activeConversationId = null;
+      if (chatThreadsList) {
+        chatThreadsList.querySelectorAll('.thread-item').forEach(t => t.classList.remove('active'));
+      }
     });
   }
 
@@ -2995,6 +6692,12 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentReplyToMessage = null;
 
   async function sendMessage() {
+    if (pendingImageAttachment) {
+      return sendImageMessage();
+    }
+    if (pendingVideoAttachment) {
+      return sendVideoMessage();
+    }
     const text = messageInput.value.trim();
     const targetUserId = state.currentChatThread;
     if (!text || !targetUserId) return;
@@ -3005,7 +6708,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const secretKey = getChatSecretKey(currentUser.id || currentUser._id, targetUserId);
 
-    // Embed reply data into content payload to bypass backend schema limits
+    // Embed reply data into content payload if present
     let finalPayloadText = text;
     if (currentReplyToMessage) {
       finalPayloadText = JSON.stringify({
@@ -3041,9 +6744,13 @@ document.addEventListener('DOMContentLoaded', () => {
       });
 
       if (!res.ok) throw new Error('Failed to send message');
+      const createdMsg = await res.json();
 
-      await fetchMessages(targetUserId, true);
-      loadChatThreads();
+      // Append single sent message smoothly into active viewport (NO REFETCH / NO SKELETON / NO FLICKER)
+      appendSingleMessage(targetUserId, createdMsg);
+
+      // Update the thread item preview in sidebar in place
+      updateThreadLastMessageInPlace(targetUserId, createdMsg);
     } catch (err) {
       console.error('Send error:', err);
       showToast('Failed to send message: ' + err.message);
@@ -3158,99 +6865,659 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // --- REAL CAMERA CAPTURE MODAL LOGIC ---
+  // --- REAL DM SPATIAL CAMERA CAPTURE & VIDEO RECORDING LOGIC ---
   const cameraCaptureModal = document.getElementById('camera-capture-modal');
   const cameraModalCloseBtn = document.getElementById('camera-modal-close-btn');
-  const cameraVideo = document.getElementById('camera-video');
-  const cameraCanvas = document.getElementById('camera-canvas');
+  const dmCameraMirrorBtn = document.getElementById('dm-camera-mirror-btn');
+  const dmCameraSwitchBtn = document.getElementById('dm-camera-switch-btn') || document.getElementById('dm-camera-flip-btn');
+  const dmCameraVideo = document.getElementById('dm-camera-video');
+  const dmCameraCanvas = document.getElementById('dm-camera-canvas');
+  const dmCameraPreviewImg = document.getElementById('camera-preview-img');
+  const dmCameraPreviewVideo = document.getElementById('dm-camera-preview-video');
   const cameraFallbackView = document.getElementById('camera-fallback-view');
   const fallbackUploadAction = document.getElementById('fallback-upload-action');
   const cameraCaptureAction = document.getElementById('camera-capture-action');
-  let cameraStream = null;
+  const dmCameraRecordAction = document.getElementById('dm-camera-record-action');
+  const dmModePhotoBtn = document.getElementById('dm-mode-photo-btn');
+  const dmModeVideoBtn = document.getElementById('dm-mode-video-btn');
+  const dmCameraModeBar = document.getElementById('dm-camera-mode-bar');
+  const dmCameraRecordingBadge = document.getElementById('dm-camera-recording-badge');
+  const dmCameraRecordTimer = document.getElementById('dm-camera-record-timer');
+  const cameraPreviewControls = document.getElementById('camera-preview-controls');
+  const cameraRetakeBtn = document.getElementById('camera-retake-btn');
+  const cameraSendBtn = document.getElementById('camera-send-btn');
 
-  // Open real camera capture view
-  function openCameraCapture() {
-    if (!cameraCaptureModal) return;
+  let dmCameraStream = null;
+  let dmCurrentFacingMode = 'user'; // 'user' | 'environment'
+  let dmIsMirrored = true; // Preview only mirror toggle (independent of hardware camera)
+  let dmCurrentMode = 'photo'; // 'photo' | 'video'
+  let currentCameraContext = 'dm'; // 'dm' | 'story'
+  let dmTempCapturedImage = null;
+  let dmTempRecordedBlob = null;
+  let dmTempRecordedUrl = null;
+  let dmMediaRecorder = null;
+  let dmRecordedChunks = [];
+  let dmIsRecording = false;
+  let dmRecordTimerInterval = null;
+  let dmRecordSeconds = 0;
 
-    // Show modal
-    cameraCaptureModal.classList.add('active');
-
-    // Reset views
-    if (cameraVideo) cameraVideo.style.display = 'none';
-    if (cameraFallbackView) cameraFallbackView.style.display = 'flex';
-    if (cameraCaptureAction) cameraCaptureAction.classList.add('disabled');
-
-    // Request webcam access
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', frameRate: { ideal: 60, min: 30 } } })
-        .then(stream => {
-          cameraStream = stream;
-          if (cameraVideo) {
-            cameraVideo.srcObject = stream;
-            cameraVideo.style.display = 'block';
-            cameraVideo.play();
-          }
-          if (cameraFallbackView) cameraFallbackView.style.display = 'none';
-          if (cameraCaptureAction) cameraCaptureAction.classList.remove('disabled');
-        })
-        .catch(err => {
-          console.warn('Webcam permission denied or error:', err);
-          // Keep fallback active
-          if (cameraVideo) cameraVideo.style.display = 'none';
-          if (cameraFallbackView) cameraFallbackView.style.display = 'flex';
-          if (cameraCaptureAction) cameraCaptureAction.classList.add('disabled');
-        });
+  function updateCameraSendButtonState() {
+    if (!cameraSendBtn) return;
+    if (currentCameraContext === 'story' || currentCameraContext === 'hubbs') {
+      if (dmCurrentMode === 'video' || dmTempRecordedBlob) {
+        cameraSendBtn.innerHTML = '<i data-lucide="check"></i> Use This Video';
+      } else {
+        cameraSendBtn.innerHTML = '<i data-lucide="check"></i> Use This Photo';
+      }
     } else {
-      // Browser doesn't support mediaDevices
-      if (cameraVideo) cameraVideo.style.display = 'none';
+      cameraSendBtn.innerHTML = '<i data-lucide="send"></i> Send';
+    }
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  function applyDMMirrorState() {
+    if (dmCameraVideo) {
+      if (dmIsMirrored) {
+        dmCameraVideo.classList.add('mirrored');
+      } else {
+        dmCameraVideo.classList.remove('mirrored');
+      }
+    }
+    if (dmCameraMirrorBtn) {
+      dmCameraMirrorBtn.classList.toggle('active', dmIsMirrored);
+      dmCameraMirrorBtn.setAttribute('title', dmIsMirrored ? 'Mirror Preview: ON (Click to disable)' : 'Mirror Preview: OFF (Click to enable)');
+    }
+  }
+
+  function setCameraHeaderControlsDisabled(disabled) {
+    if (dmCameraMirrorBtn) dmCameraMirrorBtn.classList.toggle('disabled', disabled);
+    if (dmCameraSwitchBtn) dmCameraSwitchBtn.classList.toggle('disabled', disabled);
+  }
+
+  async function startDMCameraStream() {
+    if (dmCameraStream) {
+      try {
+        dmCameraStream.getTracks().forEach(t => t.stop());
+      } catch (e) {}
+      dmCameraStream = null;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      if (dmCameraVideo) dmCameraVideo.style.display = 'none';
       if (cameraFallbackView) cameraFallbackView.style.display = 'flex';
       if (cameraCaptureAction) cameraCaptureAction.classList.add('disabled');
+      if (dmCameraRecordAction) dmCameraRecordAction.classList.add('disabled');
+      return;
+    }
+
+    const videoConstraints = {
+      facingMode: { ideal: dmCurrentFacingMode },
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    };
+
+    try {
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: videoConstraints,
+          audio: true
+        });
+      } catch (audioErr) {
+        console.warn('Audio capture not available, falling back to video only:', audioErr);
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: videoConstraints,
+          audio: false
+        });
+      }
+
+      dmCameraStream = stream;
+      if (dmCameraVideo) {
+        dmCameraVideo.srcObject = stream;
+        dmCameraVideo.muted = true; // keep live preview quiet to prevent feedback loop
+        dmCameraVideo.playsInline = true;
+        dmCameraVideo.autoplay = true;
+
+        applyDMMirrorState();
+
+        dmCameraVideo.style.display = 'block';
+        dmCameraVideo.onloadedmetadata = () => {
+          dmCameraVideo.play().catch(e => console.warn('Camera video play caught:', e));
+        };
+        dmCameraVideo.play().catch(e => console.warn('Camera video play:', e));
+      }
+
+      if (dmCameraSwitchBtn) {
+        dmCameraSwitchBtn.classList.toggle('active', dmCurrentFacingMode === 'environment');
+        dmCameraSwitchBtn.setAttribute('title', dmCurrentFacingMode === 'user' ? 'Switch to Rear Camera' : 'Switch to Front Camera');
+      }
+
+      if (cameraFallbackView) cameraFallbackView.style.display = 'none';
+      if (cameraCaptureAction) cameraCaptureAction.classList.remove('disabled');
+      if (dmCameraRecordAction) dmCameraRecordAction.classList.remove('disabled');
+    } catch (err) {
+      console.warn('Webcam stream error:', err);
+      if (dmCameraVideo) dmCameraVideo.style.display = 'none';
+      if (cameraFallbackView) cameraFallbackView.style.display = 'flex';
+      if (cameraCaptureAction) cameraCaptureAction.classList.add('disabled');
+      if (dmCameraRecordAction) dmCameraRecordAction.classList.add('disabled');
     }
   }
 
-  // Close camera capture view and stop streams
+  async function switchDMCamera() {
+    if (dmIsRecording) return;
+    
+    // Check available devices gracefully
+    try {
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(d => d.kind === 'videoinput');
+        if (videoDevices.length <= 1 && !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+          console.info('Single video device detected on desktop, attempting facingMode toggle gracefully.');
+        }
+      }
+    } catch (e) {
+      console.warn('Device check:', e);
+    }
+
+    dmCurrentFacingMode = (dmCurrentFacingMode === 'user') ? 'environment' : 'user';
+    
+    // Front camera defaults to mirrored ON; Rear camera defaults to mirrored OFF
+    if (dmCurrentFacingMode === 'environment') {
+      dmIsMirrored = false;
+    } else {
+      dmIsMirrored = true;
+    }
+
+    await startDMCameraStream();
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  function toggleDMMirror() {
+    if (dmIsRecording) return;
+    dmIsMirrored = !dmIsMirrored;
+    applyDMMirrorState();
+  }
+
+  function setDMCameraMode(mode) {
+    if (dmIsRecording) return;
+    dmCurrentMode = mode;
+
+    if (mode === 'photo') {
+      if (dmModePhotoBtn) dmModePhotoBtn.classList.add('active');
+      if (dmModeVideoBtn) dmModeVideoBtn.classList.remove('active');
+      if (cameraCaptureAction) cameraCaptureAction.style.display = 'flex';
+      if (dmCameraRecordAction) dmCameraRecordAction.style.display = 'none';
+    } else {
+      if (dmModeVideoBtn) dmModeVideoBtn.classList.add('active');
+      if (dmModePhotoBtn) dmModePhotoBtn.classList.remove('active');
+      if (cameraCaptureAction) cameraCaptureAction.style.display = 'none';
+      if (dmCameraRecordAction) dmCameraRecordAction.style.display = 'flex';
+      if (dmCameraStream && dmCameraStream.getAudioTracks().length === 0) {
+        startDMCameraStream();
+      }
+    }
+  }
+
+  function resetDMCameraUI() {
+    dmTempCapturedImage = null;
+    if (dmTempRecordedUrl) {
+      try { URL.revokeObjectURL(dmTempRecordedUrl); } catch(e) {}
+      dmTempRecordedUrl = null;
+    }
+    dmTempRecordedBlob = null;
+    dmRecordedChunks = [];
+    dmIsRecording = false;
+
+    if (dmRecordTimerInterval) {
+      clearInterval(dmRecordTimerInterval);
+      dmRecordTimerInterval = null;
+    }
+    dmRecordSeconds = 0;
+
+    setCameraHeaderControlsDisabled(false);
+
+    if (dmCameraPreviewImg) {
+      dmCameraPreviewImg.style.display = 'none';
+      dmCameraPreviewImg.src = '';
+    }
+    if (dmCameraPreviewVideo) {
+      dmCameraPreviewVideo.pause();
+      dmCameraPreviewVideo.style.display = 'none';
+      dmCameraPreviewVideo.src = '';
+    }
+    if (dmCameraRecordingBadge) {
+      dmCameraRecordingBadge.style.display = 'none';
+    }
+    if (dmCameraRecordAction) {
+      dmCameraRecordAction.classList.remove('recording');
+    }
+
+    if (dmCameraVideo) {
+      dmCameraVideo.style.display = 'block';
+      try { dmCameraVideo.play(); } catch(e) {}
+    }
+
+    if (dmCameraModeBar) dmCameraModeBar.style.display = 'flex';
+    if (cameraPreviewControls) cameraPreviewControls.style.display = 'none';
+
+    setDMCameraMode(dmCurrentMode);
+    applyDMMirrorState();
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  function openCameraCapture(context = 'dm') {
+    if (!cameraCaptureModal) return;
+    currentCameraContext = context;
+
+    const container = cameraCaptureModal.querySelector('.camera-modal-container');
+    const titleSpan = document.querySelector('#camera-modal-title span');
+
+    if (currentCameraContext === 'story' || currentCameraContext === 'hubbs') {
+      if (container) {
+        container.classList.add('story-mode');
+        container.classList.add('hubbs-mode');
+      }
+      if (titleSpan) titleSpan.textContent = 'HUBBS Camera';
+    } else {
+      if (container) {
+        container.classList.remove('story-mode');
+        container.classList.remove('hubbs-mode');
+      }
+      if (titleSpan) titleSpan.textContent = 'Spatial Camera';
+    }
+
+    cameraCaptureModal.classList.add('active');
+    dmCurrentFacingMode = 'user';
+    dmIsMirrored = true;
+    resetDMCameraUI();
+    startDMCameraStream();
+    if (window.lucide) window.lucide.createIcons();
+  }
+  window.openCameraCapture = openCameraCapture;
+
   function closeCameraCapture() {
     if (!cameraCaptureModal) return;
-
     cameraCaptureModal.classList.remove('active');
 
-    if (cameraStream) {
-      cameraStream.getTracks().forEach(track => track.stop());
-      cameraStream = null;
+    const container = cameraCaptureModal.querySelector('.camera-modal-container');
+    if (container) {
+      container.classList.remove('story-mode');
+      container.classList.remove('hubbs-mode');
     }
-    if (cameraVideo) {
-      cameraVideo.srcObject = null;
+
+    if (dmIsRecording && dmMediaRecorder) {
+      try { dmMediaRecorder.stop(); } catch(e) {}
     }
-    resetCameraModalUI();
+
+    if (dmCameraStream) {
+      try {
+        dmCameraStream.getTracks().forEach(track => track.stop());
+      } catch(e) {}
+      dmCameraStream = null;
+    }
+
+    if (dmCameraVideo) {
+      dmCameraVideo.srcObject = null;
+    }
+
+    dmCurrentFacingMode = 'user';
+    dmIsMirrored = true;
+    currentCameraContext = 'dm';
+    resetDMCameraUI();
   }
 
-  let tempCapturedImage = null;
+  if (dmCameraMirrorBtn) {
+    dmCameraMirrorBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleDMMirror();
+    });
+  }
 
-  function resetCameraModalUI() {
-    const previewImg = document.getElementById('camera-preview-img');
-    if (previewImg) previewImg.style.display = 'none';
-    if (cameraVideo) {
-      cameraVideo.style.display = 'block';
-      try { cameraVideo.play(); } catch (e) { }
+  if (dmCameraSwitchBtn) {
+    dmCameraSwitchBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      switchDMCamera();
+    });
+  }
+
+  if (dmModePhotoBtn) {
+    dmModePhotoBtn.addEventListener('click', () => setDMCameraMode('photo'));
+  }
+  if (dmModeVideoBtn) {
+    dmModeVideoBtn.addEventListener('click', () => setDMCameraMode('video'));
+  }
+
+  if (cameraCaptureAction) {
+    cameraCaptureAction.addEventListener('click', async () => {
+      if (!dmCameraStream || !dmCameraVideo || !dmCameraCanvas) return;
+
+      const width = dmCameraVideo.videoWidth || 640;
+      const height = dmCameraVideo.videoHeight || 480;
+
+      dmCameraCanvas.width = width;
+      dmCameraCanvas.height = height;
+
+      const ctx = dmCameraCanvas.getContext('2d');
+      if (ctx) {
+        ctx.save();
+        if (dmIsMirrored) {
+          ctx.translate(width, 0);
+          ctx.scale(-1, 1);
+        }
+        ctx.drawImage(dmCameraVideo, 0, 0, width, height);
+        ctx.restore();
+
+        try {
+          dmTempCapturedImage = dmCameraCanvas.toDataURL('image/jpeg', 0.92);
+
+          dmCameraVideo.style.display = 'none';
+          if (dmCameraPreviewImg) {
+            dmCameraPreviewImg.src = dmTempCapturedImage;
+            dmCameraPreviewImg.style.display = 'block';
+          }
+
+          if (dmCameraModeBar) dmCameraModeBar.style.display = 'none';
+          cameraCaptureAction.style.display = 'none';
+          if (dmCameraRecordAction) dmCameraRecordAction.style.display = 'none';
+          if (cameraPreviewControls) cameraPreviewControls.style.display = 'flex';
+          updateCameraSendButtonState();
+          if (window.lucide) window.lucide.createIcons();
+        } catch (err) {
+          console.error('Error capturing image from canvas:', err);
+          showToast('Failed to capture photo from camera feed.');
+        }
+      }
+    });
+  }
+
+  function formatRecordTime(totalSeconds) {
+    const mins = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+    const secs = (totalSeconds % 60).toString().padStart(2, '0');
+    return `${mins}:${secs}`;
+  }
+
+  async function startVideoRecording() {
+    if (!dmCameraStream) {
+      await startDMCameraStream();
     }
-    if (cameraCaptureAction) cameraCaptureAction.style.display = 'flex';
-    const previewControls = document.getElementById('camera-preview-controls');
-    if (previewControls) previewControls.style.display = 'none';
-    tempCapturedImage = null;
+    if (!dmCameraStream) return;
+
+    // Ensure audio track is present for recorded stream
+    if (dmCameraStream.getAudioTracks().length === 0) {
+      try {
+        const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioStream.getAudioTracks().forEach(t => dmCameraStream.addTrack(t));
+      } catch (e) {
+        console.warn('Could not attach microphone audio track to stream:', e);
+      }
+    }
+
+    dmRecordedChunks = [];
+    dmIsRecording = true;
+    dmRecordSeconds = 0;
+    setCameraHeaderControlsDisabled(true);
+
+    let chosenMime = '';
+    if (typeof MediaRecorder !== 'undefined' && typeof MediaRecorder.isTypeSupported === 'function') {
+      const candidates = [
+        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=h264,opus',
+        'video/mp4;codecs=avc1,mp4a.40.2',
+        'video/mp4',
+        'video/webm'
+      ];
+      for (const c of candidates) {
+        if (MediaRecorder.isTypeSupported(c)) {
+          chosenMime = c;
+          break;
+        }
+      }
+    }
+
+    let options = chosenMime ? { mimeType: chosenMime } : {};
+
+    try {
+      dmMediaRecorder = new MediaRecorder(dmCameraStream, options);
+    } catch (e) {
+      try {
+        dmMediaRecorder = new MediaRecorder(dmCameraStream);
+      } catch (err) {
+        console.error('MediaRecorder initialization failed:', err);
+        showToast('Video recording is not supported on this browser.');
+        dmIsRecording = false;
+        return;
+      }
+    }
+
+    dmMediaRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        dmRecordedChunks.push(event.data);
+      }
+    };
+
+    dmMediaRecorder.onstop = () => {
+      finishVideoRecording();
+    };
+
+    dmMediaRecorder.start(250);
+
+    if (dmCameraRecordAction) dmCameraRecordAction.classList.add('recording');
+    if (dmCameraRecordingBadge) {
+      dmCameraRecordingBadge.style.display = 'flex';
+      if (dmCameraRecordTimer) dmCameraRecordTimer.textContent = '00:00';
+    }
+
+    dmRecordTimerInterval = setInterval(() => {
+      dmRecordSeconds++;
+      if (dmCameraRecordTimer) dmCameraRecordTimer.textContent = formatRecordTime(dmRecordSeconds);
+      if (dmRecordSeconds >= 60) {
+        stopVideoRecording();
+      }
+    }, 1000);
+  }
+
+  function stopVideoRecording() {
+    if (!dmIsRecording || !dmMediaRecorder) return;
+    dmIsRecording = false;
+    setCameraHeaderControlsDisabled(false);
+    if (dmRecordTimerInterval) {
+      clearInterval(dmRecordTimerInterval);
+      dmRecordTimerInterval = null;
+    }
+    if (dmCameraRecordingBadge) dmCameraRecordingBadge.style.display = 'none';
+    if (dmCameraRecordAction) dmCameraRecordAction.classList.remove('recording');
+
+    if (dmMediaRecorder.state !== 'inactive') {
+      try { dmMediaRecorder.stop(); } catch(e) {}
+    }
+  }
+
+  function finishVideoRecording() {
+    const mimeType = (dmMediaRecorder && dmMediaRecorder.mimeType) ? dmMediaRecorder.mimeType : 'video/webm';
+    dmTempRecordedBlob = new Blob(dmRecordedChunks, { type: mimeType });
+    if (dmTempRecordedUrl) {
+      try { URL.revokeObjectURL(dmTempRecordedUrl); } catch(e) {}
+    }
+    dmTempRecordedUrl = URL.createObjectURL(dmTempRecordedBlob);
+
+    if (dmCameraVideo) dmCameraVideo.style.display = 'none';
+    if (dmCameraPreviewVideo) {
+      dmCameraPreviewVideo.src = dmTempRecordedUrl;
+      dmCameraPreviewVideo.muted = false; // allow user to preview recorded sound
+      dmCameraPreviewVideo.style.display = 'block';
+      dmCameraPreviewVideo.load();
+      dmCameraPreviewVideo.play().catch(e => console.warn('Preview play caught:', e));
+    }
+
+    if (dmCameraModeBar) dmCameraModeBar.style.display = 'none';
+    if (dmCameraRecordAction) dmCameraRecordAction.style.display = 'none';
+    if (cameraCaptureAction) cameraCaptureAction.style.display = 'none';
+    if (cameraPreviewControls) cameraPreviewControls.style.display = 'flex';
+    updateCameraSendButtonState();
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  if (dmCameraRecordAction) {
+    dmCameraRecordAction.addEventListener('click', () => {
+      if (!dmIsRecording) {
+        startVideoRecording();
+      } else {
+        stopVideoRecording();
+      }
+    });
+  }
+
+  if (cameraRetakeBtn) {
+    cameraRetakeBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      resetDMCameraUI();
+    });
+  }
+
+  if (cameraSendBtn) {
+    cameraSendBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+
+      if (currentCameraContext === 'story' || currentCameraContext === 'hubbs') {
+        if (dmTempCapturedImage) {
+          try {
+            const res = await fetch(dmTempCapturedImage);
+            const blob = await res.blob();
+            const file = new File([blob], `hubbs_photo_${Date.now()}.jpg`, { type: 'image/jpeg' });
+            if (typeof window.handleCreateHubbsFiles === 'function') {
+              await window.handleCreateHubbsFiles([file]);
+            }
+            showToast('Photo added to HUBBS! 📸');
+          } catch (err) {
+            console.error('Error attaching captured photo to HUBBS:', err);
+            showToast('Failed to add captured photo.');
+          }
+        } else if (dmTempRecordedBlob) {
+          try {
+            const rawMime = dmTempRecordedBlob.type || (dmMediaRecorder && dmMediaRecorder.mimeType) || 'video/webm';
+            const cleanMime = rawMime.split(';')[0].trim().toLowerCase();
+            const ext = cleanMime.includes('mp4') ? 'mp4' : 'webm';
+            const file = new File([dmTempRecordedBlob], `hubbs_video_${Date.now()}.${ext}`, { type: cleanMime });
+            if (typeof window.handleCreateHubbsFiles === 'function') {
+              await window.handleCreateHubbsFiles([file]);
+            }
+            showToast('Video added to HUBBS! 🎥');
+          } catch (err) {
+            console.error('Error attaching recorded video to HUBBS:', err);
+            showToast('Failed to add recorded video.');
+          }
+        }
+        closeCameraCapture();
+        return;
+      }
+
+      const targetUserId = state.currentChatThread;
+      const currentUser = getCurrentUser();
+      const token = getAuthToken();
+
+      if (!targetUserId || !currentUser || !token) {
+        showToast('Please select a conversation first.');
+        closeCameraCapture();
+        return;
+      }
+
+      if (dmTempCapturedImage) {
+        try {
+          const res = await fetch(`${API_URL}/api/chats/message`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+              recipient: targetUserId,
+              content: '',
+              mediaUrl: dmTempCapturedImage,
+              mediaType: 'image',
+              mediaName: `Photo_${Date.now()}.jpg`,
+              mediaSize: Math.round(dmTempCapturedImage.length * 0.75)
+            })
+          });
+
+          if (res.ok) {
+            const createdMsg = await res.json();
+            appendSingleMessage(targetUserId, createdMsg);
+            updateThreadLastMessageInPlace(targetUserId, createdMsg);
+            showToast('Photo sent! 📷');
+          } else {
+            await fetchMessages(targetUserId, true);
+            loadChatThreads();
+          }
+        } catch (err) {
+          console.error('Photo send error:', err);
+          showToast('Failed to send photo.');
+        }
+      } else if (dmTempRecordedBlob) {
+        try {
+          const rawMime = dmTempRecordedBlob.type || (dmMediaRecorder && dmMediaRecorder.mimeType) || 'video/webm';
+          const cleanMime = rawMime.split(';')[0].trim().toLowerCase();
+          const ext = cleanMime.includes('mp4') ? 'mp4' : 'webm';
+          const fileName = `Video_${Date.now()}.${ext}`;
+          const videoFile = new File([dmTempRecordedBlob], fileName, { type: cleanMime });
+
+          const reader = new FileReader();
+          reader.onload = async function (evt) {
+            const videoDataUrl = evt.target.result;
+            const res = await fetch(`${API_URL}/api/chats/message`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+              },
+              body: JSON.stringify({
+                recipient: targetUserId,
+                content: '',
+                mediaUrl: videoDataUrl,
+                mediaType: 'video',
+                mediaName: fileName,
+                mediaSize: videoFile.size,
+                mimeType: cleanMime,
+                durationSeconds: dmRecordSeconds || 0
+              })
+            });
+
+            if (res.ok) {
+              const createdMsg = await res.json();
+              appendSingleMessage(targetUserId, createdMsg);
+              updateThreadLastMessageInPlace(targetUserId, createdMsg);
+              showToast('Video sent! 🎥');
+            } else {
+              await fetchMessages(targetUserId, true);
+              loadChatThreads();
+            }
+          };
+          reader.readAsDataURL(videoFile);
+        } catch (err) {
+          console.error('Video send error:', err);
+          showToast('Failed to send video.');
+        }
+      }
+
+      closeCameraCapture();
+    });
   }
 
   // Bind DM camera triggers to open the capture modal
   if (chatImgPickerBtn) {
     chatImgPickerBtn.addEventListener('click', (e) => {
       e.preventDefault();
-      openCameraCapture();
+      openCameraCapture('dm');
     });
   }
 
   if (cameraClickSim) {
     cameraClickSim.addEventListener('click', (e) => {
       e.preventDefault();
-      openCameraCapture();
+      openCameraCapture('dm');
     });
   }
 
@@ -3267,49 +7534,16 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Capture frame logic
-  if (cameraCaptureAction) {
-    cameraCaptureAction.addEventListener('click', async () => {
-      if (!cameraStream || !cameraVideo || !cameraCanvas) return;
-
-      const width = cameraVideo.videoWidth || 640;
-      const height = cameraVideo.videoHeight || 480;
-
-      cameraCanvas.width = width;
-      cameraCanvas.height = height;
-
-      const ctx = cameraCanvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(cameraVideo, 0, 0, width, height);
-
-        try {
-          tempCapturedImage = cameraCanvas.toDataURL('image/png');
-
-          // Freeze video and show preview img
-          cameraVideo.style.display = 'none';
-          const previewImg = document.getElementById('camera-preview-img');
-          if (previewImg) {
-            previewImg.src = tempCapturedImage;
-            previewImg.style.display = 'block';
-          }
-
-          // Toggle buttons
-          cameraCaptureAction.style.display = 'none';
-          const previewControls = document.getElementById('camera-preview-controls');
-          if (previewControls) previewControls.style.display = 'flex';
-
-        } catch (err) {
-          console.error('Error capturing image from canvas:', err);
-          showToast('Failed to capture photo from webcam feed.');
-        }
-      }
-    });
-  }
-
   // Fallback upload action triggers hidden file selector
-  if (fallbackUploadAction && chatCameraInput) {
+  if (fallbackUploadAction) {
     fallbackUploadAction.addEventListener('click', () => {
-      chatCameraInput.click();
+      if (currentCameraContext === 'story' || currentCameraContext === 'hubbs') {
+        const fileInput = document.getElementById('ch-hidden-file-input');
+        if (fileInput) fileInput.click();
+      } else if (chatCameraInput) {
+        chatCameraInput.click();
+      }
+      closeCameraCapture();
     });
   }
 
@@ -3321,20 +7555,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const reader = new FileReader();
       reader.onload = async function (evt) {
-        const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        const imgUrl = evt.target.result;
-
+        const mediaDataUrl = evt.target.result;
         const targetUserId = state.currentChatThread;
         const currentUser = getCurrentUser();
         const token = getAuthToken();
 
         if (targetUserId && currentUser && token) {
           try {
-            const secretKey = getChatSecretKey(currentUser.id || currentUser._id, targetUserId);
-            const htmlContent = `<img src="${imgUrl}" alt="Uploaded Photo" style="max-width:100%; border-radius:var(--radius-md);" />`;
-            const encryptedText = encryptMessage(htmlContent, secretKey);
+            const isVideo = file.type.startsWith('video/');
+            const isAudio = file.type.startsWith('audio/');
+            const mediaType = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
 
-            await fetch(`${API_URL}/api/chats/message`, {
+            const res = await fetch(`${API_URL}/api/chats/message`, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -3342,11 +7574,22 @@ document.addEventListener('DOMContentLoaded', () => {
               },
               body: JSON.stringify({
                 recipient: targetUserId,
-                content: encryptedText
+                content: '',
+                mediaUrl: mediaDataUrl,
+                mediaType: mediaType,
+                mediaName: file.name,
+                mediaSize: file.size
               })
             });
-            await fetchMessages(targetUserId, true);
-            loadChatThreads();
+
+            if (res.ok) {
+              const createdMsg = await res.json();
+              appendSingleMessage(targetUserId, createdMsg);
+              updateThreadLastMessageInPlace(targetUserId, createdMsg);
+            } else {
+              await fetchMessages(targetUserId, true);
+              loadChatThreads();
+            }
           } catch (err) {
             console.error('File send error:', err);
             showToast('Failed to send file.');
@@ -3365,11 +7608,105 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- INBOX SIDEBAR CONTROLS (INTERACTIVITY) ---
   const inboxSearchInput = document.getElementById('inbox-search-input');
+  const hubberSearchDropdown = document.getElementById('hubber-search-dropdown');
+  let followingHubbersCache = null;
+
+  async function fetchFollowingHubbers() {
+    if (followingHubbersCache) return followingHubbersCache;
+    const token = localStorage.getItem('invibe_jwt_token');
+    if (!token) return [];
+    try {
+      const currentUser = getCurrentUser();
+      const userId = currentUser ? (currentUser.id || currentUser._id) : 'me';
+      const res = await fetch(`${API_URL}/api/users/${userId}/following-list`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.ok) {
+        followingHubbersCache = await res.json();
+        return followingHubbersCache;
+      }
+    } catch(err) {
+      console.error(err);
+    }
+    return [];
+  }
+
+  function renderHubberDropdown(users) {
+    if (!hubberSearchDropdown) return;
+    hubberSearchDropdown.innerHTML = '';
+    if (!users || users.length === 0) {
+      hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">No Hubbers found</div>';
+      hubberSearchDropdown.classList.add('active');
+      return;
+    }
+    
+    users.forEach(u => {
+      const item = document.createElement('div');
+      item.className = 'hubber-dropdown-item';
+      item.innerHTML = `
+        <img src="${u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" class="hubber-dropdown-avatar" />
+        <div class="hubber-dropdown-info">
+          <div class="hubber-dropdown-name">${u.fullName || u.username}</div>
+          <div class="hubber-dropdown-username">@${u.username}</div>
+        </div>
+      `;
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault(); // Prevent input blur so we can click
+        hubberSearchDropdown.classList.remove('active');
+        inboxSearchInput.value = '';
+        selectConversation(u);
+      });
+      hubberSearchDropdown.appendChild(item);
+    });
+    hubberSearchDropdown.classList.add('active');
+  }
+
   if (inboxSearchInput) {
-    inboxSearchInput.addEventListener('input', async () => {
-      lastRenderedThreadsFingerprint = ''; // Ensure search results render without cache blocking
-      const query = inboxSearchInput.value.trim();
+    inboxSearchInput.addEventListener('focus', async () => {
+      const users = await fetchFollowingHubbers();
+      const query = inboxSearchInput.value.trim().toLowerCase();
       if (!query) {
+        if (users.length === 0) {
+           if(hubberSearchDropdown) {
+              hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">You\'re not following anyone yet.</div>';
+              hubberSearchDropdown.classList.add('active');
+           }
+        } else {
+           renderHubberDropdown(users);
+        }
+      } else {
+        const filtered = users.filter(u => (u.fullName || '').toLowerCase().includes(query) || (u.username || '').toLowerCase().includes(query));
+        renderHubberDropdown(filtered);
+      }
+    });
+
+    inboxSearchInput.addEventListener('blur', () => {
+      if (hubberSearchDropdown) hubberSearchDropdown.classList.remove('active');
+    });
+
+    inboxSearchInput.addEventListener('input', async () => {
+      // Update Dropdown
+      const users = await fetchFollowingHubbers();
+      const query = inboxSearchInput.value.trim().toLowerCase();
+      
+      if (!query) {
+        if (users.length === 0) {
+           if(hubberSearchDropdown) {
+              hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">You\'re not following anyone yet.</div>';
+              hubberSearchDropdown.classList.add('active');
+           }
+        } else {
+           renderHubberDropdown(users);
+        }
+      } else {
+        const filtered = users.filter(u => (u.fullName || '').toLowerCase().includes(query) || (u.username || '').toLowerCase().includes(query));
+        renderHubberDropdown(filtered);
+      }
+
+      // Existing behavior for chatThreadsList
+      lastRenderedThreadsFingerprint = ''; // Ensure search results render without cache blocking
+      const rawQuery = inboxSearchInput.value.trim();
+      if (!rawQuery) {
         loadChatThreads();
         return;
       }
@@ -3378,13 +7715,13 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!token) return;
 
       try {
-        const res = await fetch(`${API_URL}/api/users/search?q=${encodeURIComponent(query)}`, {
+        const res = await fetch(`${API_URL}/api/users/search?q=${encodeURIComponent(rawQuery)}`, {
           headers: { 'Authorization': `Bearer ${token}` }
         });
         if (!res.ok) throw new Error('Search failed');
-        const users = await res.json();
+        const apiUsers = await res.json();
 
-        chatThreads = users.map(u => ({
+        chatThreads = apiUsers.map(u => ({
           user: u,
           lastMessage: null,
           unreadCount: 0
@@ -3418,6 +7755,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const chatSubPanels = document.querySelectorAll('.chat-sub-panel');
   const chatGlobalFooter = document.getElementById('chat-global-footer');
 
+  window.switchChatModeGlobal = (mode) => {
+    switchChatMode(mode);
+  };
+
+  window.selectConversationGlobal = (targetUserId) => {
+    selectConversation(targetUserId);
+  };
+
   function switchChatMode(modeName) {
     state.chatMode = modeName;
 
@@ -3441,15 +7786,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (modeName === 'call' || modeName === 'voice-call') {
       if (chatGlobalFooter) chatGlobalFooter.style.display = 'none';
-      if (!isCallActive && state.currentChatThread) {
-        initiateVideoCall(state.currentChatThread, modeName === 'voice-call');
+      if (state.currentChatThread) {
+        const thread = chatThreads.find(t => t.user && (getUserIdentifier(t.user) === state.currentChatThread.toString()));
+        const user = thread ? thread.user : null;
+        const recipientName = user ? (user.fullName || user.username) : 'User';
+        const recipientAvatar = user ? user.profileImage : '';
+        const conversationId = dmState.conversationIdByUser.get(state.currentChatThread);
+
+        if (modeName === 'voice-call') {
+          initiateAudioCall(state.currentChatThread, conversationId, recipientName, recipientAvatar);
+        } else {
+          initiateVideoCall(state.currentChatThread, conversationId, recipientName, recipientAvatar);
+        }
       }
     } else {
       if (chatGlobalFooter) chatGlobalFooter.style.display = 'flex';
-      if (isCallActive) {
-        cancelOutgoingCall();
-      } else {
-        stopVideoCallTimer();
+      if (window.audioState && window.audioState.isCallActive) {
+        try { endAudioCall(); } catch(_) {}
+      }
+      if (window.videoState && window.videoState.isCallActive) {
+        try { endVideoCall(); } catch(_) {}
       }
       const watchVideo = document.getElementById('watch-together-video');
       if (watchVideo && modeName !== 'watch') {
@@ -3470,134 +7826,411 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
 
-  // --- CAMERA CAPTURE CONFIRMATION LISTENERS ---
-  const cameraRetakeBtn = document.getElementById('camera-retake-btn');
-  const cameraSendBtn = document.getElementById('camera-send-btn');
+  // --- PHASE 3A: IMAGE ATTACHMENT SYSTEM ---
+  const chatImageInput = document.getElementById('chat-image-file-input');
+  const chatImagePreviewContainer = document.getElementById('chat-image-preview-container');
+  const chatImagePreviewImg = document.getElementById('chat-image-preview-img');
+  const chatImagePreviewName = document.getElementById('chat-image-preview-name');
+  const chatImagePreviewSize = document.getElementById('chat-image-preview-size');
+  const chatImagePreviewCancel = document.getElementById('chat-image-preview-cancel');
+  const chatImagePreviewSend = document.getElementById('chat-image-preview-send');
 
-  if (cameraRetakeBtn) {
-    cameraRetakeBtn.addEventListener('click', () => {
-      const previewImg = document.getElementById('camera-preview-img');
-      if (previewImg) previewImg.style.display = 'none';
-      if (cameraVideo) {
-        cameraVideo.style.display = 'block';
-        cameraVideo.play();
-      }
-      if (cameraCaptureAction) cameraCaptureAction.style.display = 'flex';
-      const previewControls = document.getElementById('camera-preview-controls');
-      if (previewControls) previewControls.style.display = 'none';
-      tempCapturedImage = null;
-    });
-  }
-
-  if (cameraSendBtn) {
-    cameraSendBtn.addEventListener('click', async () => {
-      if (!tempCapturedImage) return;
-
-      const targetUserId = state.currentChatThread;
-      const currentUser = getCurrentUser();
-      const token = getAuthToken();
-
-      if (targetUserId && currentUser && token) {
-        const secretKey = getChatSecretKey(currentUser.id || currentUser._id, targetUserId);
-        const encryptedText = encryptMessage(tempCapturedImage, secretKey);
-
-        try {
-          await fetch(`${API_URL}/api/chats/message`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token}`
-            },
-            body: JSON.stringify({
-              recipient: targetUserId,
-              content: encryptedText,
-              mediaUrl: 'camera_capture',
-              mediaType: 'image',
-              mediaName: `Camera_${Date.now()}.png`,
-              mediaSize: '0.1 MB'
-            })
-          });
-          await fetchMessages(targetUserId, true);
-          loadChatThreads();
-          showToast('Photo shared! 📸');
-        } catch (err) {
-          console.error('Camera send error:', err);
-          showToast('Failed to send captured photo.');
-        }
-      }
-
-      closeCameraCapture();
-    });
-  }
-
-  // --- GALLERY FILE PICKER SYSTEM ---
+  const attachmentBtnPicker = document.getElementById('attachment-btn-picker');
   const galleryPickerBtn = document.getElementById('chat-gallery-picker-btn');
-  const galleryFileInput = document.getElementById('chat-gallery-file-input');
 
-  if (galleryPickerBtn && galleryFileInput) {
-    galleryPickerBtn.addEventListener('click', () => {
-      galleryFileInput.click();
+  let pendingImageAttachment = null;
+  let isSendingImage = false;
+
+  function formatFileSize(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  }
+
+  function clearPendingImage() {
+    pendingImageAttachment = null;
+    if (chatImagePreviewContainer) chatImagePreviewContainer.style.display = 'none';
+    if (chatImagePreviewImg) chatImagePreviewImg.src = '';
+    if (chatImageInput) chatImageInput.value = '';
+    const attachmentsDrawer = document.getElementById('chat-attachments-drawer');
+    if (attachmentsDrawer) attachmentsDrawer.classList.remove('active');
+  }
+
+  function handleImageFileSelection(file) {
+    if (!file) return;
+
+    // If a video file reaches image selection, delegate to video handler
+    if (file.type.startsWith('video/') || /\.(mp4|webm|ogg|mov|m4v)$/i.test(file.name)) {
+      return handleVideoFileSelection(file);
+    }
+
+    // 1. Validate MIME type
+    const validMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    const isImageMime = validMimes.includes(file.type) || file.type.startsWith('image/');
+    if (!isImageMime) {
+      showToast('Please select a valid image (JPEG, PNG, WEBP, GIF).');
+      if (chatImageInput) chatImageInput.value = '';
+      return;
+    }
+
+    // 2. Validate Extension
+    const extMatch = file.name.match(/\.([0-9a-z]+)$/i);
+    const ext = extMatch ? extMatch[1].toLowerCase() : '';
+    const validExts = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+    if (!validExts.includes(ext)) {
+      showToast('Unsupported image format. Allowed: JPG, PNG, WEBP, GIF.');
+      if (chatImageInput) chatImageInput.value = '';
+      return;
+    }
+
+    // 3. Validate Size (Max 15MB)
+    const maxSizeBytes = 15 * 1024 * 1024;
+    if (file.size > maxSizeBytes) {
+      showToast('Image is too large. Maximum size allowed is 15MB.');
+      if (chatImageInput) chatImageInput.value = '';
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+      const dataUrl = evt.target.result;
+      pendingImageAttachment = {
+        file,
+        dataUrl,
+        name: file.name,
+        size: file.size,
+        mimeType: file.type
+      };
+
+      if (chatImagePreviewImg) chatImagePreviewImg.src = dataUrl;
+      if (chatImagePreviewName) chatImagePreviewName.textContent = file.name;
+      if (chatImagePreviewSize) chatImagePreviewSize.textContent = formatFileSize(file.size);
+      if (chatImagePreviewContainer) chatImagePreviewContainer.style.display = 'flex';
+
+      // Close drawer if open
+      const attachmentsDrawer = document.getElementById('chat-attachments-drawer');
+      if (attachmentsDrawer) attachmentsDrawer.classList.remove('active');
+
+      debouncedCreateIcons();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function sendImageMessage() {
+    if (!pendingImageAttachment || isSendingImage) return;
+
+    const targetUserId = state.currentChatThread;
+    const currentUser = getCurrentUser();
+    const token = getAuthToken();
+
+    if (!targetUserId || !currentUser || !token) {
+      showToast('Please select a conversation to send the image.');
+      return;
+    }
+
+    isSendingImage = true;
+    if (chatImagePreviewSend) {
+      chatImagePreviewSend.disabled = true;
+      chatImagePreviewSend.innerHTML = '<i data-lucide="loader" class="spin"></i> Sending...';
+    }
+
+    try {
+      const res = await fetch(`${API_URL}/api/chats/message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          recipient: targetUserId,
+          content: '',
+          mediaUrl: pendingImageAttachment.dataUrl,
+          mediaType: 'image',
+          mediaName: pendingImageAttachment.name,
+          mediaSize: pendingImageAttachment.size
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to send image.');
+      }
+
+      const createdMsg = await res.json();
+
+      // Append sent image smoothly into active conversation viewport (Right-aligned)
+      appendSingleMessage(targetUserId, createdMsg);
+
+      // Update sidebar thread preview in-place
+      updateThreadLastMessageInPlace(targetUserId, createdMsg);
+
+      clearPendingImage();
+      showToast('Image sent! 📷');
+    } catch (err) {
+      console.error('Image send error:', err);
+      showToast('Image upload failed.');
+    } finally {
+      isSendingImage = false;
+      if (chatImagePreviewSend) {
+        chatImagePreviewSend.disabled = false;
+        chatImagePreviewSend.innerHTML = '<i data-lucide="send" style="width: 14px; height: 14px;"></i> Send';
+      }
+      debouncedCreateIcons();
+    }
+  }
+
+  if (attachmentBtnPicker && chatImageInput) {
+    attachmentBtnPicker.addEventListener('click', () => {
+      chatImageInput.click();
     });
   }
 
-  if (galleryFileInput) {
-    galleryFileInput.addEventListener('change', (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
+  if (galleryPickerBtn && chatImageInput) {
+    galleryPickerBtn.addEventListener('click', () => {
+      chatImageInput.click();
+    });
+  }
 
-      const reader = new FileReader();
-      reader.onload = async function (evt) {
-        const fileDataUrl = evt.target.result;
-        const targetUserId = state.currentChatThread;
-        const currentUser = getCurrentUser();
-        const token = getAuthToken();
+  if (chatImagePreviewCancel) {
+    chatImagePreviewCancel.addEventListener('click', clearPendingImage);
+  }
 
-        if (targetUserId && currentUser && token) {
-          try {
-            let mediaType = 'file';
-            if (file.type.startsWith('image/')) {
-              mediaType = 'image';
-            } else if (file.type.startsWith('video/')) {
-              mediaType = 'video';
-            } else if (file.type.startsWith('audio/')) {
-              mediaType = 'voice';
-            }
+  if (chatImagePreviewSend) {
+    chatImagePreviewSend.addEventListener('click', sendImageMessage);
+  }
 
-            const sizeStr = (file.size / 1024 / 1024).toFixed(1) + ' MB';
+  // --- PHASE 3B: VIDEO ATTACHMENT SYSTEM ---
+  const chatVideoInput = document.getElementById('chat-video-file-input');
+  const chatVideoPreviewContainer = document.getElementById('chat-video-preview-container');
+  const chatVideoPreviewElement = document.getElementById('chat-video-preview-element');
+  const chatVideoPreviewName = document.getElementById('chat-video-preview-name');
+  const chatVideoPreviewSize = document.getElementById('chat-video-preview-size');
+  const chatVideoPreviewDuration = document.getElementById('chat-video-preview-duration');
+  const chatVideoPreviewCancel = document.getElementById('chat-video-preview-cancel');
+  const chatVideoPreviewSend = document.getElementById('chat-video-preview-send');
 
-            const secretKey = getChatSecretKey(currentUser.id || currentUser._id, targetUserId);
-            const encryptedText = encryptMessage(fileDataUrl, secretKey);
+  let pendingVideoAttachment = null;
+  let isSendingVideo = false;
+  let videoBlobUrl = null;
 
-            await fetch(`${API_URL}/api/chats/message`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`
-              },
-              body: JSON.stringify({
-                recipient: targetUserId,
-                content: encryptedText,
-                mediaUrl: 'gallery_upload',
-                mediaType: mediaType,
-                mediaName: file.name,
-                mediaSize: sizeStr
-              })
-            });
-            await fetchMessages(targetUserId, true);
-            loadChatThreads();
-            showToast('Media uploaded from gallery! 🖼️');
-          } catch (err) {
-            console.error('Gallery upload error:', err);
-            showToast('Failed to upload file.');
-          }
+  function formatDuration(seconds) {
+    if (!seconds || isNaN(seconds) || !isFinite(seconds)) return '';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
+  function clearPendingVideo() {
+    pendingVideoAttachment = null;
+    if (chatVideoPreviewContainer) chatVideoPreviewContainer.style.display = 'none';
+    if (chatVideoPreviewElement) {
+      chatVideoPreviewElement.pause();
+      chatVideoPreviewElement.src = '';
+      chatVideoPreviewElement.load();
+    }
+    if (videoBlobUrl) {
+      URL.revokeObjectURL(videoBlobUrl);
+      videoBlobUrl = null;
+    }
+    if (chatVideoInput) chatVideoInput.value = '';
+    const attachmentsDrawer = document.getElementById('chat-attachments-drawer');
+    if (attachmentsDrawer) attachmentsDrawer.classList.remove('active');
+  }
+
+  function handleVideoFileSelection(file) {
+    if (!file) return;
+
+    // 1. Validate MIME type
+    const validVideoMimes = ['video/mp4', 'video/webm', 'video/ogg'];
+    const isVideoMime = validVideoMimes.includes(file.type) || file.type.startsWith('video/');
+    if (!isVideoMime) {
+      showToast('Please select a valid video (MP4, WebM, OGG).');
+      if (chatVideoInput) chatVideoInput.value = '';
+      return;
+    }
+
+    // 2. Validate Extension
+    const extMatch = file.name.match(/\.([0-9a-z]+)$/i);
+    const ext = extMatch ? extMatch[1].toLowerCase() : '';
+    const validVideoExts = ['mp4', 'webm', 'ogg', 'mov', 'm4v'];
+    if (!validVideoExts.includes(ext)) {
+      showToast('Unsupported video format. Allowed: MP4, WebM, OGG, MOV, M4V.');
+      if (chatVideoInput) chatVideoInput.value = '';
+      return;
+    }
+
+    // 3. Validate Size (Max 100MB for videos)
+    const maxVideoSizeBytes = 100 * 1024 * 1024;
+    if (file.size > maxVideoSizeBytes) {
+      showToast('Video is too large. Maximum size is 100MB.');
+      if (chatVideoInput) chatVideoInput.value = '';
+      return;
+    }
+
+    // Revoke any previous blob URL before creating a new one
+    if (videoBlobUrl) {
+      URL.revokeObjectURL(videoBlobUrl);
+      videoBlobUrl = null;
+    }
+
+    // Use Object URL for local preview only — never persisted
+    videoBlobUrl = URL.createObjectURL(file);
+
+    pendingVideoAttachment = {
+      file,
+      blobUrl: videoBlobUrl,
+      name: file.name,
+      size: file.size,
+      mimeType: file.type,
+      durationSeconds: 0
+    };
+
+    if (chatVideoPreviewElement) {
+      chatVideoPreviewElement.src = videoBlobUrl;
+      chatVideoPreviewElement.load();
+      chatVideoPreviewElement.onloadedmetadata = () => {
+        const dur = chatVideoPreviewElement.duration;
+        if (pendingVideoAttachment) pendingVideoAttachment.durationSeconds = Math.round(dur) || 0;
+        if (chatVideoPreviewDuration) {
+          chatVideoPreviewDuration.textContent = formatDuration(dur) ? `• ${formatDuration(dur)}` : '';
         }
       };
-      reader.readAsDataURL(file);
-      galleryFileInput.value = '';
+    }
+
+    if (chatVideoPreviewName) chatVideoPreviewName.textContent = file.name;
+    if (chatVideoPreviewSize) chatVideoPreviewSize.textContent = formatFileSize(file.size);
+    if (chatVideoPreviewDuration) chatVideoPreviewDuration.textContent = '';
+    if (chatVideoPreviewContainer) chatVideoPreviewContainer.style.display = 'flex';
+
+    const attachmentsDrawer = document.getElementById('chat-attachments-drawer');
+    if (attachmentsDrawer) attachmentsDrawer.classList.remove('active');
+
+    debouncedCreateIcons();
+  }
+
+  async function sendVideoMessage() {
+    if (!pendingVideoAttachment || isSendingVideo) return;
+
+    const targetUserId = state.currentChatThread;
+    const currentUser = getCurrentUser();
+    const token = getAuthToken();
+
+    if (!targetUserId || !currentUser || !token) {
+      showToast('Please select a conversation to send the video.');
+      return;
+    }
+
+    isSendingVideo = true;
+    if (chatVideoPreviewSend) {
+      chatVideoPreviewSend.disabled = true;
+      chatVideoPreviewSend.innerHTML = '<i data-lucide="loader" class="spin"></i> Uploading...';
+      debouncedCreateIcons();
+    }
+
+    try {
+      // Read file as base64 for upload — do NOT use blob URL
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = () => reject(new Error('Failed to read video file.'));
+        reader.readAsDataURL(pendingVideoAttachment.file);
+      });
+
+      const res = await fetch(`${API_URL}/api/chats/message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          recipient: targetUserId,
+          content: '',
+          mediaUrl: dataUrl,
+          mediaType: 'video',
+          mediaName: pendingVideoAttachment.name,
+          mediaSize: pendingVideoAttachment.size,
+          durationSeconds: pendingVideoAttachment.durationSeconds || 0
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Video upload failed.');
+      }
+
+      const createdMsg = await res.json();
+
+      // Append sent video smoothly into active conversation viewport (Right-aligned)
+      appendSingleMessage(targetUserId, createdMsg);
+
+      // Update sidebar thread preview in-place
+      updateThreadLastMessageInPlace(targetUserId, createdMsg);
+
+      clearPendingVideo();
+      showToast('Video sent! 🎥');
+    } catch (err) {
+      console.error('[VIDEO_UPLOAD_ERROR]', err.message);
+      showToast(err.message || 'Video upload failed.');
+    } finally {
+      isSendingVideo = false;
+      if (chatVideoPreviewSend) {
+        chatVideoPreviewSend.disabled = false;
+        chatVideoPreviewSend.innerHTML = '<i data-lucide="send" style="width: 14px; height: 14px;"></i> Send';
+      }
+      debouncedCreateIcons();
+    }
+  }
+
+  function handleMediaFileSelection(file) {
+    if (!file) return;
+    console.log('[DM MEDIA] selected file:', {
+      name: file.name,
+      type: file.type,
+      size: file.size
+    });
+
+    const isVideo = (file.type && file.type.startsWith('video/')) || /\.(mp4|webm|ogg|mov|m4v)$/i.test(file.name);
+    const isImage = (file.type && file.type.startsWith('image/')) || /\.(jpg|jpeg|png|webp|gif)$/i.test(file.name);
+
+    const mediaType = isVideo ? 'video' : (isImage ? 'image' : 'unknown');
+    console.log('[DM MEDIA] detected type:', mediaType);
+
+    if (isVideo) {
+      handleVideoFileSelection(file);
+    } else if (isImage) {
+      handleImageFileSelection(file);
+    } else {
+      showToast('Unsupported media format. Allowed: Images (JPG, PNG, WEBP, GIF) and Videos (MP4, WebM, OGG, MOV).');
+      if (chatImageInput) chatImageInput.value = '';
+      if (chatVideoInput) chatVideoInput.value = '';
+    }
+  }
+
+  if (chatImageInput) {
+    chatImageInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      handleMediaFileSelection(file);
     });
   }
 
-  // --- SHARED MEDIA VIEWER AND REPLIES ---
+  if (chatVideoInput) {
+    chatVideoInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      handleMediaFileSelection(file);
+    });
+  }
+
+  if (chatVideoPreviewCancel) {
+    chatVideoPreviewCancel.addEventListener('click', clearPendingVideo);
+  }
+
+  if (chatVideoPreviewSend) {
+    chatVideoPreviewSend.addEventListener('click', sendVideoMessage);
+  }
+
+
   const mediaViewerModal = document.getElementById('media-viewer-modal');
   const mediaViewerCloseBtn = document.getElementById('media-viewer-close-btn');
   const mediaViewerTitle = document.getElementById('media-viewer-title');
@@ -3614,9 +8247,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const targetUserId = state.currentChatThread;
     if (!targetUserId || !mediaViewerModal) return;
 
-    const conversationMsgs = chatFeeds[targetUserId] || [];
-    const msg = conversationMsgs.find(m => m._id.toString() === messageId.toString());
-    if (!msg || !msg.mediaType) return;
+    const conversationMsgs = dmState.messagesByConversation.get(targetUserId) || [];
+    const msg = conversationMsgs.find(m => (m._id || m.id || '').toString() === messageId.toString());
+    const effectiveType = (msg?.mediaType || msg?.media_type || (msg?.attachment?.file_type) || (msg?.mediaUrl || msg?.media_url ? 'image' : '')).toLowerCase();
+    if (!msg || !effectiveType || effectiveType === 'text') return;
 
     const currentUser = getCurrentUser();
     if (!currentUser) return;
@@ -3625,28 +8259,75 @@ document.addEventListener('DOMContentLoaded', () => {
     const decryptedData = decryptMessage(msg.content, secretKey);
 
     mediaViewerViewport.innerHTML = '';
-    mediaViewerName.textContent = msg.mediaName || 'Shared Media';
-    mediaViewerSize.textContent = msg.mediaSize || '';
+    mediaViewerName.textContent = msg.mediaName || msg.media_name || 'Shared Media';
+    mediaViewerSize.textContent = msg.mediaSize || msg.media_size || '';
     mediaViewerReplyInput.value = '';
 
-    if (msg.mediaType === 'image') {
+    if (effectiveType === 'image' || effectiveType.includes('image')) {
       mediaViewerTitle.textContent = 'View Image';
       const img = document.createElement('img');
-      img.src = decryptedData;
+      img.src = resolveBrowserMediaUrl(msg) || (decryptedData.startsWith('http') || decryptedData.startsWith('data:') ? decryptedData : '');
+      img.style.maxWidth = '100%';
+      img.style.maxHeight = '80vh';
+      img.style.borderRadius = 'var(--radius-md)';
+      img.style.objectFit = 'contain';
       mediaViewerViewport.appendChild(img);
-    } else if (msg.mediaType === 'video') {
+    } else if (effectiveType === 'video' || effectiveType.includes('video')) {
       mediaViewerTitle.textContent = 'Play Video';
+      const videoUrl = resolveBrowserMediaUrl(msg) || (decryptedData.startsWith('http') || decryptedData.startsWith('data:') ? decryptedData : '');
+      const mimeType = (msg.attachment && msg.attachment.mime_type) || msg.mimeType || msg.mime_type || 'video/mp4';
       const video = document.createElement('video');
-      video.src = decryptedData;
       video.controls = true;
-      video.autoplay = true;
+      video.autoplay = false;
+      video.preload = 'metadata';
+      video.playsInline = true;
+      video.src = videoUrl;
+      video.style.maxWidth = '100%';
+      video.style.maxHeight = '80vh';
+      video.style.borderRadius = 'var(--radius-md)';
+      video.style.display = 'block';
+
+      const source = document.createElement('source');
+      source.src = videoUrl;
+      source.type = mimeType;
+      video.appendChild(source);
+
+      video.addEventListener('loadedmetadata', () => {
+        if (video.duration === Infinity || isNaN(video.duration) || video.duration === 0) {
+          const p = video.currentTime;
+          video.currentTime = 1e101;
+          video.addEventListener('timeupdate', function f() {
+            video.removeEventListener('timeupdate', f);
+            video.currentTime = p || 0;
+          }, { once: true });
+        }
+      });
+      video.addEventListener('error', () => {
+        console.error('[VIEWER_VIDEO_ERROR]', {
+          messageId,
+          videoUrl,
+          errorCode: video.error ? video.error.code : 'unknown',
+          errorMessage: video.error ? video.error.message : ''
+        });
+      });
+
       mediaViewerViewport.appendChild(video);
-    } else if (msg.mediaType === 'voice') {
+    } else if (effectiveType === 'audio' || effectiveType === 'voice' || effectiveType.includes('audio') || effectiveType.includes('voice')) {
       mediaViewerTitle.textContent = 'Play Voice Note';
+      const audioUrl = resolveBrowserMediaUrl(msg) || (decryptedData.startsWith('http') || decryptedData.startsWith('data:') ? decryptedData : '');
+      const mimeType = (msg.attachment && msg.attachment.mime_type) || msg.mimeType || msg.mime_type || 'audio/webm';
       const audio = document.createElement('audio');
-      audio.src = decryptedData;
       audio.controls = true;
-      audio.autoplay = true;
+      audio.autoplay = false;
+      audio.src = audioUrl;
+      audio.style.width = '100%';
+      audio.style.maxWidth = '360px';
+
+      const source = document.createElement('source');
+      source.src = audioUrl;
+      source.type = mimeType;
+      audio.appendChild(source);
+
       mediaViewerViewport.appendChild(audio);
     } else if (msg.mediaType === 'file') {
       mediaViewerTitle.textContent = 'View Document';
@@ -3917,16 +8598,9 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // --- ATTACHMENTS DRAWER ACTION BUTTONS ---
-  const attachmentBtnPicker = document.getElementById('attachment-btn-picker');
   const filesBtnPicker = document.getElementById('files-btn-picker');
   const attachmentFileInput = document.getElementById('attachment-file-input');
   const attachmentDocInput = document.getElementById('attachment-doc-input');
-
-  if (attachmentBtnPicker && attachmentFileInput) {
-    attachmentBtnPicker.addEventListener('click', () => {
-      attachmentFileInput.click();
-    });
-  }
 
   if (filesBtnPicker && attachmentDocInput) {
     filesBtnPicker.addEventListener('click', () => {
@@ -4068,193 +8742,420 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Voice Note Audio Recording
+  // --- PHASE 4: AUDIO / VOICE MESSAGES SYSTEM & STATE MACHINE ---
   const micClickSimBtn = document.getElementById('mic-click-sim');
-  let mediaRecorder = null;
-  let audioChunks = [];
-  let isRecordingAudio = false;
-  let recordingTimeout = null;
+  const chatMicInputBtn = document.getElementById('chat-mic-input-btn');
+  const voiceRecordingBar = document.getElementById('chat-voice-recording-bar');
+  const voiceRecordingTimer = document.getElementById('voice-recording-timer');
+  const voiceRecordingCancelBtn = document.getElementById('voice-recording-cancel-btn');
+  const voiceRecordingPauseBtn = document.getElementById('voice-recording-pause-btn');
+  const voiceRecordingPauseText = document.getElementById('voice-recording-pause-text');
+  const voiceRecordingStopBtn = document.getElementById('voice-recording-stop-btn');
 
-  // Global variables to store the voice note preview
-  let tempVoiceNoteBase64 = null;
-  let tempVoiceNoteBlobSize = null;
-  let tempVoiceNoteBlob = null;
+  const voicePreviewBar = document.getElementById('chat-voice-preview-bar');
+  const voicePreviewPlayBtn = document.getElementById('voice-preview-play-btn');
+  const voicePreviewDuration = document.getElementById('voice-preview-duration');
+  const voicePreviewAudioElem = document.getElementById('voice-preview-audio-elem');
+  const voicePreviewTrack = document.getElementById('voice-preview-track');
+  const voicePreviewProgress = document.getElementById('voice-preview-progress');
+  const voicePreviewDeleteBtn = document.getElementById('voice-preview-delete-btn');
+  const voicePreviewSendBtn = document.getElementById('voice-preview-send-btn');
 
+  // Legacy fallback containers if present
   const voiceNotePreviewContainer = document.getElementById('voice-note-preview-container');
   const voiceNotePreviewAudio = document.getElementById('voice-note-preview-audio');
   const voiceNotePreviewDelete = document.getElementById('voice-note-preview-delete');
   const voiceNotePreviewSend = document.getElementById('voice-note-preview-send');
 
-  if (micClickSimBtn) {
-    micClickSimBtn.addEventListener('click', async () => {
-      if (isRecordingAudio) {
-        // Stop recording
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-          mediaRecorder.stop();
+  let mediaRecorder = null;
+  let audioChunks = [];
+  let isRecordingAudio = false;
+  let recordingTimeout = null;
+  let recordingStartTime = 0;
+  let recordedDurationSeconds = 0;
+  let activeAudioStream = null;
+  let voiceTimerInterval = null;
+  let voiceRecordedSeconds = 0;
+  let voiceIsPaused = false;
+
+  let tempVoiceNoteBase64 = null;
+  let tempVoiceNoteBlobSize = null;
+  let tempVoiceNoteBlob = null;
+  let tempAudioObjectUrl = null;
+  let isSendingVoiceNote = false;
+
+  function formatTime(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+
+  function setVoiceComposerState(newState) {
+    const inputRow = document.querySelector('.chat-input-row');
+
+    if (newState === 'idle') {
+      if (inputRow) inputRow.style.display = 'flex';
+      if (voiceRecordingBar) voiceRecordingBar.style.display = 'none';
+      if (voicePreviewBar) voicePreviewBar.style.display = 'none';
+      if (voiceNotePreviewContainer) voiceNotePreviewContainer.style.display = 'none';
+      clearVoiceTimer();
+      cleanupAudioStream();
+      isRecordingAudio = false;
+      voiceIsPaused = false;
+      if (voicePreviewAudioElem) {
+        voicePreviewAudioElem.pause();
+        voicePreviewAudioElem.src = '';
+      }
+      if (voicePreviewProgress) voicePreviewProgress.style.width = '0%';
+      if (voicePreviewPlayBtn) {
+        voicePreviewPlayBtn.innerHTML = '<i data-lucide="play" style="width: 15px; height: 15px; fill: currentColor;"></i>';
+      }
+      if (voiceRecordingPauseText) voiceRecordingPauseText.textContent = 'Pause';
+    } else if (newState === 'recording') {
+      if (inputRow) inputRow.style.display = 'none';
+      if (voiceRecordingBar) voiceRecordingBar.style.display = 'flex';
+      if (voicePreviewBar) voicePreviewBar.style.display = 'none';
+      if (voiceNotePreviewContainer) voiceNotePreviewContainer.style.display = 'none';
+    } else if (newState === 'preview') {
+      if (inputRow) inputRow.style.display = 'none';
+      if (voiceRecordingBar) voiceRecordingBar.style.display = 'none';
+      if (voicePreviewBar) voicePreviewBar.style.display = 'flex';
+      if (voiceNotePreviewContainer) voiceNotePreviewContainer.style.display = 'none';
+      clearVoiceTimer();
+      cleanupAudioStream();
+      isRecordingAudio = false;
+    }
+    debouncedCreateIcons();
+  }
+
+  function startVoiceTimer() {
+    clearVoiceTimer();
+    voiceRecordedSeconds = 0;
+    voiceIsPaused = false;
+    if (voiceRecordingTimer) voiceRecordingTimer.textContent = '00:00';
+
+    voiceTimerInterval = setInterval(() => {
+      if (!voiceIsPaused) {
+        voiceRecordedSeconds++;
+        if (voiceRecordingTimer) voiceRecordingTimer.textContent = formatTime(voiceRecordedSeconds);
+      }
+    }, 1000);
+  }
+
+  function clearVoiceTimer() {
+    if (voiceTimerInterval) {
+      clearInterval(voiceTimerInterval);
+      voiceTimerInterval = null;
+    }
+  }
+
+  function cleanupAudioStream() {
+    if (activeAudioStream) {
+      try {
+        activeAudioStream.getTracks().forEach(track => track.stop());
+      } catch (_) {}
+      activeAudioStream = null;
+    }
+  }
+
+  function clearVoiceNoteState() {
+    tempVoiceNoteBase64 = null;
+    tempVoiceNoteBlobSize = null;
+    tempVoiceNoteBlob = null;
+    recordedDurationSeconds = 0;
+    if (tempAudioObjectUrl) {
+      try {
+        URL.revokeObjectURL(tempAudioObjectUrl);
+      } catch (_) {}
+      tempAudioObjectUrl = null;
+    }
+    if (voiceNotePreviewAudio) {
+      voiceNotePreviewAudio.pause();
+      voiceNotePreviewAudio.src = '';
+    }
+    if (voicePreviewAudioElem) {
+      voicePreviewAudioElem.pause();
+      voicePreviewAudioElem.src = '';
+    }
+    setVoiceComposerState('idle');
+  }
+
+  async function startAudioRecording() {
+    clearPendingImage();
+    clearPendingVideo();
+    clearVoiceNoteState();
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showToast('Microphone is not supported in this browser.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      activeAudioStream = stream;
+      audioChunks = [];
+
+      const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg'];
+      let chosenMime = '';
+      for (const mime of mimeTypes) {
+        if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(mime)) {
+          chosenMime = mime;
+          break;
         }
-      } else {
-        // Start recording
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          showToast('Audio recording is not supported by your browser.');
+      }
+
+      mediaRecorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+      recordingStartTime = Date.now();
+
+      mediaRecorder.addEventListener('dataavailable', (event) => {
+        if (event.data.size > 0) {
+          audioChunks.push(event.data);
+        }
+      });
+
+      mediaRecorder.addEventListener('stop', async () => {
+        recordedDurationSeconds = Math.max(1, voiceRecordedSeconds || Math.round((Date.now() - recordingStartTime) / 1000));
+        cleanupAudioStream();
+
+        const finalMime = mediaRecorder.mimeType || chosenMime || 'audio/webm';
+        const audioBlob = new Blob(audioChunks, { type: finalMime });
+
+        if (audioBlob.size < 300) {
+          showToast('No audio was recorded.');
+          clearVoiceNoteState();
           return;
         }
 
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          audioChunks = [];
-          mediaRecorder = new MediaRecorder(stream);
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          tempVoiceNoteBase64 = reader.result;
+          tempVoiceNoteBlobSize = formatFileSize(audioBlob.size);
+          tempVoiceNoteBlob = audioBlob;
 
-          mediaRecorder.addEventListener('dataavailable', (event) => {
-            if (event.data.size > 0) {
-              audioChunks.push(event.data);
-            }
-          });
+          if (tempAudioObjectUrl) {
+            try { URL.revokeObjectURL(tempAudioObjectUrl); } catch (_) {}
+          }
+          tempAudioObjectUrl = URL.createObjectURL(audioBlob);
 
-          mediaRecorder.addEventListener('stop', async () => {
-            // Stop all stream tracks to release microphone
-            stream.getTracks().forEach(track => track.stop());
-
-            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-            if (audioBlob.size < 1000) {
-              showToast('Recording was too short.');
-              resetRecordingUI();
-              return;
-            }
-
-            // Convert to base64 Data URL
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-              // Store locally in temporary variables
-              tempVoiceNoteBase64 = reader.result;
-              tempVoiceNoteBlobSize = (audioBlob.size / 1024).toFixed(1) + ' KB';
-              tempVoiceNoteBlob = audioBlob;
-
-              // Bind to preview audio player
-              if (voiceNotePreviewAudio) {
-                if (voiceNotePreviewAudio.src && voiceNotePreviewAudio.src.startsWith('blob:')) {
-                  URL.revokeObjectURL(voiceNotePreviewAudio.src);
-                }
-                voiceNotePreviewAudio.src = URL.createObjectURL(audioBlob);
+          if (voicePreviewAudioElem) {
+            voicePreviewAudioElem.src = tempAudioObjectUrl;
+            voicePreviewAudioElem.onended = () => {
+              if (voicePreviewPlayBtn) {
+                voicePreviewPlayBtn.innerHTML = '<i data-lucide="play" style="width: 15px; height: 15px; fill: currentColor;"></i>';
+                debouncedCreateIcons();
               }
-
-              // Display the preview container
-              if (voiceNotePreviewContainer) {
-                voiceNotePreviewContainer.style.display = 'flex';
-              }
-
-              // Collapse the attachments drawer mimicking standard behavior
-              if (toggleAttachmentsBtn && toggleAttachmentsBtn.classList.contains('active')) {
-                toggleAttachmentsBtn.classList.remove('active');
-                if (attachmentsDrawer) attachmentsDrawer.classList.remove('active');
-              }
-
-              resetRecordingUI();
+              if (voicePreviewProgress) voicePreviewProgress.style.width = '0%';
             };
-            reader.readAsDataURL(audioBlob);
-          });
+            voicePreviewAudioElem.ontimeupdate = () => {
+              if (voicePreviewAudioElem.duration) {
+                const pct = (voicePreviewAudioElem.currentTime / voicePreviewAudioElem.duration) * 100;
+                if (voicePreviewProgress) voicePreviewProgress.style.width = `${pct}%`;
+                if (voicePreviewDuration) voicePreviewDuration.textContent = formatTime(Math.floor(voicePreviewAudioElem.currentTime));
+              }
+            };
+          }
 
-          mediaRecorder.start();
-          isRecordingAudio = true;
+          if (voicePreviewDuration) {
+            voicePreviewDuration.textContent = formatTime(recordedDurationSeconds);
+          }
 
-          // Update UI
-          micClickSimBtn.classList.add('bg-pulse-red');
-          const spanText = micClickSimBtn.querySelector('span');
-          if (spanText) spanText.textContent = 'Stop';
-          showToast('Recording voice note... Click again to stop. 🔴');
+          const attachmentsDrawer = document.getElementById('chat-attachments-drawer');
+          if (attachmentsDrawer) attachmentsDrawer.classList.remove('active');
 
-          // Maximum recording duration: 60 seconds
-          recordingTimeout = setTimeout(() => {
-            if (isRecordingAudio && mediaRecorder && mediaRecorder.state !== 'inactive') {
-              mediaRecorder.stop();
-            }
-          }, 60000);
+          setVoiceComposerState('preview');
+        };
+        reader.readAsDataURL(audioBlob);
+      });
 
-        } catch (err) {
-          console.error('Microphone access denied or error:', err);
-          showToast('Could not access microphone: ' + err.message);
-          resetRecordingUI();
+      mediaRecorder.start();
+      isRecordingAudio = true;
+      setVoiceComposerState('recording');
+      startVoiceTimer();
+
+      // Auto-stop after 120 seconds
+      if (recordingTimeout) clearTimeout(recordingTimeout);
+      recordingTimeout = setTimeout(() => {
+        if (isRecordingAudio && mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
         }
+      }, 120000);
+
+    } catch (err) {
+      console.error('Microphone access error:', err);
+      showToast('Microphone permission denied or unavailable.');
+      cleanupAudioStream();
+      clearVoiceNoteState();
+    }
+  }
+
+  // Mic Button Listeners
+  if (chatMicInputBtn) {
+    chatMicInputBtn.addEventListener('click', () => {
+      startAudioRecording();
+    });
+  }
+
+  if (micClickSimBtn) {
+    micClickSimBtn.addEventListener('click', () => {
+      startAudioRecording();
+    });
+  }
+
+  // Recording State Controls
+  if (voiceRecordingCancelBtn) {
+    voiceRecordingCancelBtn.addEventListener('click', () => {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
       }
+      clearVoiceNoteState();
+      showToast('Recording cancelled.');
+    });
+  }
+
+  if (voiceRecordingPauseBtn) {
+    voiceRecordingPauseBtn.addEventListener('click', () => {
+      if (!mediaRecorder) return;
+      if (mediaRecorder.state === 'recording') {
+        mediaRecorder.pause();
+        voiceIsPaused = true;
+        if (voiceRecordingPauseText) voiceRecordingPauseText.textContent = 'Resume';
+        voiceRecordingPauseBtn.innerHTML = '<i data-lucide="play" style="width: 13px; height: 13px;"></i> <span id="voice-recording-pause-text">Resume</span>';
+      } else if (mediaRecorder.state === 'paused') {
+        mediaRecorder.resume();
+        voiceIsPaused = false;
+        if (voiceRecordingPauseText) voiceRecordingPauseText.textContent = 'Pause';
+        voiceRecordingPauseBtn.innerHTML = '<i data-lucide="pause" style="width: 13px; height: 13px;"></i> <span id="voice-recording-pause-text">Pause</span>';
+      }
+      debouncedCreateIcons();
+    });
+  }
+
+  if (voiceRecordingStopBtn) {
+    voiceRecordingStopBtn.addEventListener('click', () => {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+    });
+  }
+
+  // Preview State Controls
+  if (voicePreviewPlayBtn) {
+    voicePreviewPlayBtn.addEventListener('click', () => {
+      if (!voicePreviewAudioElem || !voicePreviewAudioElem.src) return;
+      if (voicePreviewAudioElem.paused) {
+        voicePreviewAudioElem.play();
+        voicePreviewPlayBtn.innerHTML = '<i data-lucide="pause" style="width: 15px; height: 15px; fill: currentColor;"></i>';
+      } else {
+        voicePreviewAudioElem.pause();
+        voicePreviewPlayBtn.innerHTML = '<i data-lucide="play" style="width: 15px; height: 15px; fill: currentColor;"></i>';
+      }
+      debouncedCreateIcons();
+    });
+  }
+
+  if (voicePreviewTrack) {
+    voicePreviewTrack.addEventListener('click', (e) => {
+      if (!voicePreviewAudioElem || !voicePreviewAudioElem.duration) return;
+      const rect = voicePreviewTrack.getBoundingClientRect();
+      const clickX = e.clientX - rect.left;
+      const pct = Math.max(0, Math.min(1, clickX / rect.width));
+      voicePreviewAudioElem.currentTime = pct * voicePreviewAudioElem.duration;
+    });
+  }
+
+  if (voicePreviewDeleteBtn) {
+    voicePreviewDeleteBtn.addEventListener('click', () => {
+      clearVoiceNoteState();
+      showToast('Voice note deleted.');
     });
   }
 
   if (voiceNotePreviewDelete) {
     voiceNotePreviewDelete.addEventListener('click', () => {
-      tempVoiceNoteBase64 = null;
-      tempVoiceNoteBlobSize = null;
-      tempVoiceNoteBlob = null;
-      if (voiceNotePreviewAudio) {
-        if (voiceNotePreviewAudio.src && voiceNotePreviewAudio.src.startsWith('blob:')) {
-          URL.revokeObjectURL(voiceNotePreviewAudio.src);
-        }
-        voiceNotePreviewAudio.src = '';
-      }
-      if (voiceNotePreviewContainer) {
-        voiceNotePreviewContainer.style.display = 'none';
-      }
+      clearVoiceNoteState();
       showToast('Voice note discarded.');
     });
   }
 
-  if (voiceNotePreviewSend) {
-    voiceNotePreviewSend.addEventListener('click', async () => {
-      const targetUserId = state.currentChatThread;
-      const currentUser = getCurrentUser();
-      const token = getAuthToken();
+  async function sendVoiceNoteMessage() {
+    if (!tempVoiceNoteBase64 || isSendingVoiceNote) return;
 
-      if (tempVoiceNoteBase64 && targetUserId && currentUser && token) {
-        try {
-          const secretKey = getChatSecretKey(currentUser.id || currentUser._id, targetUserId);
-          const encryptedText = encryptMessage(tempVoiceNoteBase64, secretKey);
+    const targetUserId = state.currentChatThread;
+    const currentUser = getCurrentUser();
+    const token = getAuthToken();
 
-          await fetch(`${API_URL}/api/chats/message`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token}`
-            },
-            body: JSON.stringify({
-              recipient: targetUserId,
-              content: encryptedText,
-              mediaUrl: 'voice_recording',
-              mediaType: 'voice',
-              mediaName: `Voice Note - ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
-              mediaSize: tempVoiceNoteBlobSize
-            })
-          });
-          await fetchMessages(targetUserId, true);
-          loadChatThreads();
-          showToast('Voice note sent! 🎙️');
-        } catch (err) {
-          console.error('Audio upload error:', err);
-          showToast('Failed to send voice note.');
-        }
+    if (!targetUserId || !currentUser || !token) {
+      showToast('Please select a conversation to send the voice note.');
+      return;
+    }
+
+    isSendingVoiceNote = true;
+    if (voicePreviewSendBtn) {
+      voicePreviewSendBtn.disabled = true;
+      voicePreviewSendBtn.innerHTML = '<i data-lucide="loader" class="spin"></i> Sending...';
+    }
+    if (voiceNotePreviewSend) {
+      voiceNotePreviewSend.disabled = true;
+      voiceNotePreviewSend.innerHTML = '<i data-lucide="loader" class="spin"></i> Uploading...';
+    }
+
+    try {
+      const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const res = await fetch(`${API_URL}/api/chats/message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          recipient: targetUserId,
+          content: '',
+          mediaUrl: tempVoiceNoteBase64,
+          mediaType: 'audio',
+          mediaName: `Voice Note - ${timeStr}`,
+          mediaSize: tempVoiceNoteBlob ? tempVoiceNoteBlob.size : 0,
+          durationSeconds: recordedDurationSeconds || 0
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to send voice note.');
       }
 
-      // Clear states
-      tempVoiceNoteBase64 = null;
-      tempVoiceNoteBlobSize = null;
-      tempVoiceNoteBlob = null;
-      if (voiceNotePreviewAudio) {
-        if (voiceNotePreviewAudio.src && voiceNotePreviewAudio.src.startsWith('blob:')) {
-          URL.revokeObjectURL(voiceNotePreviewAudio.src);
-        }
-        voiceNotePreviewAudio.src = '';
+      const createdMsg = await res.json();
+
+      // Append sent voice note smoothly into active conversation viewport
+      appendSingleMessage(targetUserId, createdMsg);
+
+      // Update sidebar thread preview in-place
+      updateThreadLastMessageInPlace(targetUserId, createdMsg);
+
+      clearVoiceNoteState();
+      showToast('Voice note sent! 🎙️');
+    } catch (err) {
+      console.error('Audio upload error:', err);
+      showToast('Voice message could not be sent.');
+    } finally {
+      isSendingVoiceNote = false;
+      if (voicePreviewSendBtn) {
+        voicePreviewSendBtn.disabled = false;
+        voicePreviewSendBtn.innerHTML = '<i data-lucide="send" style="width: 13px; height: 13px;"></i> Send';
       }
-      if (voiceNotePreviewContainer) {
-        voiceNotePreviewContainer.style.display = 'none';
+      if (voiceNotePreviewSend) {
+        voiceNotePreviewSend.disabled = false;
+        voiceNotePreviewSend.innerHTML = '<i data-lucide="send" style="width: 14px; height: 14px;"></i> Send';
       }
-    });
+      debouncedCreateIcons();
+    }
   }
 
-  function resetRecordingUI() {
-    isRecordingAudio = false;
-    if (recordingTimeout) clearTimeout(recordingTimeout);
-    if (micClickSimBtn) {
-      micClickSimBtn.classList.remove('bg-pulse-red');
-      const spanText = micClickSimBtn.querySelector('span');
-      if (spanText) spanText.textContent = 'Voice Note';
-    }
+  if (voicePreviewSendBtn) {
+    voicePreviewSendBtn.addEventListener('click', sendVoiceNoteMessage);
+  }
+
+  if (voiceNotePreviewSend) {
+    voiceNotePreviewSend.addEventListener('click', sendVoiceNoteMessage);
   }
 
 
@@ -4304,942 +9205,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
 
-  // --- WEBRTC AND VIDEO CALL STATE ---
-  let localStream = null;
-  let peerConnection = null;
-  let currentCallId = null;
-  let callStatePollingInterval = null;
-  let isCallActive = false;
-  let isCaller = false;
-  let currentRecipientId = null;
-  let localScreenStream = null;
-  let fakeCallSimulation = false;
-  let isAudioCall = false;
-
-  let activeRtcConfig = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' }
-    ]
-  };
-
-  async function fetchIceServers() {
-    try {
-      const res = await fetch(`${API_URL}/api/calls/ice-servers`, {
-        headers: getAuthHeaders()
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.iceServers) {
-          activeRtcConfig = { iceServers: data.iceServers };
-        }
-      }
-    } catch (e) {
-      console.warn("Could not fetch TURN/STUN servers from backend, using defaults:", e);
-    }
-  }
-
-  // Synthesized sounds
-  let audioCtx = null;
-  let ringToneInterval = null;
-
-  function initAudioContext() {
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume();
-    }
-  }
-
-  function playTone(freq, type, duration, gainValue = 0.1) {
-    try {
-      initAudioContext();
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
-
-      osc.type = type;
-      osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-
-      gain.gain.setValueAtTime(gainValue, audioCtx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
-
-      osc.connect(gain);
-      gain.connect(audioCtx.destination);
-
-      osc.start();
-      osc.stop(audioCtx.currentTime + duration);
-    } catch (e) {
-      console.error("Audio error:", e);
-    }
-  }
-
-  function startIncomingRingtone() {
-    stopAudioFeedback();
-    let noteIndex = 0;
-    const notes = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6
-    ringToneInterval = setInterval(() => {
-      playTone(notes[noteIndex % notes.length], 'triangle', 0.6, 0.12);
-      noteIndex++;
-    }, 350);
-  }
-
-  function startOutgoingRingback() {
-    stopAudioFeedback();
-    ringToneInterval = setInterval(() => {
-      // US ringback: 440Hz + 480Hz
-      playTone(440, 'sine', 1.5, 0.04);
-      playTone(480, 'sine', 1.5, 0.04);
-    }, 4000);
-  }
-
-  function playCallEndBeep() {
-    stopAudioFeedback();
-    playTone(250, 'sine', 0.4, 0.08);
-  }
-
-  function stopAudioFeedback() {
-    if (ringToneInterval) {
-      clearInterval(ringToneInterval);
-      ringToneInterval = null;
-    }
-  }
-
-  function getAuthHeaders() {
-    const token = localStorage.getItem('invibe_jwt_token');
-    return {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
-    };
-  }
-
-  function getUserById(userId) {
-    const thread = chatThreads.find(t => t.user && t.user._id.toString() === userId.toString());
-    if (thread) return thread.user;
-    return null;
-  }
-
-  // --- VIDEO CALL TIMER CONTROLLER ---
-  const callTimerDisplay = document.getElementById('call-timer-display');
-
-  function startVideoCallTimer() {
-    stopVideoCallTimer();
-    state.callSeconds = 0;
-    state.callTimerInterval = setInterval(() => {
-      state.callSeconds++;
-      if (callTimerDisplay) {
-        callTimerDisplay.textContent = formatCallTime(state.callSeconds);
-      }
-    }, 1000);
-  }
-
-  function stopVideoCallTimer() {
-    if (state.callTimerInterval) {
-      clearInterval(state.callTimerInterval);
-      state.callTimerInterval = null;
-    }
-  }
-
-  function formatCallTime(totalSec) {
-    const hrs = Math.floor(totalSec / 3600);
-    const mins = Math.floor((totalSec % 3600) / 60);
-    const secs = totalSec % 60;
-    const h = hrs < 10 ? '0' + hrs : hrs;
-    const m = mins < 10 ? '0' + mins : mins;
-    const s = secs < 10 ? '0' + secs : secs;
-    return `${h}:${m}:${s}`;
-  }
-
-  let iceCandidateSendPromise = Promise.resolve();
-
-  async function sendIceCandidateToServer(callId, candidate, role) {
-    iceCandidateSendPromise = iceCandidateSendPromise.then(async () => {
-      try {
-        await fetch(`${API_URL}/api/calls/ice-candidate`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({ callId, candidate, role })
-        });
-      } catch (e) {
-        console.error("Error sending ICE candidate:", e);
-      }
-    });
-  }
-
-  async function initiateVideoCall(recipientId, isAudioOnly = false) {
-    if (isCallActive) return;
-    isCallActive = true;
-    isCaller = true;
-    isAudioCall = isAudioOnly;
-    currentRecipientId = recipientId;
-    fakeCallSimulation = false;
-
-    // Show outgoing screen, hide active call screen and controls
-    document.getElementById('video-call-active-screen').style.display = 'none';
-    document.getElementById('video-call-outgoing-screen').style.display = 'flex';
-    document.getElementById('video-call-controls').style.display = 'none';
-
-    // Populate outgoing screen metadata
-    const user = getUserById(recipientId);
-    if (user) {
-      document.getElementById('video-call-outgoing-name').textContent = user.fullName;
-      document.getElementById('video-call-outgoing-avatar').src = user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
-    }
-
-    const outgoingStatus = document.getElementById('video-call-outgoing-status');
-    if (outgoingStatus) {
-      outgoingStatus.textContent = isAudioOnly ? 'Audio Calling...' : 'Calling...';
-    }
-
-    startOutgoingRingback();
-
-    try {
-      // 1. Get media permission
-      const mediaConstraints = isAudioOnly
-        ? { video: false, audio: true }
-        : { video: true, audio: true };
-
-      localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints).catch(err => {
-        console.warn("Could not get media devices, falling back to mock call: ", err);
-        fakeCallSimulation = true;
-        return null;
-      });
-
-      if (!fakeCallSimulation) {
-        // Set local stream to local preview video tag
-        const localVideo = document.getElementById('video-call-local-feed');
-        const localFrame = document.getElementById('video-call-local-frame');
-        if (localVideo) {
-          if (isAudioOnly) {
-            localVideo.srcObject = null;
-            if (localFrame) localFrame.style.display = 'none';
-          } else {
-            localVideo.srcObject = localStream;
-            localVideo.muted = true;
-            if (localFrame) localFrame.style.display = 'block';
-            localVideo.play().catch(e => console.log("video play error:", e));
-          }
-        }
-
-        // 2. Create PeerConnection
-        await fetchIceServers();
-        peerConnection = new RTCPeerConnection(activeRtcConfig);
-
-        // Add local tracks
-        localStream.getTracks().forEach(track => {
-          peerConnection.addTrack(track, localStream);
-        });
-
-        // ICE candidate handler
-        let iceCandidateQueue = [];
-        peerConnection.onicecandidate = (event) => {
-          if (event.candidate) {
-            if (currentCallId) {
-              sendIceCandidateToServer(currentCallId, event.candidate, 'caller');
-            } else {
-              iceCandidateQueue.push(event.candidate);
-            }
-          }
-        };
-
-        // Remote track handler
-        peerConnection.ontrack = (event) => {
-          const remoteVideo = document.getElementById('video-call-remote-feed');
-          if (remoteVideo && event.streams[0]) {
-            if (!isAudioOnly) {
-              remoteVideo.srcObject = event.streams[0];
-              remoteVideo.play().catch(e => console.log("remote play error:", e));
-            }
-          }
-        };
-
-        // Create Offer
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-
-        // Send Offer to Server
-        const offerPayload = {
-          type: offer.type,
-          sdp: offer.sdp,
-          isAudioOnly: isAudioOnly
-        };
-
-        const res = await fetch(`${API_URL}/api/calls/initiate`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({
-            recipientId,
-            offer: JSON.stringify(offerPayload)
-          })
-        });
-
-        if (!res.ok) throw new Error("Failed to initiate call on server.");
-        const callData = await res.json();
-        currentCallId = callData._id || callData.id;
-
-        // Flush queued ICE candidates
-        if (typeof iceCandidateQueue !== 'undefined') {
-          iceCandidateQueue.forEach(cand => {
-            sendIceCandidateToServer(currentCallId, cand, 'caller');
-          });
-          iceCandidateQueue = [];
-        }
-      } else {
-        // Mock Call initiation on server (just so signaling works for matching UI state)
-        const offerPayload = {
-          type: 'offer',
-          sdp: 'mock',
-          isAudioOnly: isAudioOnly
-        };
-
-        const res = await fetch(`${API_URL}/api/calls/initiate`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({
-            recipientId,
-            offer: JSON.stringify(offerPayload)
-          })
-        });
-        if (!res.ok) throw new Error("Failed to initiate call on server.");
-        const callData = await res.json();
-        currentCallId = callData._id || callData.id;
-      }
-
-      // Start polling for accept status
-      startCallStatePolling();
-
-    } catch (err) {
-      console.error("Error initiating call:", err);
-      showToast("Error initiating call 📞");
-      endVideoCallLocally();
-    }
-  }
-
-  function startCallStatePolling() {
-    if (callStatePollingInterval) clearInterval(callStatePollingInterval);
-
-    let processedCandidates = new Set();
-    callStatePollingInterval = setInterval(async () => {
-      if (!currentCallId) return;
-
-      try {
-        const res = await fetch(`${API_URL}/api/calls/${currentCallId}/state`, {
-          headers: getAuthHeaders()
-        });
-        if (!res.ok) return;
-
-        const data = await res.json();
-
-        // If caller and call was accepted:
-        if (isCaller && data.status === 'connected' && isCallActive && document.getElementById('video-call-active-screen').style.display === 'none') {
-          stopAudioFeedback();
-
-          // Switch to active view
-          document.getElementById('video-call-outgoing-screen').style.display = 'none';
-          document.getElementById('video-call-active-screen').style.display = 'block';
-          document.getElementById('video-call-controls').style.display = 'block';
-
-          startVideoCallTimer();
-
-          const camBtn = document.getElementById('call-cam-btn');
-          const shareBtn = document.getElementById('call-share-btn');
-          if (camBtn) camBtn.style.display = isAudioCall ? 'none' : 'flex';
-          if (shareBtn) shareBtn.style.display = isAudioCall ? 'none' : 'flex';
-
-          if (isAudioCall) {
-            const remoteContainer = document.getElementById('remote-video-container');
-            const localFrame = document.getElementById('video-call-local-frame');
-            const audioContainer = document.getElementById('audio-call-active-container');
-            if (remoteContainer) remoteContainer.style.display = 'none';
-            if (localFrame) localFrame.style.display = 'none';
-            if (audioContainer) {
-              audioContainer.style.display = 'flex';
-              const user = getUserById(currentRecipientId);
-              if (user) {
-                const activeAvatar = document.getElementById('audio-call-active-avatar');
-                const activeName = document.getElementById('audio-call-active-name');
-                if (activeAvatar) activeAvatar.src = user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
-                if (activeName) activeName.textContent = user.fullName;
-              }
-            }
-          } else {
-            const remoteContainer = document.getElementById('remote-video-container');
-            const localFrame = document.getElementById('video-call-local-frame');
-            const audioContainer = document.getElementById('audio-call-active-container');
-            if (remoteContainer) remoteContainer.style.display = 'block';
-            if (localFrame) localFrame.style.display = 'block';
-            if (audioContainer) audioContainer.style.display = 'none';
-
-            // Update remote name
-            const user = getUserById(currentRecipientId);
-            if (user) {
-              document.getElementById('video-call-remote-name').textContent = user.fullName;
-            }
-          }
-
-          if (!fakeCallSimulation && data.answer) {
-            const answerData = JSON.parse(data.answer);
-            if (answerData.sdp === 'mock') {
-              fakeCallSimulation = true;
-              if (!isAudioCall) switchToSimulationFeeds();
-            } else {
-              const answerDesc = new RTCSessionDescription(answerData);
-              if (peerConnection.signalingState === 'have-local-offer') {
-                await peerConnection.setRemoteDescription(answerDesc);
-              }
-            }
-          } else if (fakeCallSimulation) {
-            if (!isAudioCall) switchToSimulationFeeds();
-          }
-        }
-
-        // Process peer ICE candidates
-        if (!fakeCallSimulation && peerConnection && peerConnection.remoteDescription) {
-          if (data.peerCandidates && data.peerCandidates.length > 0) {
-            data.peerCandidates.forEach(cand => {
-              const candId = cand.candidate || JSON.stringify(cand);
-              if (!processedCandidates.has(candId)) {
-                processedCandidates.add(candId);
-                try {
-                  peerConnection.addIceCandidate(new RTCIceCandidate(cand));
-                } catch (e) { console.error("Error adding candidate:", e); }
-              }
-            });
-          }
-        }
-
-        // If call declined or ended
-        if (data.status === 'declined' || data.status === 'ended') {
-          showToast(data.status === 'declined' ? 'Call Declined. 📞' : 'Call Ended.');
-          playCallEndBeep();
-          endVideoCallLocally();
-        }
-
-      } catch (err) {
-        console.error("Error polling call state:", err);
-      }
-    }, 1500);
-  }
-
-  function endVideoCallLocally() {
-    isCallActive = false;
-    stopVideoCallTimer();
-    stopAudioFeedback();
-
-    if (callStatePollingInterval) {
-      clearInterval(callStatePollingInterval);
-      callStatePollingInterval = null;
-    }
-
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
-      localStream = null;
-    }
-
-    if (localScreenStream) {
-      localScreenStream.getTracks().forEach(track => track.stop());
-      localScreenStream = null;
-    }
-
-    if (peerConnection) {
-      peerConnection.close();
-      peerConnection = null;
-    }
-
-    const localVideo = document.getElementById('video-call-local-feed');
-    if (localVideo) {
-      localVideo.srcObject = null;
-      localVideo.removeAttribute('src');
-    }
-
-    const remoteVideo = document.getElementById('video-call-remote-feed');
-    if (remoteVideo) {
-      remoteVideo.srcObject = null;
-      remoteVideo.removeAttribute('src');
-    }
-
-    currentCallId = null;
-    currentRecipientId = null;
-    isAudioCall = false;
-
-    // Reset controls UI state
-    const muteBtn = document.getElementById('call-mute-btn');
-    const camBtn = document.getElementById('call-cam-btn');
-    const shareBtn = document.getElementById('call-share-btn');
-    if (muteBtn) muteBtn.classList.remove('active');
-    if (camBtn) {
-      camBtn.classList.remove('active');
-      camBtn.style.display = 'flex';
-    }
-    if (shareBtn) {
-      shareBtn.classList.remove('active');
-      shareBtn.style.display = 'flex';
-    }
-
-    // Reset active panels visibility
-    const remoteContainer = document.getElementById('remote-video-container');
-    const localFrame = document.getElementById('video-call-local-frame');
-    const audioContainer = document.getElementById('audio-call-active-container');
-    if (remoteContainer) remoteContainer.style.display = 'block';
-    if (localFrame) localFrame.style.display = 'block';
-    if (audioContainer) audioContainer.style.display = 'none';
-
-    // Switch chat layout back to normal chat mode
-    switchChatMode('chat');
-  }
-
-  function switchToSimulationFeeds() {
-    const remoteVideo = document.getElementById('video-call-remote-feed');
-    if (remoteVideo) {
-      remoteVideo.srcObject = null;
-      remoteVideo.src = 'https://vjs.zencdn.net/v/oceans.mp4';
-      remoteVideo.loop = true;
-      remoteVideo.muted = true;
-      remoteVideo.play().catch(e => console.log("remote mock play error:", e));
-    }
-    const localVideo = document.getElementById('video-call-local-feed');
-    if (localVideo) {
-      localVideo.srcObject = null;
-      localVideo.src = 'https://www.w3schools.com/html/mov_bbb.mp4';
-      localVideo.loop = true;
-      localVideo.muted = true;
-      localVideo.play().catch(e => console.log("local mock play error:", e));
-    }
-  }
-
-  async function checkForIncomingCall() {
-    if (isCallActive) return;
-
-    try {
-      const res = await fetch(`${API_URL}/api/calls/incoming`, {
-        headers: getAuthHeaders()
-      });
-      if (!res.ok) return;
-
-      const call = await res.json();
-      if (call && call.status === 'ringing') {
-        showIncomingCallModal(call);
-      }
-    } catch (e) {
-      console.error("Error checking incoming calls:", e);
-    }
-  }
-
-  function showIncomingCallModal(call) {
-    try {
-      isCallActive = true;
-      isCaller = false;
-      currentCallId = call._id || call.id;
-
-      // Safe caller object extraction to prevent null property access crashes
-      const callerObj = (call && call.caller && typeof call.caller === 'object') ? call.caller : {};
-      const callerId = callerObj._id || callerObj.id || (typeof call.caller === 'string' ? call.caller : null);
-      const callerName = callerObj.fullName || 'User';
-      const callerAvatar = callerObj.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
-
-      currentRecipientId = callerId;
-      fakeCallSimulation = false;
-
-      // Determine if it is audio only call
-      let isAudioOnlyCall = false;
-      try {
-        const parsedOffer = JSON.parse(call.offer);
-        if (parsedOffer && parsedOffer.isAudioOnly) {
-          isAudioOnlyCall = true;
-        }
-      } catch (e) {
-        if (call.offer && !call.offer.includes('m=video')) {
-          isAudioOnlyCall = true;
-        }
-      }
-      isAudioCall = isAudioOnlyCall;
-
-      const modal = document.getElementById('incoming-call-modal');
-      const avatar = document.getElementById('incoming-call-avatar');
-      const name = document.getElementById('incoming-call-name');
-      const title = document.getElementById('incoming-call-title');
-
-      if (avatar) avatar.src = callerAvatar;
-      if (name) name.textContent = `${callerName} is calling you...`;
-      if (title) title.textContent = isAudioOnlyCall ? 'Incoming Audio Call' : 'Incoming Video Call';
-
-      if (modal) modal.style.display = 'flex';
-      startIncomingRingtone();
-
-      // Hook up Accept / Decline listeners
-      const acceptBtn = document.getElementById('accept-call-btn');
-      const declineBtn = document.getElementById('decline-call-btn');
-
-      acceptBtn.onclick = () => {
-        acceptIncomingCall(call);
-      };
-
-      declineBtn.onclick = () => {
-        declineIncomingCall(call);
-      };
-    } catch (err) {
-      console.error("Error showing incoming call modal:", err);
-      showToast("Error displaying incoming call 📞");
-    }
-  }
-
-  async function acceptIncomingCall(call) {
-    try {
-      stopAudioFeedback();
-      const modal = document.getElementById('incoming-call-modal');
-      if (modal) modal.style.display = 'none';
-
-      // Safe caller object extraction
-      const callerObj = (call && call.caller && typeof call.caller === 'object') ? call.caller : {};
-      const callerId = callerObj._id || callerObj.id || (typeof call.caller === 'string' ? call.caller : null);
-      const callerName = callerObj.fullName || 'User';
-      const callerAvatar = callerObj.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
-
-      // Set current chat thread to the caller
-      state.currentChatThread = callerId;
-      switchView('chats');
-
-      // Trigger UI selection of the thread item
-      const threadItem = document.querySelector(`.thread-item[data-thread="${state.currentChatThread}"]`);
-      if (threadItem) {
-        threadItem.click();
-      } else {
-        const chatHeaderName = document.getElementById('chat-header-name');
-        const chatHeaderAvatar = document.getElementById('chat-header-avatar');
-        if (chatHeaderName) chatHeaderName.textContent = callerName;
-        if (chatHeaderAvatar) chatHeaderAvatar.src = callerAvatar;
-
-        const emptyState = document.getElementById('chat-empty-state');
-        const chatHeader = document.getElementById('chat-window-header');
-        const chatViewport = document.querySelector('.chat-dynamic-viewport');
-        if (emptyState) emptyState.style.display = 'none';
-        if (chatHeader) chatHeader.style.display = '';
-        if (chatViewport) chatViewport.style.display = '';
-      }
-
-      // Determine if it is audio only call
-      let isAudioOnlyCall = false;
-      let offerData = null;
-      try {
-        offerData = JSON.parse(call.offer);
-        if (offerData && offerData.isAudioOnly) {
-          isAudioOnlyCall = true;
-        }
-      } catch (e) {
-        offerData = call.offer;
-        if (call.offer && !call.offer.includes('m=video')) {
-          isAudioOnlyCall = true;
-        }
-      }
-      isAudioCall = isAudioOnlyCall;
-
-      switchChatMode(isAudioOnlyCall ? 'voice-call' : 'call');
-
-      // Setup UI
-      document.getElementById('video-call-outgoing-screen').style.display = 'none';
-      document.getElementById('video-call-active-screen').style.display = 'block';
-      document.getElementById('video-call-controls').style.display = 'block';
-
-      const camBtn = document.getElementById('call-cam-btn');
-      const shareBtn = document.getElementById('call-share-btn');
-      if (camBtn) camBtn.style.display = isAudioOnlyCall ? 'none' : 'flex';
-      if (shareBtn) shareBtn.style.display = isAudioOnlyCall ? 'none' : 'flex';
-
-      if (isAudioOnlyCall) {
-        const remoteContainer = document.getElementById('remote-video-container');
-        const localFrame = document.getElementById('video-call-local-frame');
-        const audioContainer = document.getElementById('audio-call-active-container');
-        if (remoteContainer) remoteContainer.style.display = 'none';
-        if (localFrame) localFrame.style.display = 'none';
-        if (audioContainer) {
-          audioContainer.style.display = 'flex';
-          const activeAvatar = document.getElementById('audio-call-active-avatar');
-          const activeName = document.getElementById('audio-call-active-name');
-          if (activeAvatar) activeAvatar.src = callerAvatar;
-          if (activeName) activeName.textContent = callerName;
-        }
-      } else {
-        const remoteContainer = document.getElementById('remote-video-container');
-        const localFrame = document.getElementById('video-call-local-frame');
-        const audioContainer = document.getElementById('audio-call-active-container');
-        if (remoteContainer) remoteContainer.style.display = 'block';
-        if (localFrame) localFrame.style.display = 'block';
-        if (audioContainer) audioContainer.style.display = 'none';
-      }
-
-      const remoteName = document.getElementById('video-call-remote-name');
-      if (remoteName) remoteName.textContent = callerName;
-
-      startVideoCallTimer();
-
-      if (offerData && offerData.sdp === 'mock') {
-        fakeCallSimulation = true;
-      }
-
-      const mediaConstraints = isAudioOnlyCall
-        ? { video: false, audio: true }
-        : { video: true, audio: true };
-
-      // Safe MediaDevices check
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints).catch(err => {
-          console.warn("Could not get media devices, falling back to mock call: ", err);
-          fakeCallSimulation = true;
-          return null;
-        });
-      } else {
-        console.warn("Media devices not supported in this browser context, using mock call.");
-        fakeCallSimulation = true;
-        localStream = null;
-      }
-
-      if (!fakeCallSimulation) {
-        const localVideo = document.getElementById('video-call-local-feed');
-        const localFrame = document.getElementById('video-call-local-frame');
-        if (localVideo) {
-          if (isAudioOnlyCall) {
-            localVideo.srcObject = null;
-            if (localFrame) localFrame.style.display = 'none';
-          } else {
-            localVideo.srcObject = localStream;
-            localVideo.muted = true;
-            if (localFrame) localFrame.style.display = 'block';
-            localVideo.play().catch(e => console.log("video play error:", e));
-          }
-        }
-
-        await fetchIceServers();
-        peerConnection = new RTCPeerConnection(activeRtcConfig);
-
-        localStream.getTracks().forEach(track => {
-          peerConnection.addTrack(track, localStream);
-        });
-
-        peerConnection.onicecandidate = (event) => {
-          if (event.candidate && currentCallId) {
-            sendIceCandidateToServer(currentCallId, event.candidate, 'recipient');
-          }
-        };
-
-        peerConnection.ontrack = (event) => {
-          const remoteVideo = document.getElementById('video-call-remote-feed');
-          if (remoteVideo && event.streams[0]) {
-            if (!isAudioOnlyCall) {
-              remoteVideo.srcObject = event.streams[0];
-              remoteVideo.play().catch(e => console.log("remote play error:", e));
-            }
-          }
-        };
-
-        // Set remote offer SDP (remove isAudioOnly metadata for session description creation)
-        const offerDesc = new RTCSessionDescription({
-          type: offerData.type,
-          sdp: offerData.sdp
-        });
-        await peerConnection.setRemoteDescription(offerDesc);
-
-        // Create Answer
-        const answer = await peerConnection.createAnswer();
-        await peerConnection.setLocalDescription(answer);
-
-        // Accept call on server
-        await fetch(`${API_URL}/api/calls/accept`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({
-            callId: currentCallId,
-            answer: JSON.stringify(answer)
-          })
-        });
-
-        startCallStatePolling();
-      } else {
-        // Mock call answer on server
-        await fetch(`${API_URL}/api/calls/accept`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({
-            callId: currentCallId,
-            answer: JSON.stringify({ type: 'answer', sdp: 'mock' })
-          })
-        });
-
-        if (!isAudioOnlyCall) {
-          switchToSimulationFeeds();
-        } else {
-          // Clear mock feeds for audio calls
-          const localVideo = document.getElementById('video-call-local-feed');
-          if (localVideo) {
-            localVideo.srcObject = null;
-            localVideo.removeAttribute('src');
-          }
-        }
-        startCallStatePolling();
-      }
-
-    } catch (err) {
-      console.error("Error accepting incoming call:", err);
-      showToast("Error accepting call 📞: " + err.message);
-      endVideoCallLocally();
-    }
-  }
-
-  async function declineIncomingCall(call) {
-    stopAudioFeedback();
-    const modal = document.getElementById('incoming-call-modal');
-    if (modal) modal.style.display = 'none';
-
-    try {
-      await fetch(`${API_URL}/api/calls/decline`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ callId: call._id || call.id })
-      });
-    } catch (e) {
-      console.error("Error declining call:", e);
-    }
-
-    endVideoCallLocally();
-  }
-
-  async function cancelOutgoingCall() {
-    stopAudioFeedback();
-    if (currentCallId) {
-      try {
-        await fetch(`${API_URL}/api/calls/end`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({ callId: currentCallId })
-        });
-      } catch (e) { }
-    }
-    endVideoCallLocally();
-  }
-
-  // Set up listeners for controls
-  const cancelOutgoingBtn = document.getElementById('cancel-outgoing-call-btn');
-  if (cancelOutgoingBtn) {
-    cancelOutgoingBtn.addEventListener('click', () => {
-      cancelOutgoingCall();
-    });
-  }
-
-  const endCallBtn = document.getElementById('end-call-btn');
-  if (endCallBtn) {
-    endCallBtn.addEventListener('click', () => {
-      cancelOutgoingCall();
-      showToast('Video Call Ended. 📞');
-    });
-  }
-
-  const muteBtn = document.getElementById('call-mute-btn');
-  const camBtn = document.getElementById('call-cam-btn');
-  const speakerBtn = document.getElementById('call-speaker-btn');
-  const shareBtn = document.getElementById('call-share-btn');
-  const localCamFeed = document.getElementById('video-call-local-frame');
-  const remoteCamFeed = document.getElementById('video-call-remote-feed');
-
-  if (muteBtn) {
-    muteBtn.addEventListener('click', () => {
-      muteBtn.classList.toggle('active');
-      const isMuted = muteBtn.classList.contains('active');
-      if (localStream) {
-        localStream.getAudioTracks().forEach(track => {
-          track.enabled = !isMuted;
-        });
-      }
-      showToast(isMuted ? 'Microphone Muted 🔇' : 'Microphone Active 🎙️');
-    });
-  }
-
-  if (camBtn) {
-    camBtn.addEventListener('click', () => {
-      camBtn.classList.toggle('active');
-      const isCamOff = camBtn.classList.contains('active');
-      if (localStream) {
-        localStream.getVideoTracks().forEach(track => {
-          track.enabled = !isCamOff;
-        });
-      }
-      localCamFeed.style.opacity = isCamOff ? '0.2' : '1';
-      showToast(isCamOff ? 'Your Camera Off 📷' : 'Your Camera Active 📹');
-    });
-  }
-
-  if (speakerBtn) {
-    speakerBtn.addEventListener('click', () => {
-      speakerBtn.classList.toggle('active');
-      const isSpeakerOff = speakerBtn.classList.contains('active');
-      const remoteVideo = document.getElementById('video-call-remote-feed');
-      if (remoteVideo) {
-        remoteVideo.muted = isSpeakerOff;
-      }
-      showToast(isSpeakerOff ? 'Speaker Output: Muted 🔕' : 'Speaker Output: Loud 🔊');
-    });
-  }
-
-  if (shareBtn) {
-    shareBtn.addEventListener('click', async () => {
-      if (fakeCallSimulation) {
-        shareBtn.classList.toggle('active');
-        if (shareBtn.classList.contains('active')) {
-          showToast('Screen sharing initialized! 🖥️');
-        } else {
-          showToast('Screen sharing stopped.');
-        }
-        return;
-      }
-
-      if (!shareBtn.classList.contains('active')) {
-        try {
-          localScreenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-          shareBtn.classList.add('active');
-          showToast('Screen sharing initialized! 🖥️');
-
-          const screenTrack = localScreenStream.getVideoTracks()[0];
-
-          if (peerConnection) {
-            const senders = peerConnection.getSenders();
-            const videoSender = senders.find(sender => sender.track && sender.track.kind === 'video');
-            if (videoSender) {
-              videoSender.replaceTrack(screenTrack);
-            }
-          }
-
-          screenTrack.onended = () => {
-            stopScreenSharing();
-          };
-
-        } catch (err) {
-          console.error("Screen sharing error:", err);
-          showToast('Could not share screen 🖥️');
-        }
-      } else {
-        stopScreenSharing();
-      }
-    });
-  }
-
-  function stopScreenSharing() {
-    if (localScreenStream) {
-      localScreenStream.getTracks().forEach(track => track.stop());
-      localScreenStream = null;
-    }
-    if (shareBtn) shareBtn.classList.remove('active');
-    showToast('Screen sharing stopped.');
-
-    if (localStream && peerConnection) {
-      const cameraTrack = localStream.getVideoTracks()[0];
-      const senders = peerConnection.getSenders();
-      const videoSender = senders.find(sender => sender.track && sender.track.kind === 'video');
-      if (videoSender && cameraTrack) {
-        videoSender.replaceTrack(cameraTrack);
-      }
-    }
-  }
+  // --- OLD CALL IMPLEMENTATION REMOVED FOR ISOLATION ---
 
 
 
@@ -5255,11 +9221,14 @@ document.addEventListener('DOMContentLoaded', () => {
       const filter = pill.getAttribute('data-filter-tag');
       let matchCount = 0;
 
+      const feedContainer = document.getElementById('home-feed-posts');
+      const feedCards = feedContainer ? feedContainer.querySelectorAll('.feed-card') : [];
+
       feedCards.forEach(card => {
         if (card.id === 'feed-empty-state') return;
-        const tags = card.getAttribute('data-tags') || '';
+        const tags = (card.getAttribute('data-tags') || '').toLowerCase();
 
-        if (filter === 'all' || tags.includes(filter)) {
+        if (filter === 'all' || tags.split(' ').includes(filter.toLowerCase())) {
           card.style.display = 'flex';
           matchCount++;
         } else {
@@ -5267,8 +9236,18 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
 
+      let emptyStateCard = document.getElementById('feed-empty-state');
       if (matchCount === 0) {
-        if (emptyStateCard) emptyStateCard.style.display = 'block';
+        if (!emptyStateCard) {
+          emptyStateCard = document.createElement('div');
+          emptyStateCard.id = 'feed-empty-state';
+          emptyStateCard.style.cssText = 'text-align:center; padding:40px; color:rgba(255,255,255,0.5); width:100%; grid-column: 1/-1;';
+          emptyStateCard.textContent = `No posts found for #${filter.toUpperCase()}`;
+          if (feedContainer) feedContainer.appendChild(emptyStateCard);
+        } else {
+          emptyStateCard.style.display = 'block';
+          emptyStateCard.textContent = `No posts found for #${filter.toUpperCase()}`;
+        }
       } else {
         if (emptyStateCard) emptyStateCard.style.display = 'none';
       }
@@ -5325,13 +9304,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Disabled hardcoded follow suggestion listeners. Managed dynamically in loadFollowSuggestions()
 
-  // Suggest see all
-  const sugSeeAll = document.getElementById('sug-see-all-btn');
-  if (sugSeeAll) {
-    sugSeeAll.addEventListener('click', () => {
+  // Suggested Hubbers "See All" triggers
+  document.querySelectorAll('#sug-see-all-btn, .sug-see-all-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
       openSuggestedVibersModal();
     });
-  }
+  });
 
   // Trending hash words click
   const trendItems = document.querySelectorAll('.trend-item');
@@ -5496,32 +9475,21 @@ document.addEventListener('DOMContentLoaded', () => {
       let formattedHandle = newHandle.startsWith('@') ? newHandle.slice(1) : newHandle;
       formattedHandle = formattedHandle.trim().toLowerCase();
 
+      const originalBtnHtml = editProfileSaveBtn.innerHTML;
+      editProfileSaveBtn.disabled = true;
+      editProfileSaveBtn.innerHTML = '<i data-lucide="loader" class="spin"></i> Saving...';
+      if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+
       const token = localStorage.getItem('invibe_jwt_token');
 
       // 1. Update local user session & localStorage DB
       const userStr = localStorage.getItem('invibeUser');
       const currentUser = userStr ? JSON.parse(userStr) : {};
-      const updatedUser = {
-        ...currentUser,
-        fullName: newName,
-        username: formattedHandle,
-        bio: newBio,
-        phoneNumber: newPhone,
-        preferred2faMethod: new2faMethod
-      };
+      let resolvedAvatarUrl = currentAvatarUrl;
 
-      localStorage.setItem('invibeUser', JSON.stringify(updatedUser));
-      if (currentAvatarUrl && !currentAvatarUrl.startsWith('data:image/gif;base64')) {
-        localStorage.setItem('invibeProfileImage', currentAvatarUrl);
-      }
-      if (currentBannerUrl && !currentBannerUrl.startsWith('data:image/gif;base64')) {
-        localStorage.setItem('invibeBannerImage', currentBannerUrl);
-      }
-      localStorage.setItem('invibeBio', newBio);
-
-      // 2. Try async backend & Supabase sync
+      // 2. Perform backend & Supabase sync
       try {
-        fetch(`${API_URL}/api/users/profile`, {
+        const res = await fetch(`${API_URL}/api/users/profile`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -5536,8 +9504,72 @@ document.addEventListener('DOMContentLoaded', () => {
             phoneNumber: newPhone,
             preferred2faMethod: new2faMethod
           })
-        }).catch(err => console.warn("Backend profile sync notice:", err.message));
-      } catch (e) { }
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.user && data.user.profileImage) {
+            resolvedAvatarUrl = data.user.profileImage;
+          }
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          console.warn("Backend profile sync error:", errData.error);
+        }
+      } catch (err) {
+        console.warn("Backend profile sync notice:", err.message);
+      } finally {
+        if (editProfileSaveBtn) {
+          editProfileSaveBtn.disabled = false;
+          editProfileSaveBtn.innerHTML = originalBtnHtml;
+          if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+        }
+      }
+
+      const updatedUser = {
+        ...currentUser,
+        fullName: newName,
+        username: formattedHandle,
+        bio: newBio,
+        phoneNumber: newPhone,
+        preferred2faMethod: new2faMethod,
+        profileImage: resolvedAvatarUrl || currentUser.profileImage
+      };
+
+      localStorage.setItem('invibeUser', JSON.stringify(updatedUser));
+      if (resolvedAvatarUrl && !resolvedAvatarUrl.startsWith('data:image/gif;base64')) {
+        localStorage.setItem('invibeProfileImage', resolvedAvatarUrl);
+      }
+      if (currentBannerUrl && !currentBannerUrl.startsWith('data:image/gif;base64')) {
+        localStorage.setItem('invibeBannerImage', currentBannerUrl);
+      }
+      localStorage.setItem('invibeBio', newBio);
+
+      // Synchronize in-memory feed posts and comments
+      const myId = (updatedUser.id || updatedUser._id || '').toString();
+      if (Array.isArray(window.feedPosts)) {
+        window.feedPosts.forEach(p => {
+          const pAuthorId = (getUserIdentifier(p.author) || '').toString();
+          if ((myId && pAuthorId === myId) || (p.author && p.author.username === formattedHandle)) {
+            if (p.author) {
+              p.author.profileImage = resolvedAvatarUrl;
+              p.author.fullName = newName;
+              p.author.username = formattedHandle;
+            }
+          }
+          if (Array.isArray(p.comments)) {
+            p.comments.forEach(c => {
+              const cAuthorId = (getUserIdentifier(c.author) || '').toString();
+              if ((myId && cAuthorId === myId) || (c.author && c.author.username === formattedHandle)) {
+                if (c.author) {
+                  c.author.profileImage = resolvedAvatarUrl;
+                  c.author.fullName = newName;
+                  c.author.username = formattedHandle;
+                }
+              }
+            });
+          }
+        });
+      }
 
       const displayHandle = newHandle.startsWith('@') ? newHandle : '@' + newHandle;
 
@@ -5551,20 +9583,21 @@ document.addEventListener('DOMContentLoaded', () => {
       if (profilePreviewHandleP) profilePreviewHandleP.textContent = displayHandle;
       if (profileBioP) profileBioP.textContent = newBio;
 
-      // 2. Update images
-      if (currentAvatarUrl) {
-        if (profileLargeAvatar) profileLargeAvatar.src = currentAvatarUrl;
-        if (profilePreviewAvatarImg) profilePreviewAvatarImg.src = currentAvatarUrl;
-        if (headerAvatarImg) headerAvatarImg.src = currentAvatarUrl;
+      // 2. Update images across all components
+      if (resolvedAvatarUrl) {
+        if (profileLargeAvatar) profileLargeAvatar.src = resolvedAvatarUrl;
+        if (profilePreviewAvatarImg) profilePreviewAvatarImg.src = resolvedAvatarUrl;
+        if (headerAvatarImg) headerAvatarImg.src = resolvedAvatarUrl;
 
         // Also update story user avatar if needed
         const storyViewerAvatar = document.getElementById('story-viewer-avatar');
-        if (storyViewerAvatar) storyViewerAvatar.src = currentAvatarUrl;
+        if (storyViewerAvatar) storyViewerAvatar.src = resolvedAvatarUrl;
       }
       if (currentBannerUrl && profileBannerImg) {
         profileBannerImg.src = currentBannerUrl;
       }
 
+      updateAppUI();
       showToast('Profile updated successfully! ✨');
       closeEditProfileModal();
     });
@@ -5651,7 +9684,7 @@ document.addEventListener('DOMContentLoaded', () => {
       <div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 0;">
         <div style="display: flex; align-items: center; gap: 8px;">
           <img src="${user.avatar}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover;" />
-          <span style="font-size: 0.85rem; color: white;">${user.name}</span>
+          <span style="font-size: 0.85rem; color: var(--text-main);">${user.name}</span>
         </div>
         <input type="checkbox" class="hide-story-checkbox" data-username="${user.name}" style="accent-color: var(--accent-gradient, #f35626);" />
       </div>
@@ -5716,11 +9749,7 @@ document.addEventListener('DOMContentLoaded', () => {
     appearanceToggle.checked = document.body.classList.contains('light-theme');
     appearanceToggle.addEventListener('change', () => {
       const isLight = appearanceToggle.checked;
-      if (isLight) {
-        document.body.classList.replace('dark-theme', 'light-theme');
-      } else {
-        document.body.classList.replace('light-theme', 'dark-theme');
-      }
+      applyTheme(isLight ? 'light' : 'dark', true);
       showToast(isLight ? 'Switched appearance on ☀️' : 'Switched appearance off 🌙');
     });
   }
@@ -5920,6 +9949,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // --- COMMENTS & SHARE MODALS CONTROLLER ---
   const commentsModal = document.getElementById('comments-modal');
   const shareModal = document.getElementById('share-modal');
+  if (shareModal) shareModal.style.zIndex = '3000';
+  if (commentsModal) commentsModal.style.zIndex = '3000';
 
   document.querySelectorAll('.modal-close-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -5945,7 +9976,7 @@ document.addEventListener('DOMContentLoaded', () => {
         switchView('feed');
       }
     } else if (type === 'reel') {
-      switchView('reels');
+      switchView('explore');
     } else {
       switchView('feed');
     }
@@ -5953,9 +9984,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let shareSearchDebounceTimer = null;
   let cachedShareUsers = [];
+  let currentShareSelection = new Map();
+  let currentShareKey = null;
+
+  function updateShareFooter(modal) {
+    if (!modal) return;
+    const footer = modal.querySelector('.share-modal-footer');
+    if (!footer) return;
+    const countSpan = footer.querySelector('.share-selection-count');
+    if (currentShareSelection.size > 0) {
+      footer.style.display = 'flex';
+      if (countSpan) countSpan.innerText = `${currentShareSelection.size} selected`;
+    } else {
+      footer.style.display = 'none';
+    }
+  }
 
   function openShare(key, modalOverride = shareModal) {
+    currentShareSelection.clear();
+    currentShareKey = key;
     const modal = modalOverride || shareModal;
+    if (modal) updateShareFooter(modal);
     if (!modal) return;
 
     const shareList = modal.querySelector('.share-friends-list');
@@ -5969,32 +10018,25 @@ document.addEventListener('DOMContentLoaded', () => {
         searchInput.addEventListener('input', (e) => {
           const query = e.target.value.trim();
           clearTimeout(shareSearchDebounceTimer);
-          shareSearchDebounceTimer = setTimeout(async () => {
+          shareSearchDebounceTimer = setTimeout(() => {
             if (!query) {
               renderShareCards(cachedShareUsers, key, modal, shareList);
               return;
             }
-            const token = localStorage.getItem('invibe_jwt_token');
-            if (!token) return;
-            try {
-              shareList.innerHTML = '<div style="padding:10px; font-size:12px; color:var(--text-muted); text-align:center; grid-column: 1 / -1;">Searching...</div>';
-              const res = await fetch(`${API_URL}/api/users/search?q=${encodeURIComponent(query)}`, {
-                headers: { 'Authorization': `Bearer ${token}` }
-              });
-              if (res.ok) {
-                const results = await res.json();
-                const mappedResults = (results || []).map(u => ({
-                  _id: u._id || u.id,
-                  fullName: u.fullName || u.full_name || u.username,
-                  username: u.username || 'user',
-                  profileImage: u.profileImage || u.profile_image_url || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
-                }));
-                renderShareCards(mappedResults, key, modal, shareList);
-              }
-            } catch (searchErr) {
-              console.error('Error searching share users:', searchErr);
-            }
-          }, 200);
+            const filteredHubbies = cachedShareUsers.filter(u => 
+              (u.fullName || '').toLowerCase().includes(query.toLowerCase()) || 
+              (u.username || '').toLowerCase().includes(query.toLowerCase())
+            );
+            renderShareCards(filteredHubbies, key, modal, shareList);
+          }, 150);
+        });
+
+        // Ensure when user taps/focuses the input, it shows all hubbies
+        searchInput.addEventListener('focus', () => {
+          const query = searchInput.value.trim();
+          if (!query) {
+            renderShareCards(cachedShareUsers, key, modal, shareList);
+          }
         });
       }
     }
@@ -6020,7 +10062,76 @@ document.addEventListener('DOMContentLoaded', () => {
       const currentUserId = (currentUser.id || currentUser._id || '').toString();
       const userMap = new Map();
 
-      // 1. Retrieve existing chat conversations
+      console.log("diagnostic-share: currentUser =", currentUser);
+      console.log("diagnostic-share: currentUserId =", currentUserId);
+      console.log("diagnostic-share: token =", token);
+      console.log("diagnostic-share: API_URL =", API_URL);
+
+      // 1. Fetch Following list
+      try {
+        const followingRes = await fetch(`${API_URL}/api/users/${currentUserId}/following-list`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        console.log("diagnostic-share: followingRes status =", followingRes.status);
+        if (followingRes.status === 401) {
+          console.warn("Session expired. Logging out.");
+          if (typeof handleLogout === 'function') handleLogout();
+          return;
+        }
+        if (followingRes.ok) {
+          const followings = await followingRes.json();
+          console.log("diagnostic-share: followings =", followings);
+          (followings || []).forEach(f => {
+            const fid = (f._id || f.id || '').toString();
+            if (fid && fid !== currentUserId) {
+              userMap.set(fid, {
+                _id: f._id || f.id,
+                fullName: f.fullName || f.username || 'Hubber',
+                username: f.username || 'user',
+                profileImage: f.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
+              });
+            }
+          });
+        } else {
+          console.error("diagnostic-share: followingRes failed", followingRes.statusText);
+        }
+      } catch (err) {
+        console.warn('Error fetching following for share popup:', err);
+      }
+
+      // 2. Fetch Followers list
+      try {
+        const followersRes = await fetch(`${API_URL}/api/users/${currentUserId}/followers-list`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        console.log("diagnostic-share: followersRes status =", followersRes.status);
+        if (followersRes.status === 401) {
+          console.warn("Session expired. Logging out.");
+          if (typeof handleLogout === 'function') handleLogout();
+          return;
+        }
+        if (followersRes.ok) {
+          const followers = await followersRes.json();
+          console.log("diagnostic-share: followers =", followers);
+          (followers || []).forEach(f => {
+            const fid = (f._id || f.id || '').toString();
+            if (fid && fid !== currentUserId) {
+              userMap.set(fid, {
+                _id: f._id || f.id,
+                fullName: f.fullName || f.username || 'Hubber',
+                username: f.username || 'user',
+                profileImage: f.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
+              });
+            }
+          });
+        } else {
+          console.error("diagnostic-share: followersRes failed", followersRes.statusText);
+        }
+      } catch (err) {
+        console.warn('Error fetching followers for share popup:', err);
+      }
+
+      // 3. Fallback: Retrieve existing chat conversations
       try {
         const threadsRes = await fetch(`${API_URL}/api/chats/threads`, {
           headers: { 'Authorization': `Bearer ${token}` }
@@ -6044,31 +10155,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       } catch (threadsErr) {
         console.warn('Error fetching threads for share popup:', threadsErr);
-      }
-
-      // 2. If fewer than 5 contacts, supplement with suggested users
-      if (userMap.size < 6) {
-        try {
-          const suggRes = await fetch(`${API_URL}/api/users/suggestions?limit=20`, {
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-          if (suggRes.ok) {
-            const suggestions = await suggRes.json();
-            (suggestions || []).forEach(s => {
-              const sid = (s._id || s.id || '').toString();
-              if (sid && sid !== currentUserId && !userMap.has(sid)) {
-                userMap.set(sid, {
-                  _id: s._id || s.id,
-                  fullName: s.fullName || s.username || 'Hubber',
-                  username: s.username || 'user',
-                  profileImage: s.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
-                });
-              }
-            });
-          }
-        } catch (suggErr) {
-          console.warn('Error fetching suggestions for share popup:', suggErr);
-        }
       }
 
       cachedShareUsers = Array.from(userMap.values());
@@ -6097,74 +10183,30 @@ document.addEventListener('DOMContentLoaded', () => {
       const card = document.createElement('div');
       card.className = 'share-friend-card';
       card.title = `${u.fullName} (@${u.username})`;
+      if (currentShareSelection.has(u._id)) {
+        card.classList.add('selected');
+      }
+
       card.innerHTML = `
-        <img src="${u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" class="share-friend-avatar" alt="${u.fullName}" />
+        <div style="position: relative; display: inline-block;">
+          <img src="${u.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" class="share-friend-avatar" alt="${u.fullName}" />
+          <div class="share-friend-card-check"><i data-lucide="check" style="width: 12px; height: 12px; color: white;"></i></div>
+        </div>
         <span class="share-friend-name" style="font-weight: 600; font-size: 12px; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;">${u.fullName}</span>
         <span style="font-size: 10px; color: var(--text-muted); width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;">@${u.username}</span>
       `;
 
-      card.addEventListener('click', async () => {
+      card.addEventListener('click', () => {
         if (!currentUser || !token) return;
 
-        const secretKey = getChatSecretKey(currentUserId, u._id);
-        const isStory = key.startsWith('story_');
-        const isReel = key.startsWith('reel_') || key.startsWith('reel');
-        const rawId = key.replace(/^(story_|reel_|post_)/, '');
-
-        let hubPayload = {
-          text: isStory ? 'Shared a Hub Story' : (isReel ? 'Shared a Reel' : 'Shared a Post'),
-          hubType: isStory ? 'story' : (isReel ? 'reel' : 'post'),
-          hubId: rawId,
-          thumbnail: '',
-          authorName: currentUser.fullName || currentUser.username || 'Hubber',
-          authorAvatar: currentUser.profileImage || '',
-          timestamp: new Date().toISOString()
-        };
-
-        if (isStory && state.storyGroups) {
-          state.storyGroups.forEach(g => {
-            (g.stories || []).forEach(s => {
-              if (s._id === rawId || ('story_' + s._id) === key) {
-                hubPayload.thumbnail = s.img || '';
-                hubPayload.authorName = s.name || hubPayload.authorName;
-                hubPayload.authorAvatar = s.avatar || '';
-                hubPayload.text = s.caption ? `Shared a Hub: "${s.caption}"` : 'Shared a Hub Story';
-              }
-            });
-          });
+        if (currentShareSelection.has(u._id)) {
+          currentShareSelection.delete(u._id);
+          card.classList.remove('selected');
+        } else {
+          currentShareSelection.set(u._id, u);
+          card.classList.add('selected');
         }
-
-        const encryptedText = encryptMessage(JSON.stringify(hubPayload), secretKey);
-
-        try {
-          const sendRes = await fetch(`${API_URL}/api/chats/message`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token}`
-            },
-            body: JSON.stringify({
-              recipient: u._id,
-              content: encryptedText,
-              mediaUrl: key,
-              mediaType: 'hub',
-              mediaName: isStory ? 'Shared Hub Story' : (isReel ? 'Shared Reel' : 'Shared Post'),
-              mediaSize: 'Link'
-            })
-          });
-          if (!sendRes.ok) throw new Error('Failed to send message');
-
-          showToast(`Shared successfully to ${u.fullName}! ✈️`);
-          if (modal) modal.classList.remove('active');
-
-          loadChatThreads();
-          if (state.currentChatThread && state.currentChatThread.toString() === u._id.toString()) {
-            await fetchMessages(u._id, true);
-          }
-        } catch (err) {
-          console.error('Error sharing hub content:', err);
-          showToast('Failed to share item.');
-        }
+        updateShareFooter(modal);
       });
 
       list.appendChild(card);
@@ -6196,6 +10238,155 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
   }
+
+      // Multi-Share submission logic
+      document.addEventListener('click', async (e) => {
+        const submitBtn = e.target.closest('.multi-share-submit-btn');
+        if (submitBtn && currentShareSelection.size > 0 && currentShareKey) {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const token = localStorage.getItem('invibe_jwt_token');
+          const currentUser = getCurrentUser();
+          const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+          if (!currentUser || !token) return;
+
+          const originalContent = submitBtn.innerHTML;
+          submitBtn.disabled = true;
+          submitBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 14px; height: 14px;"></i>`;
+          lucide.createIcons({ icons: { loader: window.lucide.icons.Loader } });
+
+          try {
+            const key = currentShareKey;
+            const isStory = key.startsWith('story_');
+            const isReel = key.startsWith('reel_') || key.startsWith('reel');
+            const isPost = key.startsWith('post_');
+            const rawId = key.replace(/^(story_|reel_|post_)/, '');
+
+            let hubPayload = {
+              text: isStory ? 'Shared a Hub Story' : (isReel ? 'Shared a Reel' : 'Shared a Post'),
+              hubType: isStory ? 'story' : (isReel ? 'reel' : 'post'),
+              hubId: rawId,
+              thumbnail: '',
+              isVideo: false,
+              authorName: currentUser.fullName || currentUser.username || 'Hubber',
+              authorAvatar: currentUser.profileImage || '',
+              timestamp: new Date().toISOString()
+            };
+
+            if (isStory && state.storyGroups) {
+              state.storyGroups.forEach(g => {
+                (g.stories || []).forEach(s => {
+                  if (s._id === rawId || ('story_' + s._id) === key) {
+                    hubPayload.thumbnail = s.img || '';
+                    hubPayload.authorName = s.name || hubPayload.authorName;
+                    hubPayload.authorAvatar = s.avatar || '';
+                    hubPayload.text = s.caption ? `Shared a Hub: "${s.caption}"` : 'Shared a Hub Story';
+                  }
+                });
+              });
+            }
+
+            if (isPost) {
+              let postObj = null;
+              if (window.feedPosts) {
+                postObj = window.feedPosts.find(p => p._id === rawId);
+              }
+              if (!postObj) {
+                try {
+                  const res = await fetch(`${API_URL}/api/posts/${rawId}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                  });
+                  if (res.ok) {
+                    postObj = await res.json();
+                  }
+                } catch (err) {
+                  console.error("Error fetching post for sharing:", err);
+                }
+              }
+
+              if (postObj) {
+                let thumbnail = '';
+                let isVideo = false;
+                if (postObj.mediaItems && postObj.mediaItems.length > 0) {
+                  thumbnail = postObj.mediaItems[0].url || '';
+                  isVideo = postObj.mediaItems[0].type === 'video';
+                } else if (postObj.mediaUrl) {
+                  thumbnail = postObj.mediaUrl;
+                  isVideo = postObj.mediaType === 'video';
+                }
+                hubPayload.thumbnail = thumbnail;
+                hubPayload.isVideo = isVideo;
+                hubPayload.authorName = postObj.author?.fullName || postObj.author?.username || 'Hubber';
+                hubPayload.authorAvatar = postObj.author?.profileImage || '';
+                hubPayload.text = postObj.caption ? `Shared a Post: "${postObj.caption}"` : 'Shared a Post';
+              }
+            }
+
+            if (isReel) {
+              let reelObj = null;
+              if (window.feedReels) {
+                reelObj = window.feedReels.find(r => (r._id || r.id || '').toString() === rawId.toString());
+              }
+              if (reelObj) {
+                hubPayload.thumbnail = reelObj.videoUrl || '';
+                hubPayload.isVideo = true;
+                hubPayload.authorName = reelObj.author?.fullName || reelObj.author?.username || 'Hubber';
+                hubPayload.authorAvatar = reelObj.author?.profileImage || '';
+                hubPayload.text = reelObj.caption ? `Shared a Reel: "${reelObj.caption}"` : 'Shared a Reel';
+              }
+            }
+
+            const payloadString = JSON.stringify(hubPayload);
+            let successCount = 0;
+            const promises = Array.from(currentShareSelection.values()).map(async (u) => {
+              const secretKey = getChatSecretKey(currentUserId, u._id);
+              const encryptedText = encryptMessage(payloadString, secretKey);
+              
+              const sendRes = await fetch(`${API_URL}/api/chats/message`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${token}`
+                },
+                body: JSON.stringify({
+                  recipient: u._id,
+                  content: encryptedText,
+                  mediaUrl: key,
+                  mediaType: 'hub',
+                  mediaName: isStory ? 'Shared Hub Story' : (isReel ? 'Shared Reel' : 'Shared Post'),
+                  mediaSize: 'Link'
+                })
+              });
+              
+              if (sendRes.ok) successCount++;
+            });
+
+            await Promise.allSettled(promises);
+            
+            if (successCount > 0) {
+              showToast(`Shared successfully to ${successCount} Hubbie${successCount > 1 ? 's' : ''}! ✈️`);
+            } else {
+              showToast('Failed to share item.');
+            }
+
+            const modal = submitBtn.closest('.story-viewer-overlay');
+            if (modal) modal.classList.remove('active');
+            currentShareSelection.clear();
+            currentShareKey = null;
+
+            loadChatThreads();
+            // Not doing specific fetchMessages unless single share but this is fine
+
+          } catch (err) {
+            console.error('Error in multi-share:', err);
+            showToast('Failed to share item.');
+          } finally {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = originalContent;
+          }
+        }
+      });
 
   // Share trigger click
   document.addEventListener('click', async (e) => {
@@ -6231,6 +10422,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch(`${API_URL}/api/posts`);
       if (res.ok) {
         posts = await res.json();
+        window.feedPosts = posts;
       }
     } catch (err) {
       console.warn("API loadFeedPosts notice:", err.message);
@@ -6260,26 +10452,49 @@ document.addEventListener('DOMContentLoaded', () => {
 
     posts.forEach(post => {
       const isLikedByMe = currentUser ? (post.likes || []).includes(currentUserId) : false;
+      const isSavedByMe = window.savedHubbs && window.savedHubbs.some(s => s.id === post._id);
       const authorObj = post.author || {};
-      const authorId = authorObj._id || authorObj.id || 'usr_unknown';
+      const authorId = getUserIdentifier(authorObj) || 'usr_unknown';
       const authorName = authorObj.fullName || authorObj.username || 'User';
       const authorUsername = authorObj.username || 'user';
-      const isMe = currentUserId && (currentUserId.toString() === authorId.toString());
+      const isMe = !!(currentUserId && (currentUserId.toString() === authorId.toString() || (currentUser?.username && currentUser.username.toLowerCase() === authorUsername.toLowerCase())));
       const isFollowing = followingSet.has(authorId);
       const isPending = pendingSet.has(authorId);
+
+      const localUserAvatar = localStorage.getItem('invibeProfileImage') || currentUser?.profileImage;
+      const resolvedAuthorAvatar = (isMe && localUserAvatar)
+        ? localUserAvatar
+        : (authorObj.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
 
       const card = document.createElement('article');
       card.className = 'feed-card';
       card.id = `post-${post._id}`;
-      card.setAttribute('data-tags', 'all chill');
+      // Extract hashtags from caption (e.g. #happy, #chill)
+      const hashtags = ['all'];
+      if (post.caption) {
+        const matches = post.caption.match(/#\w+/g);
+        if (matches) {
+          matches.forEach(m => {
+            hashtags.push(m.toLowerCase().replace('#', ''));
+          });
+        }
+      }
+      card.setAttribute('data-tags', hashtags.join(' '));
 
       let commentsHTML = '';
       (post.comments || []).forEach(comment => {
+        const commentAuthorId = getUserIdentifier(comment.author) || comment.author_id || '';
+        const commentUsername = (comment.author?.username || '').toLowerCase();
+        const isCommentMe = !!(currentUserId && (currentUserId.toString() === commentAuthorId.toString() || (currentUser?.username && currentUser.username.toLowerCase() === commentUsername)));
+        const resolvedCommentAvatar = (isCommentMe && localUserAvatar)
+          ? localUserAvatar
+          : (comment.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
+
         commentsHTML += `
           <div class="comment-item" style="display: flex; gap: 8px; margin-bottom: 8px; font-size: 13px;">
-            <img src="${comment.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80'}" alt="" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover;" />
+            <img src="${resolvedCommentAvatar}" alt="" class="comment-author-avatar" data-user-id="${commentAuthorId}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; cursor: pointer;" />
             <div>
-              <strong style="color: var(--text-color); margin-right: 4px;">${comment.author?.username || 'user'}</strong>
+              <strong class="comment-author-name" data-user-id="${commentAuthorId}" style="color: var(--text-color); margin-right: 4px; cursor: pointer;">${comment.author?.username || 'user'}</strong>
               <span style="color: var(--text-muted);">${comment.text}</span>
             </div>
           </div>
@@ -6289,7 +10504,7 @@ document.addEventListener('DOMContentLoaded', () => {
       card.innerHTML = `
         <div class="post-header" style="display: flex; align-items: center; justify-content: space-between;">
           <div class="post-author-info" style="display: flex; align-items: center; gap: 10px;">
-            <img src="${authorObj.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80'}" alt="${authorName}" class="author-avatar" style="cursor: pointer;" data-user-id="${authorId}" />
+            <img src="${resolvedAuthorAvatar}" alt="${authorName}" class="author-avatar" style="cursor: pointer;" data-user-id="${authorId}" />
             <div>
               <div style="display: flex; align-items: center; gap: 6px;">
                 <h4 class="author-name" style="margin: 0; cursor: pointer;" data-user-id="${authorId}">${authorName}</h4>
@@ -6390,21 +10605,22 @@ document.addEventListener('DOMContentLoaded', () => {
               <button class="action-circle-btn"><i data-lucide="send"></i></button>
             </div>
             <div class="engagement-item bookmark-btn-action" data-post-id="${post._id}">
-              <button class="action-circle-btn bookmark-btn"><i data-lucide="bookmark"></i></button>
+              <button class="action-circle-btn bookmark-btn ${isSavedByMe ? 'saved' : ''}"><i data-lucide="bookmark" style="${isSavedByMe ? 'fill:#FBBF24; stroke:#FBBF24;' : ''}"></i></button>
             </div>
           </div>
         </div>
 
           <div class="post-details">
-            <p class="post-caption"><strong class="author-username" style="margin-right: 8px;">${post.author.username}</strong>${post.caption}</p>
+            <p class="post-caption"><strong class="author-username" style="margin-right: 8px; cursor: pointer;">${authorUsername}</strong>${post.caption}</p>
             
             <div class="comments-section" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
               <div class="comments-list" id="comments-list-${post._id}">
                 ${commentsHTML}
               </div>
               
-              <div class="post-comment-input-area" style="display: flex; gap: 8px; margin-top: 12px;">
-                <input type="text" placeholder="Write a comment and press Enter..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 16px; color: var(--text-color); font-size: 13px;" />
+              <div class="post-comment-input-area" style="display: flex; align-items: center; gap: 8px; margin-top: 12px; position: relative;">
+                <input type="text" placeholder="Write a comment..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 40px 8px 16px; color: var(--text-color); font-size: 13px;" />
+                <button class="comment-post-btn" data-post-id="${post._id}" style="position: absolute; right: 8px; background: none; border: none; color: var(--primary, #a855f7); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 6px; transition: transform 0.2s;"><i data-lucide="send" style="width: 16px; height: 16px;"></i></button>
               </div>
             </div>
           </div>
@@ -6418,10 +10634,23 @@ document.addEventListener('DOMContentLoaded', () => {
       const usernameEl = card.querySelector('.author-username');
 
       [avatarEl, nameEl, usernameEl].forEach(el => {
-        if (el) {
+        if (el && authorId && authorId !== 'usr_unknown') {
           el.style.cursor = 'pointer';
-          el.addEventListener('click', () => {
-            switchView('profile', post.author._id);
+          el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            switchView('profile', authorId);
+          });
+        }
+      });
+
+      // Click handlers for comment author avatars and usernames in post
+      const commentAvatars = card.querySelectorAll('.comment-author-avatar, .comment-author-name');
+      commentAvatars.forEach(el => {
+        const cUserId = el.getAttribute('data-user-id');
+        if (cUserId) {
+          el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            switchView('profile', cUserId);
           });
         }
       });
@@ -6869,10 +11098,32 @@ document.addEventListener('DOMContentLoaded', () => {
       else if (Array.isArray(rawData?.reels)) reels = rawData.reels;
       else if (Array.isArray(rawData?.data)) reels = rawData.data;
 
+      // Skip DOM rebuild if the same reel IDs are already rendered
+      const newIds = reels.map(r => r._id || r.id).join(',');
+      const existingIds = Array.from(scroller.querySelectorAll('.reel-card')).map(c => c.getAttribute('data-reel-id')).join(',');
+      if (newIds && newIds === existingIds && scroller.children.length > 0) {
+        console.log('[HUBB FEED] Reels unchanged, skipping DOM rebuild.');
+        window.feedReels = reels;
+        return;
+      }
+
+      window.feedReels = reels;
+
       console.log('[HUBB FEED] reel count:', reels.length);
       if (reels.length > 0) {
         console.log('[HUBB FEED] first reel:', reels[0]);
       }
+
+      // Pause and release existing video resources to prevent detached audio play bug
+      scroller.querySelectorAll('.reel-video').forEach(vid => {
+        try {
+          vid.pause();
+          vid.removeAttribute('src');
+          vid.load();
+        } catch (e) {
+          console.warn('[REEL UNLOAD ERROR]', e);
+        }
+      });
 
       scroller.innerHTML = '';
 
@@ -6882,8 +11133,8 @@ document.addEventListener('DOMContentLoaded', () => {
             <div style="width: 72px; height: 72px; border-radius: 50%; background: rgba(168,85,247,0.15); display: flex; align-items: center; justify-content: center; border: 1px solid rgba(168,85,247,0.3);">
               <i data-lucide="clapperboard" style="width: 36px; height: 36px; color: #a855f7;"></i>
             </div>
-            <h3 style="margin: 0; color: white; font-size: 1.2rem; font-weight: 700;">No Hubbing Reels Yet</h3>
-            <p style="margin: 0; font-size: 13px; max-width: 300px; color: rgba(255,255,255,0.6); line-height: 1.5;">Be the first to create and share a reel in Hi-HUBBLE!</p>
+            <h3 style="margin: 0; color: var(--text-main); font-size: 1.2rem; font-weight: 700;">No Hubbing Reels Yet</h3>
+            <p style="margin: 0; font-size: 13px; max-width: 300px; color: var(--text-muted); line-height: 1.5;">Be the first to create and share a reel in Hi-HUBBLE!</p>
             <button class="welcome-btn btn-primary open-hubbing-editor-btn" style="padding: 10px 24px; font-size: 13.5px; font-weight: 600; border-radius: 10px; cursor: pointer; border: none; color: white; display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg, #a855f7 0%, #d946ef 100%); box-shadow: 0 4px 15px rgba(168,85,247,0.4); transition: transform 0.2s ease;">
               <i data-lucide="plus" style="width:16px; height:16px;"></i> Post a Reel
             </button>
@@ -6907,6 +11158,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const captionText = reel.caption || '';
         const captionHtml = captionText.replace(/#(\w+)/g, '<span style="color:#c084fc; font-weight:600;">#$1</span>');
+        const isReelSaved = reel.isSaved || (window.savedHubbs && window.savedHubbs.some(s => s.id === (reel._id || reel.id)));
 
         console.log('[HUBB FEED] rendering reel:', reel._id || reel.id);
         console.log('[HUBB VIDEO] video URL:', reel.videoUrl);
@@ -6914,79 +11166,93 @@ document.addEventListener('DOMContentLoaded', () => {
         const card = document.createElement('div');
         card.className = 'reel-card';
         card.setAttribute('data-reel-id', reel._id || reel.id);
-        card.style.cssText = `position: relative; width: 100%; max-width: 400px; height: 620px; margin: 0 auto 24px auto; border-radius: 18px; overflow: hidden; background: #000; box-shadow: 0 12px 35px rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.12);`;
+        card.style.cssText = `position: relative; width: 100%; height: 640px; margin: 0 auto 24px auto; border-radius: 18px; overflow: hidden; background: #000; box-shadow: 0 12px 35px rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.12); box-sizing: border-box;`;
 
         card.innerHTML = `
-          <video src="${reel.videoUrl}" loop autoplay muted playsinline class="reel-video" style="width:100%; height:100%; object-fit:cover; display:block;"></video>
+          <video data-src="${reel.videoUrl}" loop muted playsinline preload="none" class="reel-video" style="width:100%; height:100%; object-fit:cover; display:block;"></video>
           
-          <div class="reel-play-icon-overlay" style="position:absolute; inset:0; display:none; align-items:center; justify-content:center; pointer-events:none; z-index:4;">
-            <i data-lucide="play" style="width:52px; height:52px; color:white; opacity:0.85;"></i>
+          <div class="reel-play-icon-overlay" style="cursor: pointer; z-index: 4;">
+            <i data-lucide="play" style="width:30px; height:30px; color:white; opacity:0.9;"></i>
           </div>
           
           <div class="double-tap-heart"><i data-lucide="heart"></i></div>
 
           <div class="reel-overlay" style="position:absolute; inset:0; background: linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.15) 50%, rgba(0,0,0,0.3) 100%); display:flex; justify-content:space-between; align-items:flex-end; padding:20px; box-sizing:border-box; z-index:5;">
             
-            <div class="reel-left-info" style="display:flex; flex-direction:column; gap:10px; max-width:72%;">
+            <div class="reel-left-info" style="display:flex; flex-direction:column; gap:10px; max-width:72%; position:relative; z-index:7;">
               <div class="reel-user" style="display:flex; align-items:center; gap:8px;">
                 <img src="${authorAvatar}" alt="${authorName}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:2px solid #a855f7;" />
-                <span style="color:white; font-size:13px; font-weight:600;">@${authorUser}</span>
-                <strong class="reel-follow-btn" data-author-id="${reel.author?._id || reel.author?.id || ''}" style="color:white; font-size:11px; cursor:pointer; background:linear-gradient(135deg, #a855f7 0%, #ec4899 100%); padding:3px 10px; border-radius:12px; font-weight:600;">Follow</strong>
+                <div style="display:flex; flex-direction:column; gap:2px;">
+                  <div style="display:flex; align-items:center; gap:8px;">
+                    <span style="color:white; font-size:13px; font-weight:600;">@${authorUser}</span>
+                    <strong class="reel-follow-btn" data-author-id="${reel.author?._id || reel.author?.id || ''}" style="color:white; font-size:11px; cursor:pointer; background:linear-gradient(135deg, #a855f7 0%, #ec4899 100%); padding:3px 10px; border-radius:12px; font-weight:600;">Follow</strong>
+                  </div>
+                  ${reel.location ? `
+                    <div class="reel-location-badge" style="display:flex; align-items:center; gap:4px; color:rgba(255,255,255,0.7); font-size:10.5px;">
+                      <i data-lucide="map-pin" style="width:10px; height:10px; color:#ec4899;"></i>
+                      <span>${reel.location}</span>
+                    </div>
+                  ` : ''}
+                </div>
               </div>
               <p class="reel-caption" style="color:white; font-size:13px; margin:0; line-height:1.4;">${captionHtml}</p>
               <div class="reel-music" style="display:flex; align-items:center; gap:6px; color:rgba(255,255,255,0.8); font-size:11px;">
                 <i data-lucide="music" style="width:12px; height:12px;" class="music-icon-spin"></i> <span>${reel.audioTrackName || ('Original Audio - ' + authorUser)}</span>
               </div>
             </div>
-            
-            <div class="reel-right-actions" style="display:flex; flex-direction:column; gap:14px; align-items:center;">
-              <div class="reel-actions-capsule" style="background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(12px); border-radius: 36px; padding: 18px 8px; border: 1px solid rgba(255,255,255,0.12); display: flex; flex-direction: column; gap: 18px; align-items: center; box-shadow: 0 10px 30px rgba(0,0,0,0.4);">
-                
-                <!-- 1. Like -->
-                <div class="reel-action-btn reel-like-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
-                  <button class="action-circle-btn heart-btn ${reel.isLiked ? 'liked' : ''}" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
-                    <i data-lucide="heart" style="${reel.isLiked ? 'fill:#8b5cf6; stroke:#8b5cf6;' : ''}"></i>
-                  </button>
-                  <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedLikes || reel.likeCount || '0'}</span>
-                </div>
+          </div>
 
-                <!-- 2. Comment -->
-                <div class="reel-action-btn reel-comment-sim" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
-                  <button class="action-circle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
-                    <i data-lucide="message-circle"></i>
-                  </button>
-                  <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedComments || reel.commentCount || '0'}</span>
-                </div>
+          <!-- Bottom navigation zone overlays the bottom area of the reel -->
+          <div class="reel-bottom-navigation-zone" style="position: absolute; bottom: 0; left: 0; right: 0; height: 50px; z-index: 6; cursor: pointer;"></div>
 
-                <!-- 3. Share -->
-                <div class="reel-action-btn reel-share-sim" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
-                  <button class="action-circle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
-                    <i data-lucide="send"></i>
-                  </button>
-                  <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedShares || reel.shareCount || '0'}</span>
-                </div>
-
-                <!-- 4. Save/Bookmark -->
-                <div class="reel-action-btn reel-save-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
-                  <button class="action-circle-btn star-btn ${reel.isSaved ? 'saved' : ''}" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
-                    <i data-lucide="bookmark" style="${reel.isSaved ? 'fill:#FBBF24; stroke:#FBBF24;' : ''}"></i>
-                  </button>
-                </div>
-
-                <!-- 5. Sound / Audio Mute Toggle -->
-                <div class="reel-action-btn reel-audio-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;" title="Toggle Audio">
-                  <button class="action-circle-btn reel-audio-toggle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
-                    <i data-lucide="volume-x"></i>
-                  </button>
-                </div>
+          <!-- Right Actions Block (moved outside overlay for higher stack priority) -->
+          <div class="reel-right-actions" style="position: absolute; bottom: 20px; right: 20px; display:flex; flex-direction:column; gap:14px; align-items:center; z-index:10 !important;">
+            <div class="reel-actions-capsule" style="background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(12px); border-radius: 36px; padding: 18px 8px; border: 1px solid rgba(255,255,255,0.12); display: flex; flex-direction: column; gap: 18px; align-items: center; box-shadow: 0 10px 30px rgba(0,0,0,0.4);">
+              
+              <!-- 1. Like -->
+              <div class="reel-action-btn reel-like-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                <button class="action-circle-btn heart-btn ${reel.isLiked ? 'liked' : ''}" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                  <i data-lucide="heart" style="${reel.isLiked ? 'fill:#8b5cf6; stroke:#8b5cf6;' : ''}"></i>
+                </button>
+                <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedLikes || reel.likeCount || '0'}</span>
               </div>
 
-              <!-- 5. More Options -->
-              <div class="reel-action-btn reel-more-sim" data-reel-id="${reel._id || reel.id}">
-                <button class="action-circle-btn" style="width:40px; height:40px; border-radius:50%; background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.15); display:flex; align-items:center; justify-content:center; color:white; cursor:pointer;">
-                  <i data-lucide="more-horizontal"></i>
+              <!-- 2. Comment -->
+              <div class="reel-action-btn reel-comment-sim" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                <button class="action-circle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                  <i data-lucide="message-circle"></i>
+                </button>
+                <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedComments || reel.commentCount || '0'}</span>
+              </div>
+
+              <!-- 3. Share -->
+              <div class="reel-action-btn reel-share-sim" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                <button class="action-circle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                  <i data-lucide="send"></i>
+                </button>
+                <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedShares || reel.shareCount || '0'}</span>
+              </div>
+
+              <!-- 4. Save/Bookmark -->
+              <div class="reel-action-btn reel-save-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                <button class="action-circle-btn star-btn ${isReelSaved ? 'saved' : ''}" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                  <i data-lucide="bookmark" style="${isReelSaved ? 'fill:#FBBF24; stroke:#FBBF24;' : ''}"></i>
                 </button>
               </div>
+
+              <!-- 5. Sound / Audio Mute Toggle -->
+              <div class="reel-action-btn reel-audio-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;" title="Toggle Audio">
+                <button class="action-circle-btn reel-audio-toggle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                  <i data-lucide="${window.reelsMuted === false ? 'volume-2' : 'volume-x'}"></i>
+                </button>
+              </div>
+            </div>
+
+            <!-- 5. More Options -->
+            <div class="reel-action-btn reel-more-sim" data-reel-id="${reel._id || reel.id}">
+              <button class="action-circle-btn" style="width:40px; height:40px; border-radius:50%; background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.15); display:flex; align-items:center; justify-content:center; color:white; cursor:pointer;">
+                <i data-lucide="more-horizontal"></i>
+              </button>
             </div>
           </div>
 
@@ -7024,14 +11290,26 @@ document.addEventListener('DOMContentLoaded', () => {
           </div>
         `;
 
-        // Diagnostic video element listeners
+        // Diagnostic video element listeners + error isolation
         const video = card.querySelector('.reel-video');
         if (video) {
-          video.addEventListener('loadedmetadata', () => console.log('[HUBB VIDEO] loadedmetadata for reel:', reel._id || reel.id));
-          video.addEventListener('canplay', () => console.log('[HUBB VIDEO] canplay for reel:', reel._id || reel.id));
-          video.addEventListener('error', (e) => console.error('[HUBB VIDEO] error for reel:', reel._id || reel.id, video.error));
-          video.addEventListener('stalled', () => console.warn('[HUBB VIDEO] stalled for reel:', reel._id || reel.id));
-          video.addEventListener('waiting', () => console.warn('[HUBB VIDEO] waiting for reel:', reel._id || reel.id));
+          video.addEventListener('loadedmetadata', () => console.log('[HUBBING PLAYER] event=loadedmetadata reelId=' + (reel._id || reel.id) + ' duration=' + (video.duration ? video.duration.toFixed(2) : '0') + ' dim=' + video.videoWidth + 'x' + video.videoHeight));
+          video.addEventListener('canplay', () => console.log('[HUBBING PLAYER] event=canplay reelId=' + (reel._id || reel.id) + ' readyState=' + video.readyState));
+          video.addEventListener('play', () => console.log('[HUBBING PLAYER] event=play reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
+          video.addEventListener('playing', () => console.log('[HUBBING PLAYER] event=playing reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2) + ' paused=' + video.paused + ' readyState=' + video.readyState));
+          video.addEventListener('pause', () => console.log('[HUBBING PLAYER] event=pause reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
+          video.addEventListener('waiting', () => console.warn('[HUBBING PLAYER] event=waiting reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2) + ' readyState=' + video.readyState + ' networkState=' + video.networkState));
+          video.addEventListener('stalled', () => console.warn('[HUBBING PLAYER] event=stalled reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
+          video.addEventListener('seeking', () => console.log('[HUBBING PLAYER] event=seeking reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
+          video.addEventListener('seeked', () => console.log('[HUBBING PLAYER] event=seeked reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
+          video.addEventListener('ended', () => console.log('[HUBBING PLAYER] event=ended reelId=' + (reel._id || reel.id)));
+          video.addEventListener('error', () => {
+            console.error('[HUBBING PLAYER] event=error reelId=' + (reel._id || reel.id), video.error);
+            // Isolate failed reel — mark card but do NOT crash the feed
+            card.setAttribute('data-reel-failed', 'true');
+            const overlay = card.querySelector('.reel-play-icon-overlay');
+            if (overlay) overlay.innerHTML = '<span style="color:rgba(255,255,255,0.6);font-size:12px;">Video unavailable</span>';
+          });
         }
 
         scroller.appendChild(card);
@@ -7039,6 +11317,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (window.debouncedCreateIcons) window.debouncedCreateIcons();
       wireReelInteractions(scroller);
+
+      // Notify HubbingPlaybackController after feed rendering
+      if (window.hubbingPlaybackController) {
+        window.hubbingPlaybackController.scheduleSettleEvaluation(100);
+      }
 
     } catch (err) {
       console.error('[HUBB FEED] Error loading reels:', err);
@@ -7101,21 +11384,41 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
+      const card = btnElement.closest('.reel-card');
+      const video = card ? card.querySelector('video') : null;
       const starIcon = btnElement.querySelector('i, svg');
+      
       if (data.isSaved) {
         btnElement.classList.add('saved');
         if (starIcon) {
           starIcon.style.fill = '#FBBF24';
           starIcon.style.stroke = '#FBBF24';
         }
-        showToast('Reel saved to bookmarks! ⭐');
+        if (video) {
+          const mediaData = { id: reelId, type: 'video', url: video.src, isReel: true };
+          if (!window.savedHubbs.find(s => s.id === mediaData.id)) {
+            window.savedHubbs.push(mediaData);
+          }
+        }
+        showToast('Reel saved to bookmarks! 🌟');
       } else {
         btnElement.classList.remove('saved');
         if (starIcon) {
           starIcon.style.fill = 'none';
           starIcon.style.stroke = 'currentColor';
         }
+        window.savedHubbs = window.savedHubbs.filter(s => s.id !== reelId);
         showToast('Reel removed from bookmarks.');
+      }
+      
+      const savedGrid = document.getElementById('profile-saved-grid');
+      if (savedGrid && savedGrid.classList.contains('active')) {
+        if (typeof window.fetchSavedHubbs === 'function') {
+          await window.fetchSavedHubbs();
+        }
+        if (typeof renderSavedHubbs === 'function') {
+          renderSavedHubbs();
+        }
       }
     } catch (err) {
       showToast(err.message);
@@ -7140,13 +11443,26 @@ document.addEventListener('DOMContentLoaded', () => {
         item.className = 'comment-item';
         item.style.cssText = 'display: flex; gap: 10px; margin-bottom: 12px; align-items: flex-start;';
         const avatar = c.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
+        const cAuthorId = getUserIdentifier(c.author);
         item.innerHTML = `
-          <img src="${avatar}" style="width:30px; height:30px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.2);" />
+          <img src="${avatar}" class="comment-author-avatar" style="width:30px; height:30px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.2); cursor:pointer;" />
           <div style="flex:1; background: rgba(255,255,255,0.06); padding: 8px 12px; border-radius: 12px;">
-            <div style="font-size:12px; font-weight:700; color:white;">@${c.author?.username || 'user'}</div>
+            <div class="comment-author-name" style="font-size:12px; font-weight:700; color:white; cursor:pointer;">@${c.author?.username || 'user'}</div>
             <div style="font-size:12.5px; color:rgba(255,255,255,0.9); margin-top:3px; line-height: 1.4;">${c.content}</div>
           </div>
         `;
+
+        const userClickEls = item.querySelectorAll('.comment-author-avatar, .comment-author-name');
+        userClickEls.forEach(el => {
+          if (el && cAuthorId) {
+            el.addEventListener('click', (e) => {
+              e.stopPropagation();
+              modalElement.classList.remove('active');
+              switchView('profile', cAuthorId);
+            });
+          }
+        });
+
         listElem.appendChild(item);
       });
     } catch (err) {
@@ -7198,16 +11514,20 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (_) { }
 
-    if (shareModal) shareModal.classList.add('active');
-    const copyBtn = shareModal ? shareModal.querySelector('.copy-link-btn') : null;
-    if (copyBtn) {
-      copyBtn.onclick = () => {
-        const reelUrl = `${window.location.origin}/#reel-${reelId}`;
-        navigator.clipboard.writeText(reelUrl).then(() => {
-          showToast('Reel link copied to clipboard! 📋');
-          if (shareModal) shareModal.classList.remove('active');
-        });
-      };
+    if (typeof openShare === 'function') {
+      openShare('reel_' + reelId);
+    } else {
+      if (shareModal) shareModal.classList.add('active');
+      const copyBtn = shareModal ? shareModal.querySelector('.copy-link-btn') : null;
+      if (copyBtn) {
+        copyBtn.onclick = () => {
+          const reelUrl = `${window.location.origin}/#reel-${reelId}`;
+          navigator.clipboard.writeText(reelUrl).then(() => {
+            showToast('Reel link copied to clipboard! 📋');
+            if (shareModal) shareModal.classList.remove('active');
+          });
+        };
+      }
     }
   }
 
@@ -7238,23 +11558,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- ONLINE PRESENCE HEARTBEAT SYSTEM ---
   function sendPresenceHeartbeat() {
-    const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
-    if (!token) return;
-    fetch(`${API_URL}/api/presence/heartbeat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      }
-    }).catch(() => { });
+    if (typeof presenceManager !== 'undefined') {
+      presenceManager.sendHeartbeat();
+    }
   }
 
-  sendPresenceHeartbeat();
-  setInterval(sendPresenceHeartbeat, 30000);
+  function loadActiveVibers() {
+    if (typeof presenceManager !== 'undefined') {
+      return presenceManager.fetchOnlineUsers();
+    }
+  }
+
+  if (typeof presenceManager !== 'undefined') {
+    presenceManager.init();
+  }
+
   setTimeout(() => {
     loadFollowSuggestions();
     loadTrendingHubbs();
-    loadActiveVibers();
+    if (typeof presenceManager !== 'undefined') {
+      presenceManager.fetchOnlineUsers();
+    }
   }, 100);
 
   const sendLogoutBeacon = () => {
@@ -7274,11 +11598,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   window.addEventListener('beforeunload', sendLogoutBeacon);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-      sendLogoutBeacon();
-    } else if (document.visibilityState === 'visible') {
-      sendPresenceHeartbeat();
-      loadActiveVibers();
+    if (document.visibilityState === 'visible') {
+      if (typeof presenceManager !== 'undefined') {
+        presenceManager.sendHeartbeat();
+        presenceManager.fetchOnlineUsers();
+      }
     }
   });
 
@@ -7356,7 +11680,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const infoArea = row.querySelector('.user-info-area');
       if (infoArea) {
         infoArea.addEventListener('click', () => {
-          switchView('chats', user._id);
+          switchView('profile', getUserIdentifier(user));
         });
       }
 
@@ -7445,29 +11769,40 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
 
+  // --- UNIFIED ROBUST FOLLOW / HUBBIES REQUEST HANDLER ---
   async function toggleFollowUser(targetUserId, btnElement, userObj = null) {
     const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
     if (!token) {
-      showToast('Please log in to follow users! 🔐');
+      showToast('Please log in to connect with Hubbers! 🔐');
       return;
     }
 
-    const isFollowing = btnElement.classList.contains('followed');
+    if (!targetUserId || !btnElement) return;
+
+    // Prevent duplicate spam clicks
+    if (btnElement.disabled || btnElement.getAttribute('data-submitting') === 'true') {
+      return;
+    }
+
+    const currentText = btnElement.textContent.trim();
+    const isFollowing = btnElement.classList.contains('followed') || currentText === 'Hubbies';
+    const isPending = btnElement.classList.contains('requested') || currentText === 'Requested';
+
+    if (isPending) {
+      showToast('Hubbies request is already pending. ⏳');
+      return;
+    }
+
     const endpoint = isFollowing ? 'unfollow' : 'follow';
-    const targetUsername = userObj?.username || btnElement.getAttribute('data-username') || 'N/A';
-    const targetUuid = userObj?._id || targetUserId;
     const fullApiUrl = `${API_URL}/api/users/${targetUserId}/${endpoint}`;
 
-    console.log('==================================================');
-    console.log('FRONTEND DEBUG - FOLLOW ACTION CLICKED');
-    console.log('==================================================');
-    console.log('1. Selected Suggested Hubber object:', userObj || { _id: targetUserId });
-    console.log('2. Target Profile UUID:', targetUuid);
-    console.log('3. Target Username:', targetUsername);
-    console.log('4. Request Payload:', { targetUserId, endpoint });
-    console.log('5. API URL:', fullApiUrl);
-    console.log('6. HTTP Method: POST');
-    console.log('==================================================');
+    // 1. Immediately disable button & show loading state to prevent double-clicks
+    const prevText = btnElement.textContent;
+    const prevDisabled = btnElement.disabled;
+    const prevStyle = btnElement.getAttribute('style') || '';
+    btnElement.disabled = true;
+    btnElement.setAttribute('data-submitting', 'true');
+    btnElement.textContent = endpoint === 'follow' ? 'Sending...' : 'Updating...';
 
     try {
       const res = await fetch(fullApiUrl, {
@@ -7478,38 +11813,55 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
       const data = await res.json();
-      console.log('FRONTEND DEBUG - API RESPONSE:', { status: res.status, ok: res.ok, body: data });
 
       if (!res.ok) throw new Error(data.error || 'Follow action failed');
 
       if (endpoint === 'follow') {
-        btnElement.textContent = 'Requested';
-        btnElement.style.background = 'rgba(255,255,255,0.15)';
-        btnElement.style.color = 'var(--text-muted, #94a3b8)';
-        btnElement.disabled = true;
-        showToast(data.message || 'Follow request sent! 📩');
+        if (data.status === 'following') {
+          btnElement.classList.add('followed');
+          btnElement.classList.remove('requested');
+          btnElement.textContent = 'Hubbies';
+          btnElement.style.background = '#22c55e';
+          btnElement.style.color = '#ffffff';
+          btnElement.disabled = false;
+        } else {
+          btnElement.classList.add('requested');
+          btnElement.classList.remove('followed');
+          btnElement.textContent = 'Requested';
+          btnElement.style.background = 'rgba(255, 255, 255, 0.15)';
+          btnElement.style.color = 'var(--text-muted, #94a3b8)';
+          btnElement.disabled = true;
+        }
+        showToast(data.message || 'Hubbies request sent successfully! 📩');
       } else {
-        btnElement.classList.remove('followed');
+        btnElement.classList.remove('followed', 'requested');
         btnElement.textContent = 'Follow';
         btnElement.style.background = 'var(--primary, #a855f7)';
+        btnElement.style.color = '#ffffff';
         btnElement.disabled = false;
         showToast('Unfollowed successfully.');
       }
-      loadProfileStats();
-      loadFollowSuggestions();
-      if (suggestedVibersModal && suggestedVibersModal.classList.contains('active')) {
-        openSuggestedVibersModal();
-      }
+
+      // Update counters & UI
+      if (typeof loadProfileStats === 'function') loadProfileStats();
+      if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
     } catch (err) {
-      console.error('FRONTEND ERROR:', err.message);
-      showToast(err.message);
+      console.error('[toggleFollowUser Error]:', err.message);
+      btnElement.textContent = prevText;
+      btnElement.disabled = prevDisabled;
+      btnElement.setAttribute('style', prevStyle);
+      showToast(err.message || 'Action failed, please try again.');
+    } finally {
+      btnElement.removeAttribute('data-submitting');
     }
   }
 
-  // --- SUGGESTED VIBERS MODAL SYSTEM ---
+  // --- SUGGESTED HUBBERS "SEE ALL" MODAL SYSTEM ---
   const suggestedVibersModal = document.getElementById('suggested-vibers-modal');
   const suggestedVibersCloseBtn = document.getElementById('suggested-vibers-close-btn');
   const suggestedVibersContent = document.getElementById('suggested-vibers-content');
+  const suggestedHubbersSearchInput = document.getElementById('suggested-hubbers-search-input');
+  let cachedSuggestedHubbers = [];
 
   if (suggestedVibersCloseBtn && suggestedVibersModal) {
     suggestedVibersCloseBtn.addEventListener('click', () => {
@@ -7517,63 +11869,129 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Render cards in the modal
+  function renderModalHubbersList(users) {
+    if (!suggestedVibersContent) return;
+    suggestedVibersContent.innerHTML = '';
+
+    if (!users || users.length === 0) {
+      suggestedVibersContent.innerHTML = `
+        <div style="text-align: center; padding: 40px 16px; color: var(--text-muted);">
+          <i data-lucide="users" style="width: 36px; height: 36px; opacity: 0.4; margin-bottom: 8px; display: inline-block;"></i>
+          <p style="font-size: 13.5px; margin: 0;">No discoverable Hubbers found.</p>
+        </div>
+      `;
+      debouncedCreateIcons();
+      return;
+    }
+
+    users.forEach(user => {
+      const card = document.createElement('div');
+      card.className = 'suggested-hubber-card';
+      card.style.cssText = 'display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; margin-bottom: 10px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 14px; transition: all 0.2s ease;';
+
+      const isRequested = user.followStatus === 'pending';
+      const isFollowing = user.followStatus === 'following';
+
+      let btnClass = 'search-follow-btn modal-suggest-follow-btn';
+      let btnText = 'Follow';
+      let btnStyle = 'padding: 6px 16px; border-radius: 20px; font-weight: 600; font-size: 12px; border: none; cursor: pointer; background: var(--primary, #a855f7); color: white; flex-shrink: 0; transition: all 0.2s ease;';
+
+      if (isRequested) {
+        btnClass += ' requested';
+        btnText = 'Requested';
+        btnStyle = 'padding: 6px 16px; border-radius: 20px; font-weight: 600; font-size: 12px; border: none; cursor: not-allowed; background: rgba(255,255,255,0.15); color: var(--text-muted, #94a3b8); flex-shrink: 0;';
+      } else if (isFollowing) {
+        btnClass += ' followed';
+        btnText = 'Hubbies';
+        btnStyle = 'padding: 6px 16px; border-radius: 20px; font-weight: 600; font-size: 12px; border: none; cursor: pointer; background: #22c55e; color: white; flex-shrink: 0;';
+      }
+
+      const bioHtml = user.bio ? `<p class="hubber-card-bio" style="margin: 3px 0 0 0; font-size: 11.5px; color: var(--text-muted); max-width: 250px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${user.bio}</p>` : '';
+      const statsHtml = `<span style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 3px;">${user.postsCount || 0} Hubbs • <span style="color: var(--primary, #a855f7); font-weight: 600;">${user.followersCount || 0} Hubbies</span></span>`;
+
+      card.innerHTML = `
+        <div class="person-info" style="display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; cursor: pointer;">
+          <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80'}" alt="${user.fullName}" style="width: 44px; height: 44px; border-radius: 50%; object-fit: cover; flex-shrink: 0; border: 1.5px solid rgba(168,85,247,0.3);" />
+          <div style="flex: 1; min-width: 0;">
+            <strong style="font-size: 13.5px; color: var(--text-color); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${user.fullName}</strong>
+            <span style="font-size: 11.5px; color: var(--text-muted); display: block;">@${user.username}</span>
+            ${bioHtml}
+            ${statsHtml}
+          </div>
+        </div>
+        <button class="${btnClass}" data-user-id="${user._id}" style="${btnStyle}" ${isRequested ? 'disabled' : ''}>
+          ${btnText}
+        </button>
+      `;
+
+      // Profile click navigation
+      const infoArea = card.querySelector('.person-info');
+      if (infoArea) {
+        infoArea.addEventListener('click', () => {
+          if (suggestedVibersModal) suggestedVibersModal.classList.remove('active');
+          switchView('profile', getUserIdentifier(user));
+        });
+      }
+
+      // Follow action
+      const followBtn = card.querySelector('.modal-suggest-follow-btn');
+      if (followBtn) {
+        followBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const uid = followBtn.getAttribute('data-user-id');
+          await toggleFollowUser(uid, followBtn, user);
+        });
+      }
+
+      suggestedVibersContent.appendChild(card);
+    });
+
+    debouncedCreateIcons();
+  }
+
   async function openSuggestedVibersModal() {
     if (!suggestedVibersContent) return;
 
-    suggestedVibersContent.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-muted);">Loading suggestions...</div>';
+    // Reset search bar
+    if (suggestedHubbersSearchInput) {
+      suggestedHubbersSearchInput.value = '';
+    }
+
+    suggestedVibersContent.innerHTML = `
+      <div style="text-align: center; padding: 40px 16px; color: var(--text-muted);">
+        <i data-lucide="loader" style="width: 28px; height: 28px; animation: spin 1s linear infinite; margin-bottom: 8px; display: inline-block;"></i>
+        <p style="font-size: 13px; margin: 0;">Discovering Hubbers...</p>
+      </div>
+    `;
+    debouncedCreateIcons();
+
     if (suggestedVibersModal) suggestedVibersModal.classList.add('active');
 
     try {
       const suggestions = await getSuggestedHubbers(50);
-      console.log(`[Suggested Hubbers Modal] Rendering ${suggestions.length} items to Modal`);
+      cachedSuggestedHubbers = suggestions || [];
+      console.log(`[Suggested Hubbers Modal] Rendering ${cachedSuggestedHubbers.length} items to Modal`);
 
-      suggestedVibersContent.innerHTML = '';
-      if (!suggestions || suggestions.length === 0) {
-        suggestedVibersContent.innerHTML = `<div style="text-align: center; padding: 20px; color: var(--text-muted);">No suggestions available.</div>`;
-        return;
+      renderModalHubbersList(cachedSuggestedHubbers);
+
+      // Wire up live search filter
+      if (suggestedHubbersSearchInput) {
+        suggestedHubbersSearchInput.oninput = (e) => {
+          const q = (e.target.value || '').toLowerCase().trim().replace(/^@/, '');
+          if (!q) {
+            renderModalHubbersList(cachedSuggestedHubbers);
+            return;
+          }
+          const filtered = cachedSuggestedHubbers.filter(u => 
+            (u.fullName && u.fullName.toLowerCase().includes(q)) ||
+            (u.username && u.username.toLowerCase().includes(q))
+          );
+          renderModalHubbersList(filtered);
+        };
       }
-
-      suggestions.forEach(user => {
-        const row = document.createElement('div');
-        row.className = 'search-person-row';
-        row.style.margin = '10px 0';
-        row.style.display = 'flex';
-        row.style.justifyContent = 'space-between';
-        row.style.alignItems = 'center';
-
-        row.innerHTML = `
-          <div class="person-info" style="display: flex; align-items: center; cursor: pointer;">
-            <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80'}" alt="${user.fullName}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; margin-right: 10px;" />
-            <div style="display: flex; flex-direction: column;">
-              <strong style="font-size: 14px; color: var(--text-color);">${user.fullName}</strong>
-              <span style="font-size: 12px; color: var(--text-muted);">@${user.username} • ${user.followersCount || 0} Hubbers</span>
-            </div>
-          </div>
-          <button class="search-follow-btn modal-suggest-follow-btn" data-user-id="${user._id}" style="padding: 6px 14px; border-radius: 20px; font-weight: 600; font-size: 12px; border: none; cursor: pointer; background: var(--primary, #a855f7); color: white;">
-            Follow
-          </button>
-        `;
-
-        row.querySelector('.person-info').addEventListener('click', () => {
-          if (suggestedVibersModal) suggestedVibersModal.classList.remove('active');
-          switchView('profile', user._id);
-        });
-
-        const followBtn = row.querySelector('.modal-suggest-follow-btn');
-        if (followBtn) {
-          followBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const uid = followBtn.getAttribute('data-user-id');
-            await toggleFollowUser(uid, followBtn);
-          });
-        }
-
-        suggestedVibersContent.appendChild(row);
-      });
-
-      debouncedCreateIcons();
     } catch (err) {
-      console.error(err);
+      console.error('[openSuggestedVibersModal Error]:', err);
       suggestedVibersContent.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--error-color);">Error loading suggestions</div>';
     }
   }
@@ -7620,7 +12038,7 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
 
         circle.addEventListener('click', () => {
-          switchView('profile', user._id);
+          switchView('profile', getUserIdentifier(user));
         });
 
         activeVibersList.appendChild(circle);
@@ -7637,9 +12055,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentUserStr = localStorage.getItem('invibeUser');
     if (!currentUserStr) return;
     const currentUser = JSON.parse(currentUserStr);
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
 
     try {
-      const res = await fetch(`${API_URL}/api/users/${currentUser.id || currentUser._id}/relations`);
+      const res = await fetch(`${API_URL}/api/users/${currentUserId}/relations`);
       if (!res.ok) throw new Error('Failed to fetch user relations');
       const data = await res.json();
 
@@ -7648,8 +12067,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (sidebarFollowers) sidebarFollowers.textContent = formatCount(data.followersCount);
       if (sidebarFollowing) sidebarFollowing.textContent = formatCount(data.followingCount);
 
-      const followBtn = document.getElementById('profile-follow-btn');
-      const isViewingSelf = !followBtn || followBtn.style.display === 'none';
+      // Only update profile view counters if the active view belongs to the logged in user
+      const isViewingSelf = (!state.viewingProfileUserId || state.viewingProfileUserId === 'me' || state.viewingProfileUserId === currentUserId || state.viewingProfileUserId === currentUser.username);
 
       if (isViewingSelf) {
         const profileFollowers = document.getElementById('profile-followers-count');
@@ -7661,9 +12080,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (postsRes.ok) {
           const posts = await postsRes.json();
           const userPostsCount = posts.filter(p => {
-            const authorId = p.author._id || p.author;
-            const currentId = currentUser.id || currentUser._id;
-            return authorId === currentId;
+            const authorId = (p.author?._id || p.author?.id || p.author || '').toString();
+            return authorId === currentUserId;
           }).length;
           const profileVibes = document.getElementById('profile-vibes-count');
           if (profileVibes) profileVibes.textContent = userPostsCount;
@@ -7679,6 +12097,120 @@ document.addEventListener('DOMContentLoaded', () => {
     return num;
   }
 
+  // --- REELS OPTIONS DROPDOWN HELPERS ---
+  window.reelsAutoplay = false;
+  window.lastScrollTopBeforeFullscreen = 0;
+
+  function copyReelLink(reelId) {
+    const link = `${window.location.origin}${window.location.pathname}?reelId=${reelId}`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(link)
+        .then(() => {
+          showToast('Link copied 🔗');
+        })
+        .catch(err => {
+          console.error('[COPY LINK ERROR]', err);
+          fallbackCopyTextToClipboard(link);
+        });
+    } else {
+      fallbackCopyTextToClipboard(link);
+    }
+  }
+
+  function fallbackCopyTextToClipboard(text) {
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.style.top = "0";
+    textArea.style.left = "0";
+    textArea.style.position = "fixed";
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    try {
+      const successful = document.execCommand('copy');
+      if (successful) {
+        showToast('Link copied 🔗');
+      } else {
+        alert('Unable to copy link.');
+      }
+    } catch (err) {
+      console.error('[FALLBACK COPY ERROR]', err);
+      alert('Unable to copy link.');
+    }
+    document.body.removeChild(textArea);
+  }
+
+  function requestReelFullscreen(el) {
+    // Store current scroll position of main content wrapper
+    const mainContent = document.querySelector('.main-content');
+    if (mainContent) {
+      window.lastScrollTopBeforeFullscreen = mainContent.scrollTop;
+    }
+
+    if (el.requestFullscreen) {
+      el.requestFullscreen();
+    } else if (el.webkitRequestFullscreen) {
+      el.webkitRequestFullscreen();
+    } else if (el.msRequestFullscreen) {
+      el.msRequestFullscreen();
+    }
+  }
+
+  function exitReelFullscreen() {
+    if (document.exitFullscreen) {
+      document.exitFullscreen();
+    } else if (document.webkitExitFullscreen) {
+      document.webkitExitFullscreen();
+    } else if (document.msExitFullscreen) {
+      document.msExitFullscreen();
+    }
+  }
+
+  // Restore scroll position on exiting fullscreen
+  document.addEventListener('fullscreenchange', () => {
+    const isCurrentlyFullscreen = document.fullscreenElement !== null;
+    if (!isCurrentlyFullscreen && window.lastScrollTopBeforeFullscreen !== undefined) {
+      const mainContent = document.querySelector('.main-content');
+      if (mainContent) {
+        mainContent.scrollTop = window.lastScrollTopBeforeFullscreen;
+      }
+    }
+  });
+  document.addEventListener('webkitfullscreenchange', () => {
+    const isCurrentlyFullscreen = document.webkitFullscreenElement !== null;
+    if (!isCurrentlyFullscreen && window.lastScrollTopBeforeFullscreen !== undefined) {
+      const mainContent = document.querySelector('.main-content');
+      if (mainContent) {
+        mainContent.scrollTop = window.lastScrollTopBeforeFullscreen;
+      }
+    }
+  });
+
+  function scrollToReelCard(nextCard) {
+    if (!nextCard) return;
+    const mainContent = document.querySelector('.main-content');
+    if (mainContent) {
+      const mainContentRect = mainContent.getBoundingClientRect();
+      const nextCardRect = nextCard.getBoundingClientRect();
+      
+      const header = document.querySelector('#view-explore .explore-header-row');
+      const headerHeight = header ? header.offsetHeight : 0;
+      
+      const targetScrollTop = nextCardRect.top - mainContentRect.top + mainContent.scrollTop - headerHeight - 8;
+      
+      mainContent.scrollTo({
+        top: targetScrollTop,
+        behavior: 'smooth'
+      });
+    }
+  }
+
+  function syncAutoplayLoopState() {
+    document.querySelectorAll('.reel-video').forEach(video => {
+      video.loop = !window.reelsAutoplay;
+    });
+  }
+
   function wireReelInteractions(scroller) {
     const cards = scroller.querySelectorAll('.reel-card');
     cards.forEach(card => {
@@ -7687,30 +12219,55 @@ document.addEventListener('DOMContentLoaded', () => {
       const likeBtn = card.querySelector('.reel-like-action .heart-btn');
       const reelId = card.querySelector('.reel-like-action')?.getAttribute('data-reel-id');
 
+      // Video state change listeners to keep UI synchronized
+      if (video) {
+        video.loop = !window.reelsAutoplay;
+        video.addEventListener('play', () => {
+          if (playPop) {
+            playPop.classList.remove('paused-state');
+          }
+          if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+        });
+
+        video.addEventListener('pause', () => {
+          if (playPop) {
+            playPop.classList.add('paused-state');
+          }
+          if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+        });
+
+        video.addEventListener('ended', () => {
+          if (window.reelsAutoplay) {
+            const isCurrentlyFullscreen = document.fullscreenElement === card || document.webkitFullscreenElement === card;
+            if (isCurrentlyFullscreen) {
+              exitReelFullscreen();
+            }
+            
+            const scroller = video.closest('.reels-scroller');
+            if (scroller) {
+              const cards = Array.from(scroller.querySelectorAll('.reel-card'));
+              const currentIndex = cards.indexOf(card);
+              if (currentIndex !== -1) {
+                const nextCard = cards[currentIndex + 1];
+                if (nextCard) {
+                  scrollToReelCard(nextCard);
+                }
+              }
+            }
+          }
+        });
+      }
+
+      const togglePlayPause = () => {
+        if (window.hubbingPlaybackController) {
+          window.hubbingPlaybackController.togglePlayPause(card);
+        }
+      };
+
       card.addEventListener('click', (e) => {
         if (e.detail > 1) return;
         if (e.target.closest('.reel-right-actions')) return;
-
-        if (video.paused) {
-          video.play();
-          playPop.classList.remove('active');
-          window.requestAnimationFrame(() => {
-            window.requestAnimationFrame(() => {
-              playPop.querySelector('i').setAttribute('data-lucide', 'play');
-              playPop.classList.add('active');
-            });
-          });
-        } else {
-          video.pause();
-          playPop.classList.remove('active');
-          window.requestAnimationFrame(() => {
-            window.requestAnimationFrame(() => {
-              playPop.querySelector('i').setAttribute('data-lucide', 'pause');
-              playPop.classList.add('active');
-            });
-          });
-        }
-        debouncedCreateIcons();
+        togglePlayPause();
       });
 
       let lastReelTap = 0;
@@ -7752,36 +12309,12 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       const audioBtnAction = card.querySelector('.reel-audio-action');
-      const audioToggleBtn = card.querySelector('.reel-audio-toggle-btn');
-      if (audioBtnAction && audioToggleBtn && video) {
+      if (audioBtnAction) {
         audioBtnAction.addEventListener('click', (e) => {
           e.stopPropagation();
-          const isCurrentlyMuted = video.muted;
-          if (isCurrentlyMuted) {
-            // Mute all other reel videos first so only one active reel produces sound
-            document.querySelectorAll('.reel-video').forEach(v => {
-              if (v !== video) {
-                v.muted = true;
-                const otherBtn = v.closest('.reel-card')?.querySelector('.reel-audio-toggle-btn i');
-                if (otherBtn) otherBtn.setAttribute('data-lucide', 'volume-x');
-              }
-            });
-
-            video.muted = false;
-            video.volume = 1.0;
-            video.play().catch(err => console.log('[REEL AUDIO DEBUG] Play on unmute notice:', err.message));
-            const icon = audioToggleBtn.querySelector('i');
-            if (icon) icon.setAttribute('data-lucide', 'volume-2');
-            if (typeof safeShowToast === 'function') safeShowToast('Reel audio unmuted 🔊');
-            else if (typeof window.showToast === 'function') window.showToast('Reel audio unmuted 🔊');
-          } else {
-            video.muted = true;
-            const icon = audioToggleBtn.querySelector('i');
-            if (icon) icon.setAttribute('data-lucide', 'volume-x');
-            if (typeof safeShowToast === 'function') safeShowToast('Reel audio muted 🔇');
-            else if (typeof window.showToast === 'function') window.showToast('Reel audio muted 🔇');
+          if (window.hubbingPlaybackController) {
+            window.hubbingPlaybackController.toggleAudio(card);
           }
-          if (window.debouncedCreateIcons) window.debouncedCreateIcons();
         });
       }
 
@@ -7793,6 +12326,18 @@ document.addEventListener('DOMContentLoaded', () => {
           await toggleFollowFromReel(authorId, followReel);
         });
       }
+
+      const reelUserEls = card.querySelectorAll('.reel-user img, .reel-user span');
+      const reelAuthorId = followReel?.getAttribute('data-author-id');
+      reelUserEls.forEach(el => {
+        if (el && reelAuthorId) {
+          el.style.cursor = 'pointer';
+          el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            switchView('profile', reelAuthorId);
+          });
+        }
+      });
 
       const commentBtn = card.querySelector('.reel-comment-sim');
       const commentModal = card.querySelector('.reel-comments-modal');
@@ -7966,169 +12511,368 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }
       }
+
+      // Dedicated bottom tap-zone listener for smooth reel navigation
+      const navZone = card.querySelector('.reel-bottom-navigation-zone');
+      if (navZone) {
+        navZone.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const cards = Array.from(scroller.querySelectorAll('.reel-card'));
+          const currentIndex = cards.indexOf(card);
+          if (currentIndex !== -1) {
+            let nextCard = cards[currentIndex + 1];
+            if (!nextCard) {
+              // Loop back to first reel smoothly
+              nextCard = cards[0];
+            }
+            if (nextCard) {
+              const mainContent = document.querySelector('.main-content');
+              if (mainContent) {
+                const mainContentRect = mainContent.getBoundingClientRect();
+                const nextCardRect = nextCard.getBoundingClientRect();
+                
+                // Get header offset dynamically if it exists (e.g. on Explore/Hubbing page)
+                const header = document.querySelector('#view-explore .explore-header-row');
+                const headerHeight = header ? header.offsetHeight : 0;
+                
+                const targetScrollTop = nextCardRect.top - mainContentRect.top + mainContent.scrollTop - headerHeight - 8;
+                
+                mainContent.scrollTo({
+                  top: targetScrollTop,
+                  behavior: 'smooth'
+                });
+              }
+            }
+          }
+        });
+      }
+      // 6. Action Menu Toggling and Binding
+      const moreBtn = card.querySelector('.reel-more-sim');
+      if (moreBtn) {
+        // Ensure z-index is set high to sit above any bottom nav zones
+        moreBtn.style.cssText = "position: relative; z-index: 10 !important;";
+        
+        moreBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+        moreBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+        moreBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+        
+        moreBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          
+          const existingDropdown = moreBtn.querySelector('.reel-action-dropdown');
+          if (existingDropdown) {
+            existingDropdown.remove();
+          } else {
+            // Close any other open dropdowns
+            document.querySelectorAll('.reel-action-dropdown').forEach(d => d.remove());
+            
+            // Check current fullscreen state
+            const isCurrentlyFullscreen = document.fullscreenElement === card || document.webkitFullscreenElement === card;
+            
+            // Create dropdown menu
+            const dropdown = document.createElement('div');
+            dropdown.className = 'reel-action-dropdown';
+            dropdown.style.cssText = `position: absolute; bottom: 48px; right: 0; background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; padding: 6px; display: flex; flex-direction: column; gap: 4px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 100; min-width: 140px;`;
+            
+            dropdown.innerHTML = `
+              <button class="menu-item copy-link" style="background: none; border: none; color: white; padding: 8px 12px; border-radius: 8px; font-size: 12px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 500; transition: background 0.15s; width: 100%; box-sizing: border-box;"><i data-lucide="copy" style="width: 13px; height: 13px; stroke: white;"></i> Copy Link</button>
+              <button class="menu-item toggle-fullscreen" style="background: none; border: none; color: white; padding: 8px 12px; border-radius: 8px; font-size: 12px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 500; transition: background 0.15s; width: 100%; box-sizing: border-box;"><i data-lucide="${isCurrentlyFullscreen ? 'minimize' : 'maximize'}" style="width: 13px; height: 13px; stroke: white;"></i> ${isCurrentlyFullscreen ? 'Exit Full Screen' : 'Full Screen'}</button>
+              <button class="menu-item toggle-autoplay" style="background: none; border: none; color: white; padding: 8px 12px; border-radius: 8px; font-size: 12px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 500; transition: background 0.15s; width: 100%; box-sizing: border-box;"><i data-lucide="play-circle" style="width: 13px; height: 13px; stroke: white;"></i> Autoplay${window.reelsAutoplay ? ' ✓' : ''}</button>
+            `;
+            
+            moreBtn.appendChild(dropdown);
+            if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+            
+            // 1. Copy Link Click
+            const copyLinkBtn = dropdown.querySelector('.copy-link');
+            if (copyLinkBtn) {
+              copyLinkBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                ev.preventDefault();
+                dropdown.remove();
+                copyReelLink(reelId);
+              });
+            }
+            
+            // 2. Full Screen Click
+            const fsBtn = dropdown.querySelector('.toggle-fullscreen');
+            if (fsBtn) {
+              fsBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                ev.preventDefault();
+                dropdown.remove();
+                if (isCurrentlyFullscreen) {
+                  exitReelFullscreen();
+                } else {
+                  requestReelFullscreen(card);
+                }
+              });
+            }
+            
+            // 3. Autoplay Click
+            const apBtn = dropdown.querySelector('.toggle-autoplay');
+            if (apBtn) {
+              apBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                ev.preventDefault();
+                dropdown.remove();
+                window.reelsAutoplay = !window.reelsAutoplay;
+                syncAutoplayLoopState();
+                const status = window.reelsAutoplay ? 'enabled ✓' : 'disabled';
+                showToast(`Autoplay ${status}`);
+              });
+            }
+          }
+        });
+      }
     });
   }
 
+  // Close all reels action dropdowns on clicking outside
+  document.addEventListener('click', (e) => {
+    const openDropdowns = document.querySelectorAll('.reel-action-dropdown');
+    openDropdowns.forEach(dropdown => {
+      if (!dropdown.closest('.reel-more-sim')?.contains(e.target)) {
+        dropdown.remove();
+      }
+    });
+  });
+
   // --- USER PROFILE LOADER SYSTEM ---
-  async function loadUserProfile(userId) {
+  let currentProfileRequestId = 0;
+
+  async function loadUserProfile(targetUserIdInput) {
+    const requestId = ++currentProfileRequestId;
     const currentUserStr = localStorage.getItem('invibeUser');
     if (!currentUserStr) return;
     const currentUser = JSON.parse(currentUserStr);
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
     const localPhoto = localStorage.getItem('invibeProfileImage');
-    const isMe = (!userId || userId === 'me' || userId === currentUser.id || userId === currentUser._id || userId === currentUser.username);
 
-    // Immediately set UI to user's profile info (no loading placeholders)
+    const cleanInputId = getUserIdentifier(targetUserIdInput);
+    const isMe = (!cleanInputId || cleanInputId === 'me' || cleanInputId === currentUserId || cleanInputId === currentUser.username);
+
+    // Track active profile viewing ID in global state
+    state.viewingProfileUserId = isMe ? currentUserId : cleanInputId;
+
     const profileAvatar = document.querySelector('.profile-screen-avatar');
-    if (profileAvatar) profileAvatar.src = isMe ? (localPhoto || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80') : 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
-
     const profileName = document.querySelector('.profile-summary-top h3');
-    if (profileName) profileName.innerHTML = isMe ? (currentUser.fullName || currentUser.username) : 'Hubber Profile';
-
     const profileHandle = document.querySelector('.profile-screen-handle');
-    if (profileHandle) profileHandle.textContent = '@' + (isMe ? (currentUser.username || 'user') : (userId || 'user'));
-
     const profileBio = document.getElementById('profile-bio-text');
-    if (profileBio) profileBio.textContent = 'Hubber creator on Hi-Hubble 🚀';
-
     const followBtn = document.getElementById('profile-follow-btn');
     const optionsList = document.querySelector('.profile-options-list');
     const logoutBtn = document.getElementById('profile-logout-btn');
+    const followersCount = document.getElementById('profile-followers-count');
+    const followingCount = document.getElementById('profile-following-count');
+    const vibesCount = document.getElementById('profile-vibes-count');
+    const vibesGrid = document.getElementById('profile-vibes-grid');
+    const reelsGrid = document.getElementById('profile-reels-grid');
+    const taggedGrid = document.getElementById('profile-tagged-grid');
+    const savedTabBtn = document.querySelector('.profile-content-tab[data-profile-tab="saved"]');
+    const vibesTabBtn = document.querySelector('.profile-content-tab[data-profile-tab="vibes"]');
+    const savedGrid = document.getElementById('profile-saved-grid');
 
+    // Handle Own Profile vs Other User UI Elements Visibility
     if (isMe) {
       if (followBtn) followBtn.style.display = 'none';
       if (optionsList) optionsList.style.display = 'grid';
       if (logoutBtn) logoutBtn.style.display = 'block';
+      if (savedTabBtn) savedTabBtn.style.display = '';
+
+      // Initialize UI with current local profile data for instant responsiveness
+      if (profileAvatar) profileAvatar.src = localPhoto || currentUser.profileImage || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80';
+      if (profileName) profileName.innerHTML = escapeHtml(currentUser.fullName || currentUser.username || 'User');
+      if (profileHandle) profileHandle.textContent = '@' + (currentUser.username || 'user');
+      if (profileBio) profileBio.textContent = currentUser.bio || 'Hubber creator on Hi-Hubble 🚀';
     } else {
+      if (optionsList) optionsList.style.display = 'none';
+      if (logoutBtn) logoutBtn.style.display = 'none';
+      if (savedTabBtn) savedTabBtn.style.display = 'none';
+      if (savedGrid) savedGrid.classList.remove('active');
+
+      // Make sure active tab is not saved tab when viewing other users
+      if (vibesTabBtn && !vibesTabBtn.classList.contains('active') && savedGrid?.classList.contains('active')) {
+        document.querySelectorAll('.profile-content-tab').forEach(b => b.classList.remove('active'));
+        vibesTabBtn.classList.add('active');
+        if (vibesGrid) vibesGrid.classList.add('active');
+      }
+
       if (followBtn) {
         followBtn.style.display = 'block';
-        followBtn.setAttribute('data-user-id', user._id);
+        followBtn.setAttribute('data-user-id', cleanInputId);
         followBtn.classList.remove('followed');
         followBtn.textContent = 'Follow';
       }
-      if (optionsList) optionsList.style.display = 'none';
-      if (logoutBtn) logoutBtn.style.display = 'none';
+
+      // Show clean loading state while fetching other user
+      if (profileName) profileName.innerHTML = '<span style="opacity: 0.6;">Loading...</span>';
+      if (profileHandle) profileHandle.textContent = '@' + (cleanInputId && cleanInputId.startsWith('@') ? cleanInputId.slice(1) : (cleanInputId || 'user'));
+      if (profileBio) profileBio.textContent = '';
+      if (profileAvatar) profileAvatar.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
     }
 
-    let user = {
-      _id: isMe ? (currentUser.id || currentUser._id || 'me') : userId,
-      username: isMe ? (currentUser.username || 'haribol') : (userId || 'user'),
-      fullName: isMe ? (currentUser.fullName || currentUser.username || 'haribol') : (userId || 'user'),
-      profileImage: isMe ? (localPhoto || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80') : 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80',
-      bio: 'Hubber creator on Hi-Hubble 🚀',
-      followersCount: 0,
-      followingCount: 0
-    };
+    // Set initial loading placeholders for grids
+    if (vibesGrid) vibesGrid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px;">Loading hubs... 📸</div>';
+    if (taggedGrid) taggedGrid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px;">Loading tagged reels... 🏷️</div>';
+    if (reelsGrid) reelsGrid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px;">Loading reels... 🎥</div>';
 
-    let posts = [];
-    let reels = [];
+    const targetQueryId = isMe ? (currentUser.id || currentUser._id || currentUser.username) : cleanInputId;
 
-    // Try fetching remote API if available
     try {
       const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
-      const targetId = isMe ? (currentUser.id || currentUser._id || currentUser.username) : userId;
-      if (targetId) {
-        const path = `/api/users/${targetId}/profile`;
-        let res;
-        try {
-          res = await fetch(path, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
-        } catch (_) {
-          res = await fetch(`${API_URL}${path}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
-        }
-        if (res && res.ok) {
-          const data = await res.json();
-          if (data.user) {
-            user = { ...user, ...data.user };
-            
-            // Dynamically refresh the profile details with actual database fields
-            if (profileAvatar) profileAvatar.src = user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
-            if (profileName) profileName.innerHTML = user.fullName || user.username || 'Hubber Profile';
-            if (profileHandle) profileHandle.textContent = '@' + (user.username || 'user');
-            if (profileBio) profileBio.textContent = user.bio || 'Hubber creator on Hi-Hubble 🚀';
+      const res = await fetch(`${API_URL}/api/users/${encodeURIComponent(targetQueryId)}/profile`, {
+        headers: token ? { 'Authorization': `Bearer ${token}` } : {}
+      });
 
-            if (!isMe && followBtn) {
-              followBtn.setAttribute('data-user-id', user._id);
-              if (user.isFollowing) {
-                followBtn.classList.add('followed');
-                followBtn.textContent = 'Hubbies';
-              } else if (user.isPending) {
-                followBtn.classList.add('followed');
-                followBtn.textContent = 'Requested';
-              } else {
-                followBtn.classList.remove('followed');
-                followBtn.textContent = 'Follow';
-              }
-            }
-          }
-          if (Array.isArray(data.posts)) posts = data.posts;
-          if (Array.isArray(data.reels)) reels = data.reels;
+      // Guard against race conditions: ignore response if user navigated to another profile while waiting
+      if (requestId !== currentProfileRequestId) {
+        console.log(`[Profile Navigation] Ignored stale profile response for request #${requestId}`);
+        return;
+      }
+
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error('Received non-JSON response from server. Please check connection.');
+      }
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Failed to load profile (Status ${res.status})`);
+      }
+
+      const data = await res.json();
+      if (!data || !data.user) {
+        throw new Error('User profile data not found.');
+      }
+
+      const u = data.user;
+      const posts = Array.isArray(data.posts) ? data.posts : [];
+      const reels = Array.isArray(data.reels) ? data.reels : [];
+
+      // Render profile header details
+      if (profileAvatar) {
+        profileAvatar.src = u.profileImage || (isMe ? (localPhoto || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80') : 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80');
+      }
+      if (profileName) {
+        profileName.innerHTML = escapeHtml(u.fullName || u.username || (isMe ? 'My Profile' : 'Hubber'));
+      }
+      if (profileHandle) {
+        profileHandle.textContent = '@' + (u.username || 'user');
+      }
+      if (profileBio) {
+        profileBio.textContent = u.bio || 'Hubber creator on Hi-Hubble 🚀';
+      }
+
+      // Render stats
+      if (followersCount) followersCount.textContent = formatCount(u.followersCount || 0);
+      if (followingCount) followingCount.textContent = formatCount(u.followingCount || 0);
+      if (vibesCount) vibesCount.textContent = formatCount(u.postsCount !== undefined ? u.postsCount : posts.length);
+
+      // Setup follow button for other users
+      if (!isMe && followBtn) {
+        followBtn.style.display = 'block';
+        followBtn.setAttribute('data-user-id', u._id || u.id);
+        if (u.isFollowing) {
+          followBtn.classList.add('followed');
+          followBtn.textContent = 'Hubbies';
+        } else if (u.isPending) {
+          followBtn.classList.add('followed');
+          followBtn.textContent = 'Requested';
+        } else {
+          followBtn.classList.remove('followed');
+          followBtn.textContent = 'Follow';
         }
       }
-    } catch (netErr) {
-      console.warn("Network profile load notice:", netErr.message);
-    }
 
-    // Update follow statistics & YOUR HUBS post count
-    const followersCount = document.getElementById('profile-followers-count');
-    const followingCount = document.getElementById('profile-following-count');
-    const vibesCount = document.getElementById('profile-vibes-count');
-    if (followersCount) followersCount.textContent = formatCount(user.followersCount || 0);
-    if (followingCount) followingCount.textContent = formatCount(user.followingCount || 0);
-    if (vibesCount) vibesCount.textContent = formatCount(user.postsCount !== undefined ? user.postsCount : posts.length);
-
-    // Render posts grid (Vibes Gallery)
-    const vibesGrid = document.getElementById('profile-vibes-grid');
-    if (vibesGrid) {
-      vibesGrid.innerHTML = '';
-      if (!posts || posts.length === 0) {
-        vibesGrid.innerHTML = '<div class="profile-grid-empty">No hubs shared yet. 📸</div>';
-      } else {
-        posts.forEach(post => {
-          const item = document.createElement('div');
-          item.className = 'profile-grid-item';
-          item.style.cursor = 'pointer';
-          item.innerHTML = `
-            <img src="${post.mediaUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=800&q=80'}" alt="Hub" />
-            <div class="profile-grid-item-overlay">
-              <span><i data-lucide="heart"></i> ${(post.likes || []).length}</span>
-              <span><i data-lucide="message-square"></i> ${(post.comments || []).length}</span>
-            </div>
-          `;
-          item.addEventListener('click', () => {
-            openProfilePostViewer(post);
+      // Render Posts Grid
+      if (vibesGrid) {
+        vibesGrid.innerHTML = '';
+        if (posts.length === 0) {
+          vibesGrid.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 13.5px;">No hubs shared yet. 📸</div>';
+        } else {
+          posts.forEach(post => {
+            const item = document.createElement('div');
+            item.className = 'profile-grid-item';
+            item.style.cursor = 'pointer';
+            item.innerHTML = `
+              <img src="${post.mediaUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=800&q=80'}" alt="Hub" />
+              <div class="profile-grid-item-overlay">
+                <span><i data-lucide="heart"></i> ${(post.likes || []).length}</span>
+                <span><i data-lucide="message-square"></i> ${(post.comments || []).length}</span>
+              </div>
+            `;
+            item.addEventListener('click', () => openProfilePostViewer(post));
+            vibesGrid.appendChild(item);
           });
-          vibesGrid.appendChild(item);
-        });
+        }
       }
-    }
 
-    // Render reels grid (Reels Gallery)
-    const reelsGrid = document.getElementById('profile-reels-grid');
-    if (reelsGrid) {
-      reelsGrid.innerHTML = '';
-      if (!reels || reels.length === 0) {
-        reelsGrid.innerHTML = '<div class="profile-grid-empty">No reels uploaded yet. 🎥</div>';
-      } else {
-        reels.forEach(reel => {
-          const item = document.createElement('div');
-          item.className = 'profile-grid-item';
-          item.innerHTML = `
-            <video src="${reel.videoUrl}" muted loop></video>
-            <div class="profile-grid-item-overlay">
-              <span><i data-lucide="heart"></i> ${(reel.likes || []).length}</span>
-            </div>
-          `;
-          const video = item.querySelector('video');
-          item.addEventListener('mouseenter', () => video.play());
-          item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
-          reelsGrid.appendChild(item);
-        });
+      // Render Reels Grid
+      if (reelsGrid) {
+        reelsGrid.innerHTML = '';
+        if (reels.length === 0) {
+          reelsGrid.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 13.5px;">No reels uploaded yet. 🎥</div>';
+        } else {
+          reels.forEach(reel => {
+            const item = document.createElement('div');
+            item.className = 'profile-grid-item';
+            item.style.cursor = 'pointer';
+            item.innerHTML = `
+              <video src="${reel.videoUrl}" muted loop playsinline></video>
+              <div class="profile-grid-item-overlay">
+                <span><i data-lucide="heart"></i> ${(reel.likes || []).length}</span>
+              </div>
+            `;
+            const video = item.querySelector('video');
+            if (video) {
+              item.addEventListener('mouseenter', () => video.play().catch(() => {}));
+              item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
+            }
+            reelsGrid.appendChild(item);
+          });
+        }
       }
-    }
 
-    debouncedCreateIcons();
+      // Render Tagged Reels Grid
+      if (taggedGrid) {
+        taggedGrid.innerHTML = '';
+        const taggedReels = data.taggedReels || [];
+        if (taggedReels.length === 0) {
+          taggedGrid.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 13.5px;">No tagged reels yet. 🏷️</div>';
+        } else {
+          taggedReels.forEach(reel => {
+            const item = document.createElement('div');
+            item.className = 'profile-grid-item';
+            item.style.cursor = 'pointer';
+            item.innerHTML = `
+              <video src="${reel.videoUrl}" muted loop playsinline></video>
+              <div class="profile-grid-item-overlay">
+                <span><i data-lucide="heart"></i> ${(reel.likes || []).length}</span>
+              </div>
+            `;
+            const video = item.querySelector('video');
+            if (video) {
+              item.addEventListener('mouseenter', () => video.play().catch(() => {}));
+              item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
+            }
+            taggedGrid.appendChild(item);
+          });
+        }
+      }
+
+      debouncedCreateIcons();
+    } catch (err) {
+      if (requestId !== currentProfileRequestId) return;
+      console.error('[loadUserProfile Error]:', err);
+      if (profileName) profileName.innerHTML = `<span style="color: var(--error-color, #ef4444); font-size: 15px;">Unable to load profile</span>`;
+      if (profileBio) profileBio.textContent = err.message || 'Could not retrieve user details. Please check connection.';
+      if (vibesGrid) vibesGrid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 30px; color: var(--error-color, #ef4444); font-size: 13px;">Unable to load posts.</div>`;
+      if (reelsGrid) reelsGrid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 30px; color: var(--error-color, #ef4444); font-size: 13px;">Unable to load reels.</div>`;
+    }
   }
 
-  // --- PROFILE POST VIEWER MODAL SYSTEM (CHANGE 1) ---
+  // --- PROFILE POST VIEWER MODAL SYSTEM ---
   const profilePostViewerModal = document.getElementById('profile-post-viewer-modal');
   const profilePostViewerCloseBtn = document.getElementById('profile-post-viewer-close-btn');
   const profilePostViewerContent = document.getElementById('profile-post-viewer-content');
@@ -8138,15 +12882,31 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const currentUserStr = localStorage.getItem('invibeUser');
     const currentUser = currentUserStr ? JSON.parse(currentUserStr) : null;
-    const isLikedByMe = currentUser ? post.likes.includes(currentUser.id) : false;
+    const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+    const isLikedByMe = currentUser ? (post.likes || []).includes(currentUserId) : false;
+    const postAuthorId = getUserIdentifier(post.author);
+    const postAuthorUsername = (post.author?.username || '').toLowerCase();
+    const isMe = !!(currentUserId && (currentUserId.toString() === (postAuthorId || '').toString() || (currentUser?.username && currentUser.username.toLowerCase() === postAuthorUsername)));
+    const localUserAvatar = localStorage.getItem('invibeProfileImage') || currentUser?.profileImage;
+
+    const resolvedAuthorAvatar = (isMe && localUserAvatar)
+      ? localUserAvatar
+      : (post.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
 
     let commentsHTML = '';
-    post.comments.forEach(comment => {
+    (post.comments || []).forEach(comment => {
+      const commentAuthorId = getUserIdentifier(comment.author) || comment.author_id || '';
+      const commentUsername = (comment.author?.username || '').toLowerCase();
+      const isCommentMe = !!(currentUserId && (currentUserId.toString() === commentAuthorId.toString() || (currentUser?.username && currentUser.username.toLowerCase() === commentUsername)));
+      const resolvedCommentAvatar = (isCommentMe && localUserAvatar)
+        ? localUserAvatar
+        : (comment.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
+
       commentsHTML += `
         <div class="comment-item" style="display: flex; gap: 8px; margin-bottom: 8px; font-size: 13px;">
-          <img src="${comment.author.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80'}" alt="" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover;" />
+          <img src="${resolvedCommentAvatar}" alt="" class="comment-author-avatar" data-user-id="${commentAuthorId}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; cursor: pointer;" />
           <div>
-            <strong style="color: var(--text-color); margin-right: 4px;">${comment.author.username}</strong>
+            <strong class="comment-author-name" data-user-id="${commentAuthorId}" style="color: var(--text-color); margin-right: 4px; cursor: pointer;">${comment.author?.username || 'user'}</strong>
             <span style="color: var(--text-muted);">${comment.text}</span>
           </div>
         </div>
@@ -8156,10 +12916,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const cardHTML = `
       <article class="feed-card" id="post-${post._id}">
         <div class="post-header">
-          <div class="post-author-info">
-            <img src="${post.author.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80'}" alt="${post.author.fullName}" class="author-avatar" />
+          <div class="post-author-info" style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+            <img src="${resolvedAuthorAvatar}" alt="${post.author?.fullName || 'User'}" class="author-avatar" />
             <div>
-              <h4 class="author-name">${post.author.fullName}</h4>
+              <h4 class="author-name">${post.author?.fullName || post.author?.username || 'User'}</h4>
               <div class="post-meta" style="display: flex; align-items: center; gap: 6px;">
                 <span class="post-time">${new Date(post.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 <span class="dot-separator">•</span>
@@ -8174,7 +12934,7 @@ document.addEventListener('DOMContentLoaded', () => {
               </div>
             </div>
           </div>
-          <button class="post-options-btn" data-post-id="${post._id}" data-author-id="${post.author._id || post.author}"><i data-lucide="more-horizontal"></i></button>
+          <button class="post-options-btn" data-post-id="${post._id}" data-author-id="${postAuthorId || ''}"><i data-lucide="more-horizontal"></i></button>
         </div>
 
         <div class="post-media-container" style="position:relative; overflow:hidden; border-radius: 12px; margin: 12px 0;">
@@ -8199,7 +12959,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 `).join('')}
               </div>
               
-              <!-- Bottom Controls with chevrons beside the dots -->
               <div class="carousel-controls-bottom" style="position: absolute; bottom: 12px; left: 0; right: 0; display: flex; justify-content: center; align-items: center; gap: 12px; z-index: 5;">
                 <button class="carousel-nav-btn prev-btn" onclick="this.parentNode.parentNode.querySelector('.post-carousel-slides').scrollBy({left: -this.parentNode.parentNode.clientWidth, behavior: 'smooth'})" style="background: rgba(0,0,0,0.5); border: none; border-radius: 50%; width: 22px; height: 22px; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; font-weight: bold; outline: none; transition: all 0.2s ease;">‹</button>
                 
@@ -8227,7 +12986,6 @@ document.addEventListener('DOMContentLoaded', () => {
         )
       }
 
-          <!-- Speaker Overlay Button (if musicUrl is present) -->
           ${(() => {
         const musicUrl = getPostMusicUrl(post);
         return musicUrl ? `
@@ -8240,11 +12998,11 @@ document.addEventListener('DOMContentLoaded', () => {
           <div class="post-engagement-actions">
             <div class="engagement-item like-btn-action ${isLikedByMe ? 'liked' : ''}" data-post-id="${post._id}">
               <button class="action-circle-btn heart-btn"><i data-lucide="heart" style="${isLikedByMe ? 'fill:#8b5cf6; stroke:#8b5cf6;' : ''}"></i></button>
-              <span class="action-count">${post.likes.length}</span>
+              <span class="action-count">${(post.likes || []).length}</span>
             </div>
             <div class="engagement-item comment-btn-action" data-post-id="${post._id}">
               <button class="action-circle-btn"><i data-lucide="message-circle"></i></button>
-              <span class="action-count">${post.comments.length}</span>
+              <span class="action-count">${(post.comments || []).length}</span>
             </div>
             <div class="engagement-item share-btn-action" data-post-id="${post._id}">
               <button class="action-circle-btn"><i data-lucide="send"></i></button>
@@ -8256,15 +13014,16 @@ document.addEventListener('DOMContentLoaded', () => {
         </div>
 
         <div class="post-details">
-          <p class="post-caption"><strong class="author-username" style="margin-right: 8px;">${post.author.username}</strong>${post.caption}</p>
+          <p class="post-caption"><strong class="author-username" style="margin-right: 8px; cursor: pointer;">${post.author?.username || 'user'}</strong>${post.caption}</p>
           
           <div class="comments-section" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
             <div class="comments-list" id="comments-list-${post._id}">
               ${commentsHTML}
             </div>
             
-            <div class="post-comment-input-area" style="display: flex; gap: 8px; margin-top: 12px;">
-              <input type="text" placeholder="Write a comment and press Enter..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 16px; color: var(--text-color); font-size: 13px;" />
+            <div class="post-comment-input-area" style="display: flex; align-items: center; gap: 8px; margin-top: 12px; position: relative;">
+              <input type="text" placeholder="Write a comment..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 40px 8px 16px; color: var(--text-color); font-size: 13px;" />
+              <button class="comment-post-btn" data-post-id="${post._id}" style="position: absolute; right: 8px; background: none; border: none; color: var(--primary, #a855f7); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 6px; transition: transform 0.2s;"><i data-lucide="send" style="width: 16px; height: 16px;"></i></button>
             </div>
           </div>
         </div>
@@ -8275,6 +13034,28 @@ document.addEventListener('DOMContentLoaded', () => {
     profilePostViewerModal.classList.add('active');
 
     debouncedCreateIcons();
+
+    // Wire post author clicks to navigate to profile
+    const authorEl = profilePostViewerContent.querySelector('.post-author-info, .author-username');
+    if (authorEl && postAuthorId) {
+      authorEl.addEventListener('click', () => {
+        profilePostViewerModal.classList.remove('active');
+        switchView('profile', postAuthorId);
+      });
+    }
+
+    // Wire comment author clicks to navigate to profile
+    const commentUserEls = profilePostViewerContent.querySelectorAll('.comment-author-avatar, .comment-author-name');
+    commentUserEls.forEach(el => {
+      const cUid = el.getAttribute('data-user-id');
+      if (cUid) {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          profilePostViewerModal.classList.remove('active');
+          switchView('profile', cUid);
+        });
+      }
+    });
 
     // Wire up like button
     const likeBtn = profilePostViewerContent.querySelector('.like-btn-action');
@@ -8308,8 +13089,6 @@ document.addEventListener('DOMContentLoaded', () => {
         showToast('Share link copied! 🔗');
       });
     }
-
-    // Posted via Enter key only (send button removed)
 
     // Wire up comment input enter key
     const commentInput = profilePostViewerContent.querySelector('.comment-input-field');
@@ -8363,7 +13142,7 @@ document.addEventListener('DOMContentLoaded', () => {
           muteIcon.setAttribute('data-lucide', 'volume-2');
         } else {
           video.muted = true;
-          muteIcon.setAttribute('data-lucide', 'volume-2');
+          muteIcon.setAttribute('data-lucide', 'volume-x');
         }
         debouncedCreateIcons();
       });
@@ -8427,10 +13206,12 @@ document.addEventListener('DOMContentLoaded', () => {
       const vibesGrid = document.getElementById('profile-vibes-grid');
       const reelsGrid = document.getElementById('profile-reels-grid');
       const savedGrid = document.getElementById('profile-saved-grid');
+      const taggedGrid = document.getElementById('profile-tagged-grid');
 
       if (vibesGrid) vibesGrid.classList.remove('active');
       if (reelsGrid) reelsGrid.classList.remove('active');
       if (savedGrid) savedGrid.classList.remove('active');
+      if (taggedGrid) taggedGrid.classList.remove('active');
 
       if (tabName === 'vibes') {
         if (vibesGrid) vibesGrid.classList.add('active');
@@ -8441,49 +13222,273 @@ document.addEventListener('DOMContentLoaded', () => {
           savedGrid.classList.add('active');
           renderSavedHubbs();
         }
+      } else if (tabName === 'tagged') {
+        if (taggedGrid) taggedGrid.classList.add('active');
       }
     });
   });
 
+  window.renderSavedHubbs = renderSavedHubbs;
+  async function renderSavedHubbs() {
+    const savedGrid = document.getElementById('profile-saved-grid');
+      if (!savedGrid) return;
+
+      if (typeof window.fetchSavedHubbs === 'function') {
+        await window.fetchSavedHubbs();
+      }
+
+      if (!window.activeSavedFilter) {
+        window.activeSavedFilter = 'posts';
+      }
+
+      let wrapper = savedGrid.querySelector('.saved-hubbs-wrapper');
+      if (!wrapper) {
+        savedGrid.innerHTML = `
+          <div class="saved-hubbs-wrapper" style="grid-column: 1 / -1; width: 100%; display: flex; flex-direction: column; gap: 16px;">
+            <!-- Header -->
+            <div class="saved-hubbs-header" style="margin-bottom: 8px;">
+              <h3 style="font-size: 1.3rem; font-weight: 700; color: var(--text-main); margin: 0 0 4px 0;">Saved Hubbs</h3>
+              <p style="font-size: 0.85rem; color: var(--text-muted); margin: 0;">All your saved posts and reels in one place.</p>
+            </div>
+            
+            <!-- Filter tabs -->
+            <div class="saved-hubbs-filters" style="display: flex; gap: 10px; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 12px; align-items: center;">
+              <button class="ex-tab-pill" id="saved-filter-posts" style="padding: 6px 16px; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px;">
+                <i data-lucide="image" style="width: 14px; height: 14px;"></i> Posts
+              </button>
+              <button class="ex-tab-pill" id="saved-filter-reels" style="padding: 6px 16px; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px;">
+                <i data-lucide="video" style="width: 14px; height: 14px;"></i> Hubbing
+              </button>
+            </div>
+
+            <!-- Content Areas -->
+            <div id="saved-posts-container" class="profile-grid" style="display: none; grid-template-columns: repeat(3, 1fr); gap: 8px; width: 100%;"></div>
+            <div id="saved-reels-container" class="reels-panel" style="display: none; width: 100%; flex-direction: column; align-items: center;">
+              <div class="reels-scroller" style="width: 100%; max-width: 100%; height: auto; overflow: visible; padding-bottom: 0; display: flex; flex-direction: column; align-items: center; gap: 24px;"></div>
+            </div>
+          </div>
+        `;
+        
+        wrapper = savedGrid.querySelector('.saved-hubbs-wrapper');
+
+        const postsBtn = wrapper.querySelector('#saved-filter-posts');
+        const reelsBtn = wrapper.querySelector('#saved-filter-reels');
+
+        postsBtn.addEventListener('click', () => {
+          window.activeSavedFilter = 'posts';
+          renderSavedHubbs();
+        });
+
+        reelsBtn.addEventListener('click', () => {
+          window.activeSavedFilter = 'reels';
+          renderSavedHubbs();
+        });
+      }
+
+      const postsBtn = wrapper.querySelector('#saved-filter-posts');
+      const reelsBtn = wrapper.querySelector('#saved-filter-reels');
+      const postsContainer = wrapper.querySelector('#saved-posts-container');
+      const reelsContainer = wrapper.querySelector('#saved-reels-container');
+      const reelsScroller = reelsContainer.querySelector('.reels-scroller');
+
+      if (window.activeSavedFilter === 'posts') {
+        postsBtn.classList.add('active');
+        reelsBtn.classList.remove('active');
+        postsContainer.style.display = 'grid';
+        reelsContainer.style.display = 'none';
+
+        postsContainer.innerHTML = '';
+        const savedPosts = (window.savedHubbs || []).filter(item => !item.isReel);
+        
+        if (savedPosts.length === 0) {
+          postsContainer.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved posts yet.</div>';
+        } else {
+          savedPosts.forEach(post => {
+            const item = document.createElement('div');
+            item.className = 'profile-grid-item';
+            item.style.cursor = 'pointer';
+            item.innerHTML = `
+              <img src="${post.mediaUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=800&q=80'}" alt="Hub" />
+              <div class="profile-grid-item-overlay">
+                <span><i data-lucide="heart"></i> ${(post.likes || []).length}</span>
+                <span><i data-lucide="message-square"></i> ${(post.comments || []).length}</span>
+              </div>
+            `;
+            item.addEventListener('click', () => {
+              openProfilePostViewer(post);
+            });
+            postsContainer.appendChild(item);
+          });
+        }
+      } else {
+        postsBtn.classList.remove('active');
+        reelsBtn.classList.add('active');
+        postsContainer.style.display = 'none';
+        reelsContainer.style.display = 'flex';
+
+        reelsScroller.innerHTML = '';
+        const savedReels = (window.savedHubbs || []).filter(item => item.isReel);
+
+        if (savedReels.length === 0) {
+          reelsScroller.innerHTML = '<div class="profile-grid-empty" style="text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved reels yet.</div>';
+        } else {
+          savedReels.forEach(reel => {
+            const authorName = reel.author ? (reel.author.fullName || reel.author.username || 'Hubble User') : 'Hubble User';
+            const authorUser = reel.author ? (reel.author.username || 'hubble_user') : 'hubble_user';
+            const authorAvatar = reel.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
+
+            const captionText = reel.caption || '';
+            const captionHtml = captionText.replace(/#(\w+)/g, '<span style="color:#c084fc; font-weight:600;">#$1</span>');
+            const isReelSaved = true;
+
+            const card = document.createElement('div');
+            card.className = 'reel-card';
+            card.setAttribute('data-reel-id', reel._id || reel.id);
+            card.style.cssText = `position: relative; width: 100%; height: 640px; margin: 0 auto 24px auto; border-radius: 18px; overflow: hidden; background: #000; box-shadow: 0 12px 35px rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.12); box-sizing: border-box;`;
+
+            card.innerHTML = `
+              <video data-src="${reel.videoUrl}" loop muted playsinline preload="none" class="reel-video" style="width:100%; height:100%; object-fit:cover; display:block;"></video>
+              
+              <div class="reel-play-icon-overlay" style="cursor: pointer; z-index: 4;">
+                <i data-lucide="play" style="width:30px; height:30px; color:white; opacity:0.9;"></i>
+              </div>
+              
+              <div class="double-tap-heart"><i data-lucide="heart"></i></div>
+
+              <div class="reel-overlay" style="position:absolute; inset:0; background: linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.15) 50%, rgba(0,0,0,0.3) 100%); display:flex; justify-content:space-between; align-items:flex-end; padding:20px; box-sizing:border-box; z-index:5;">
+                
+                <div class="reel-left-info" style="display:flex; flex-direction:column; gap:10px; max-width:72%; position:relative; z-index:7;">
+                  <div class="reel-user" style="display:flex; align-items:center; gap:8px;">
+                    <img src="${authorAvatar}" alt="${authorName}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:2px solid #a855f7;" />
+                    <div style="display:flex; flex-direction:column; gap:2px;">
+                      <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="color:white; font-size:13px; font-weight:600;">@${authorUser}</span>
+                        <strong class="reel-follow-btn" data-author-id="${reel.author?._id || reel.author?.id || ''}" style="color:white; font-size:11px; cursor:pointer; background:linear-gradient(135deg, #a855f7 0%, #ec4899 100%); padding:3px 10px; border-radius:12px; font-weight:600;">Follow</strong>
+                      </div>
+                      ${reel.location ? `
+                        <div class="reel-location-badge" style="display:flex; align-items:center; gap:4px; color:rgba(255,255,255,0.7); font-size:10.5px;">
+                          <i data-lucide="map-pin" style="width:10px; height:10px; color:#ec4899;"></i>
+                          <span>${reel.location}</span>
+                        </div>
+                      ` : ''}
+                    </div>
+                  </div>
+                  <p class="reel-caption" style="color:white; font-size:13px; margin:0; line-height:1.4;">${captionHtml}</p>
+                  <div class="reel-music" style="display:flex; align-items:center; gap:6px; color:rgba(255,255,255,0.8); font-size:11px;">
+                    <i data-lucide="music" style="width:12px; height:12px;" class="music-icon-spin"></i> <span>${reel.audioTrackName || ('Original Audio - ' + authorUser)}</span>
+                  </div>
+                </div>
+                
+                <div class="reel-right-actions" style="display:flex; flex-direction:column; gap:14px; align-items:center; position:relative; z-index:7;">
+                  <div class="reel-actions-capsule" style="background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(12px); border-radius: 36px; padding: 18px 8px; border: 1px solid rgba(255,255,255,0.12); display: flex; flex-direction: column; gap: 18px; align-items: center; box-shadow: 0 10px 30px rgba(0,0,0,0.4);">
+                    
+                    <!-- 1. Like -->
+                    <div class="reel-action-btn reel-like-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                      <button class="action-circle-btn heart-btn ${reel.isLiked ? 'liked' : ''}" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                        <i data-lucide="heart" style="${reel.isLiked ? 'fill:#8b5cf6; stroke:#8b5cf6;' : ''}"></i>
+                      </button>
+                      <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedLikes || reel.likeCount || '0'}</span>
+                    </div>
+
+                    <!-- 2. Comment -->
+                    <div class="reel-action-btn reel-comment-sim" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                      <button class="action-circle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                        <i data-lucide="message-circle"></i>
+                      </button>
+                      <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedComments || reel.commentCount || '0'}</span>
+                    </div>
+
+                    <!-- 3. Share -->
+                    <div class="reel-action-btn reel-share-sim" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                      <button class="action-circle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                        <i data-lucide="send"></i>
+                      </button>
+                      <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${reel.formattedShares || reel.shareCount || '0'}</span>
+                    </div>
+
+                    <!-- 4. Save/Bookmark -->
+                    <div class="reel-action-btn reel-save-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+                      <button class="action-circle-btn star-btn saved" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                        <i data-lucide="bookmark" style="fill:#FBBF24; stroke:#FBBF24;"></i>
+                      </button>
+                    </div>
+
+                    <!-- 5. Sound / Audio Mute Toggle -->
+                    <div class="reel-action-btn reel-audio-action" data-reel-id="${reel._id || reel.id}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;" title="Toggle Audio">
+                      <button class="action-circle-btn reel-audio-toggle-btn" style="background:none; border:none; color:white; width:40px; height:40px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+                        <i data-lucide="${window.reelsMuted === false ? 'volume-2' : 'volume-x'}"></i>
+                      </button>
+                    </div>
+                  </div>
+
+                  <!-- 5. More Options -->
+                  <div class="reel-action-btn reel-more-sim" data-reel-id="${reel._id || reel.id}">
+                    <button class="action-circle-btn" style="width:40px; height:40px; border-radius:50%; background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.15); display:flex; align-items:center; justify-content:center; color:white; cursor:pointer;">
+                      <i data-lucide="more-horizontal"></i>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Bottom navigation zone overlays the bottom area of the reel -->
+              <div class="reel-bottom-navigation-zone" style="position: absolute; bottom: 0; left: 0; right: 0; height: 50px; z-index: 6; cursor: pointer;"></div>
+
+              <!-- Bottom Center Mascot Circle -->
+              <div class="reel-mascot-overlay" style="position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); width: 44px; height: 44px; border-radius: 50%; background: radial-gradient(circle, rgba(168,85,247,0.9) 0%, rgba(139,92,246,0.5) 60%, transparent 100%); display: flex; align-items: center; justify-content: center; box-shadow: 0 0 20px rgba(168,85,247,0.8); z-index: 8; cursor: pointer; border: 1.5px solid rgba(255,255,255,0.3);" title="Hi-HUBBLE Mascot">
+                <img src="/hihubble-mascot-circle.png" alt="Mascot" style="width: 38px; height: 38px; border-radius: 50%; object-fit: cover;" />
+              </div>
+
+              <!-- Comments Modal -->
+              <div class="story-viewer-overlay reel-comments-modal" data-reel-id="${reel._id || reel.id}">
+                <div class="comments-card glass-panel" style="background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border-radius: 20px; border: 1px solid rgba(255,255,255,0.15); width: 90%; max-width: 380px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;">
+                  <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid rgba(255,255,255,0.1);">
+                    <h3 style="margin:0; font-size:16px; color:white; font-weight:600;">Comments</h3>
+                    <button class="modal-close-btn" style="background:none; border:none; color:white; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
+                  </div>
+                  <div class="comments-list" style="flex:1; overflow-y:auto; padding:16px; min-height:180px; max-height:360px;"></div>
+                  <div class="comments-footer" style="display:flex; gap:10px; padding:12px 16px; border-top:1px solid rgba(255,255,255,0.1); background:rgba(0,0,0,0.3);">
+                    <input type="text" placeholder="Add a comment..." style="flex:1; background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); border-radius:20px; padding:8px 16px; color:white; font-size:13px; outline:none;" />
+                    <button class="comment-send-btn" style="width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg, #a855f7 0%, #d946ef 100%); border:none; color:white; display:flex; align-items:center; justify-content:center; cursor:pointer;"><i data-lucide="send" style="width:16px; height:16px;"></i></button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Share Modal -->
+              <div class="story-viewer-overlay reel-share-modal" data-reel-id="${reel._id || reel.id}">
+                <div class="share-card glass-panel" style="background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border-radius: 20px; border: 1px solid rgba(255,255,255,0.15); width: 90%; max-width: 360px; display: flex; flex-direction: column; overflow: hidden;">
+                  <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid rgba(255,255,255,0.1);">
+                    <h3 style="margin:0; font-size:16px; color:white; font-weight:600;">Share Reel</h3>
+                    <button class="modal-close-btn" style="background:none; border:none; color:white; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
+                  </div>
+                  <div class="share-options" style="padding: 20px; display: flex; flex-direction: column; gap: 12px;">
+                    <button class="copy-link-btn" style="padding: 12px; border-radius: 12px; background: linear-gradient(135deg, #a855f7 0%, #d946ef 100%); color: white; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-weight: 600; font-size: 13.5px;"><i data-lucide="copy" style="width:18px; height:18px;"></i> Copy Reel Link</button>
+                  </div>
+                </div>
+              </div>
+            `;
+
+            const video = card.querySelector('.reel-video');
+            if (video) {
+              video.addEventListener('error', () => {
+                console.error('[HUBBING PLAYER] Saved reel ERROR reelId=' + (reel._id || reel.id), video.error);
+                card.setAttribute('data-reel-failed', 'true');
+                const overlay = card.querySelector('.reel-play-icon-overlay');
+                if (overlay) overlay.innerHTML = '<span style="color:rgba(255,255,255,0.6);font-size:12px;">Video unavailable</span>';
+              });
+            }
+
+            reelsScroller.appendChild(card);
+          });
+          wireReelInteractions(reelsScroller);
+        }
+      }
+
+      if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+    }
+
   // Bind follow/unfollow action on user profile
   const profileFollowBtn = document.getElementById('profile-follow-btn');
   if (profileFollowBtn) {
-
-    function renderSavedHubbs() {
-      const savedGrid = document.getElementById('profile-saved-grid');
-      if (!savedGrid) return;
-      savedGrid.innerHTML = '';
-
-      const savedItems = window.savedHubbs || [];
-      if (savedItems.length === 0) {
-        savedGrid.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved hubs yet. 🔖</div>';
-        return;
-      }
-
-      savedItems.forEach(item => {
-        const div = document.createElement('div');
-        div.className = 'profile-grid-item';
-        if (item.type === 'video') {
-          div.innerHTML = `
-          <video src="${item.url}" muted loop style="width:100%; height:100%; object-fit:cover;"></video>
-          <div class="profile-grid-item-overlay">
-            <span><i data-lucide="bookmark"></i> Saved</span>
-          </div>`;
-          const video = div.querySelector('video');
-          div.addEventListener('mouseenter', () => video.play());
-          div.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
-        } else {
-          div.innerHTML = `
-          <img src="${item.url}" alt="Saved Hub" style="width:100%; height:100%; object-fit:cover;" />
-          <div class="profile-grid-item-overlay">
-            <span><i data-lucide="bookmark"></i> Saved</span>
-          </div>`;
-        }
-        savedGrid.appendChild(div);
-      });
-      debouncedCreateIcons();
-    }
-
     profileFollowBtn.addEventListener('click', async () => {
       const uid = profileFollowBtn.getAttribute('data-user-id');
       const token = localStorage.getItem('invibe_jwt_token');
@@ -8548,8 +13553,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!currentUserStr) return;
     const currentUser = JSON.parse(currentUserStr);
 
-    const isMe = (followBtn && followBtn.style.display === 'none');
-    const targetUserId = isMe ? (currentUser.id || currentUser._id) : followBtn.getAttribute('data-user-id');
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
+    const isMe = (!state.viewingProfileUserId || state.viewingProfileUserId === 'me' || state.viewingProfileUserId === currentUserId || state.viewingProfileUserId === currentUser.username);
+    const targetUserId = isMe ? currentUserId : (state.viewingProfileUserId || followBtn?.getAttribute('data-user-id') || currentUserId);
     if (!targetUserId) return;
 
     relationsTitle.textContent = type === 'followers' ? 'HUBBERS' : 'HUBBIES';
@@ -8595,7 +13601,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         row.querySelector('.person-info').addEventListener('click', () => {
           relationsModal.classList.remove('active');
-          switchView('profile', user._id);
+          switchView('profile', getUserIdentifier(user));
         });
 
         const rFollowBtn = row.querySelector('.relations-follow-btn');
@@ -8711,7 +13717,7 @@ document.addEventListener('DOMContentLoaded', () => {
             row.addEventListener('click', (e) => {
               if (e.target.closest('.search-follow-btn')) return;
 
-              switchView('profile', user._id);
+              switchView('profile', getUserIdentifier(user));
 
               globalSearchInput.value = '';
               searchDropdown.style.display = 'none';
@@ -8844,7 +13850,7 @@ document.addEventListener('DOMContentLoaded', () => {
               if (typeof window.filterStories === 'function') {
                 window.filterStories('');
               }
-              switchView('profile', user._id);
+              switchView('profile', getUserIdentifier(user));
             });
 
             const followBtn = row.querySelector('.search-follow-btn');
@@ -8992,7 +13998,7 @@ document.addEventListener('DOMContentLoaded', () => {
           `;
 
           row.querySelector('.person-info').addEventListener('click', () => {
-            switchView('profile', user._id);
+            switchView('profile', getUserIdentifier(user));
           });
 
           const followBtn = row.querySelector('.search-follow-btn');
@@ -9117,35 +14123,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function toggleFollowUser(targetUserId, btnEl) {
-    const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
-    if (!token || !targetUserId) return;
-
-    const isFollowing = btnEl.classList.contains('followed');
-    const endpoint = isFollowing ? 'unfollow' : 'follow';
-
-    try {
-      const res = await fetch(`${API_URL}/api/users/${targetUserId}/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Action failed');
-
-      if (endpoint === 'follow') {
-        btnEl.classList.add('followed');
-        btnEl.textContent = 'Hubbies';
-        showToast(data.message || 'Connected!');
-      } else {
-        btnEl.classList.remove('followed');
-        btnEl.textContent = 'Connect';
-        showToast('Disconnected.');
-      }
-      if (typeof loadProfileStats === 'function') loadProfileStats();
-    } catch (err) {
-      showToast(err.message || 'Follow action failed');
-    }
-  }
 
   function handleSearchViewInput(query) {
     const searchGrid = document.getElementById('search-landing-grid');
@@ -9279,8 +14256,9 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
 
         row.querySelector('.person-info').addEventListener('click', () => {
-          saveRecentSearch(query, user._id);
-          switchView('profile', user._id);
+          const targetUid = getUserIdentifier(user);
+          saveRecentSearch(query, targetUid);
+          switchView('profile', targetUid);
         });
 
         const followBtn = row.querySelector('.search-follow-btn');
@@ -9373,23 +14351,25 @@ document.addEventListener('DOMContentLoaded', () => {
           ${post.mediaUrl ? `<img src="${post.mediaUrl}" alt="Post Media" style="width: 44px; height: 44px; border-radius: 8px; object-fit: cover; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.05);" />` : ''}
         `;
 
+        const authorIdentifier = getUserIdentifier(author);
+
         // Redirect to user profile on profile pic click
         const profilePic = row.querySelector('.author-profile-pic');
-        if (profilePic && author.id) {
+        if (profilePic && authorIdentifier) {
           profilePic.addEventListener('click', (e) => {
             e.stopPropagation();
-            saveRecentSearch(query, author.id);
-            switchView('profile', author.id);
+            saveRecentSearch(query, authorIdentifier);
+            switchView('profile', authorIdentifier);
           });
         }
 
         // Redirect to user profile on username click
         const profileLink = row.querySelector('.author-profile-link');
-        if (profileLink && author.id) {
+        if (profileLink && authorIdentifier) {
           profileLink.addEventListener('click', (e) => {
             e.stopPropagation();
-            saveRecentSearch(query, author.id);
-            switchView('profile', author.id);
+            saveRecentSearch(query, authorIdentifier);
+            switchView('profile', authorIdentifier);
           });
         }
 
@@ -9521,6 +14501,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!userStr) return;
     try {
       const user = JSON.parse(userStr);
+      const userId = (user.id || user._id || '').toString();
+      const currentUsername = (user.username || '').toLowerCase();
 
       // Instant synchronous UI DOM update from local session (< 10ms)
       const headerAvatar = document.querySelector('#header-profile-avatar img');
@@ -9533,7 +14515,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (sidebarName && user.fullName) sidebarName.textContent = user.fullName;
       const sidebarUsername = document.querySelector('.profile-preview-info p');
       if (sidebarUsername && user.username) sidebarUsername.textContent = '@' + user.username;
-      const storyAvatar = document.querySelector('.story-card.current-user .story-avatar-container img');
+      const storyAvatar = document.querySelector('.story-card.current-user .story-avatar-container img') || document.querySelector('#story-btn-current img');
       if (storyAvatar && profileImage) storyAvatar.src = profileImage;
       const myProfileAvatar = document.querySelector('.profile-screen-avatar');
       if (myProfileAvatar && profileImage) myProfileAvatar.src = profileImage;
@@ -9544,6 +14526,27 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       const myProfileUsername = document.querySelector('.profile-screen-handle');
       if (myProfileUsername && user.username) myProfileUsername.textContent = '@' + user.username;
+
+      // Synchronize all live feed post author avatars and comments for current user
+      if (profileImage) {
+        document.querySelectorAll('#home-feed-posts .feed-card').forEach(card => {
+          const avatarEl = card.querySelector('.author-avatar');
+          const authorId = avatarEl?.getAttribute('data-user-id') || '';
+          const handleEl = card.querySelector('.author-handle');
+          const handleText = handleEl?.textContent?.replace('@', '').trim().toLowerCase() || '';
+
+          if (avatarEl && ((userId && authorId === userId) || (currentUsername && handleText === currentUsername))) {
+            avatarEl.src = profileImage;
+          }
+        });
+
+        document.querySelectorAll('.comment-author-avatar').forEach(img => {
+          const cAuthorId = img.getAttribute('data-user-id') || '';
+          if (userId && cAuthorId === userId) {
+            img.src = profileImage;
+          }
+        });
+      }
 
       const bannerImage = localStorage.getItem('invibeBannerImage');
       const sidebarBanner = document.querySelector('.sidebar-left .card-cover-bg');
@@ -9560,39 +14563,166 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
-  // ─── REALTIME CHAT & PRESENCE SUBSCRIBERS ──────────────────────────
-  if (window.supabase) {
-    try {
-      window.supabase
-        .channel('public:online_users')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'online_users' }, (payload) => {
-          console.log('[Realtime Presence Debug] Event received on online_users:', payload);
-          loadActiveVibers();
-        })
-        .subscribe();
+  // ─── SCOPED REALTIME DM MESSAGES SUBSCRIBER (Phase 1) ─────────────────
+  function setupDMRealtime() {
+    if (!window.supabase) return;
+    const currentUser = getCurrentUser();
+    if (!currentUser) return;
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
+    if (!currentUserId) return;
 
-      window.supabase
-        .channel('public:messages')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
-          console.log('[Realtime Chat Debug] Event received on messages:', payload);
-          loadChatThreads();
-          if (state.currentChatThread) {
-            fetchMessages(state.currentChatThread, true);
+    if (dmState.realtimeChannel) {
+      console.warn('[DM-RUNTIME] realtime unsubscribe:', Date.now());
+      try {
+        window.supabase.removeChannel(dmState.realtimeChannel);
+      } catch (_) {}
+      dmState.realtimeChannel = null;
+    }
+
+    console.warn('[DM-RUNTIME] realtime subscribe:', currentUserId, Date.now());
+
+    try {
+      const channel = window.supabase
+        .channel(`dm-messages-realtime-${currentUserId}`)
+        .on('postgres_changes', {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages'
+        }, (payload) => {
+          const newMsg = payload.new;
+          if (!newMsg) return;
+
+          console.warn('[DM-RUNTIME] realtime INSERT:', newMsg.id, newMsg.conversation_id, Date.now());
+
+          const isFromMe = (newMsg.sender_id || '').toString() === currentUserId;
+          const partnerId = isFromMe ? newMsg.recipient_id : newMsg.sender_id;
+          if (!partnerId) return;
+
+          const rawMedia = newMsg.media_url || '';
+          const resolvedMediaUrl = resolveBrowserMediaUrl(newMsg);
+          const rawType = (newMsg.media_type || (rawMedia ? 'image' : 'text')).toLowerCase();
+          const effectiveType = rawType.includes('video') ? 'video' : rawType;
+
+          const formattedMsg = {
+            _id: newMsg.id,
+            id: newMsg.id,
+            conversationId: newMsg.conversation_id,
+            sender: newMsg.sender_id,
+            recipient: newMsg.recipient_id,
+            content: newMsg.content,
+            mediaUrl: resolvedMediaUrl,
+            mediaType: effectiveType,
+            mediaName: newMsg.media_name || (effectiveType === 'video' ? 'video.mp4' : (effectiveType === 'image' ? 'image.png' : null)),
+            mediaSize: newMsg.media_size,
+            replyToId: newMsg.reply_to_id,
+            status: newMsg.status,
+            createdAt: newMsg.created_at
+          };
+
+          // Append to active conversation if open (NO REFETCH / NO SKELETON / NO FLICKER)
+          appendSingleMessage(partnerId, formattedMsg);
+
+          // Update sidebar thread preview in-place
+          updateThreadLastMessageInPlace(partnerId, formattedMsg);
+
+          // If currently in conversation with this partner, mark as read immediately
+          if (dmState.activeConversationId && dmState.activeConversationId.toString() === partnerId.toString()) {
+            markMessagesAsRead(partnerId);
           }
         })
         .subscribe();
 
-      window.supabase
-        .channel('public:typing_status')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'typing_status' }, (payload) => {
-          console.log('[Realtime Typing Debug] Event received on typing_status:', payload);
-          loadChatThreads();
+      dmState.realtimeChannel = channel;
+    } catch (rtErr) {
+      console.warn('[DM-RUNTIME] Realtime Subscription Notice:', rtErr);
+    }
+  }
+
+  // Initialize Realtime subscription
+  setupDMRealtime();
+
+  // ─── SCOPED REALTIME NOTIFICATIONS SUBSCRIBER ────────────────────────
+  let notificationsRealtimeChannel = null;
+  function setupNotificationsRealtime() {
+    if (!window.supabase) return;
+    const currentUser = getCurrentUser();
+    if (!currentUser) return;
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
+    if (!currentUserId) return;
+
+    if (notificationsRealtimeChannel) {
+      try {
+        window.supabase.removeChannel(notificationsRealtimeChannel);
+      } catch (_) {}
+      notificationsRealtimeChannel = null;
+    }
+
+    try {
+      notificationsRealtimeChannel = window.supabase
+        .channel(`notifications-realtime-${currentUserId}`)
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'notifications'
+        }, (payload) => {
+          const newNotif = payload.new;
+          const oldNotif = payload.old;
+          const targetId = ((newNotif && (newNotif.recipient_id || newNotif.user_id)) || (oldNotif && (oldNotif.recipient_id || oldNotif.user_id)) || '').toString();
+          
+          if (!targetId || targetId === currentUserId) {
+            loadNotifications();
+            if (payload.eventType === 'INSERT' && newNotif) {
+              if (newNotif.type === 'follow_request') {
+                showToast(newNotif.message || '🔔 New Hubbies request received!');
+              } else if (newNotif.type === 'accept_follow_request') {
+                showToast(newNotif.message || '🎉 Someone accepted your Hubbies request!');
+                if (typeof loadProfileStats === 'function') loadProfileStats();
+                if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
+                if (suggestedVibersModal && suggestedVibersModal.classList.contains('active')) {
+                  openSuggestedVibersModal();
+                }
+                const senderPartnerId = (newNotif.sender_id || '').toString();
+                if (senderPartnerId) {
+                  document.querySelectorAll(`[data-user-id="${senderPartnerId}"]`).forEach(btn => {
+                    btn.classList.add('followed');
+                    btn.classList.remove('requested');
+                    btn.textContent = 'Hubbies';
+                    btn.style.background = '#22c55e';
+                    btn.style.color = '#ffffff';
+                    btn.disabled = false;
+                  });
+                }
+              }
+            }
+          }
+        })
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'follow_requests'
+        }, (payload) => {
+          if (typeof loadProfileStats === 'function') loadProfileStats();
+          if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
+          if (suggestedVibersModal && suggestedVibersModal.classList.contains('active')) {
+            openSuggestedVibersModal();
+          }
+        })
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'followers'
+        }, (payload) => {
+          if (typeof loadProfileStats === 'function') loadProfileStats();
+          if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
         })
         .subscribe();
     } catch (rtErr) {
-      console.warn('[Realtime Presence Subscription Notice]:', rtErr);
+      console.warn('[NOTIF-REALTIME] Realtime Subscription Notice:', rtErr);
     }
   }
+
+  // Initialize Notifications Realtime
+  setupNotificationsRealtime();
 
   // ─── NOTIFICATIONS DROPDOWN AND BADGES INTERACTION SYSTEM ────────────────────
   const notifBtn = document.getElementById('notif-btn');
@@ -9616,7 +14746,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const notifications = await res.json();
 
       // Update badges (blue diamond for unread notifications)
-      const unreadCount = notifications.filter(n => !n.read).length;
+      const unreadCount = notifications.filter(n => n.isRead === false || n.read === false).length;
       if (unreadCount > 0) {
         if (notifBadge) {
           notifBadge.className = 'badge blue-diamond';
@@ -9645,6 +14775,31 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function recalcNotificationBadges() {
+    if (!notifPanel) return;
+    const unreadCount = notifPanel.querySelectorAll('.notification-item.unread').length;
+    if (unreadCount > 0) {
+      if (notifBadge) {
+        notifBadge.className = 'badge blue-diamond';
+        notifBadge.style.display = 'block';
+      }
+      if (radialNotifBadge) {
+        radialNotifBadge.className = 'nav-icon-badge blue-diamond';
+        radialNotifBadge.style.display = 'flex';
+        radialNotifBadge.textContent = '';
+      }
+    } else {
+      if (notifBadge) {
+        notifBadge.className = 'badge';
+        notifBadge.style.display = 'none';
+      }
+      if (radialNotifBadge) {
+        radialNotifBadge.className = 'nav-icon-badge';
+        radialNotifBadge.style.display = 'none';
+      }
+    }
+  }
+
   function renderNotificationsPanel(notifications) {
     if (!notifPanel) return;
 
@@ -9670,30 +14825,45 @@ document.addEventListener('DOMContentLoaded', () => {
       item.className = `notification-item ${isUnread ? 'unread' : ''}`;
 
       const sender = notif.sender || { fullName: 'User', username: 'user', profileImage: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80' };
+      const senderId = sender.id || sender._id || notif.senderId || '';
       const senderAvatar = sender.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80';
 
       let messageText = notif.text || `<strong>@${sender.username}</strong> interacted with you.`;
       let actionButtons = '';
 
       if (notif.type === 'follow_request') {
-        messageText = `<strong>@${sender.username}</strong> requested to follow you.`;
+        messageText = `<strong>@${sender.username}</strong> sent you a Hubbies request.`;
         actionButtons = `
           <div class="notif-action-btns" style="display: flex; gap: 6px; margin-top: 6px;">
-            <button type="button" class="btn-accept-request" data-sender-id="${sender._id}" style="padding: 4px 10px; background: var(--primary, #a855f7); color: white; border: none; border-radius: 12px; font-size: 11px; font-weight: 600; cursor: pointer;">Accept</button>
-            <button type="button" class="btn-reject-request" data-sender-id="${sender._id}" style="padding: 4px 10px; background: rgba(255,255,255,0.1); color: white; border: none; border-radius: 12px; font-size: 11px; font-weight: 600; cursor: pointer;">Decline</button>
+            <button type="button" class="btn-accept-request" data-sender-id="${senderId}" data-notif-id="${notif._id || notif.id}" style="padding: 4px 12px; background: var(--primary, #a855f7); color: white; border: none; border-radius: 12px; font-size: 11.5px; font-weight: 600; cursor: pointer; transition: all 0.2s;">Accept</button>
+            <button type="button" class="btn-reject-request" data-sender-id="${senderId}" data-notif-id="${notif._id || notif.id}" style="padding: 4px 12px; background: rgba(255,255,255,0.1); color: var(--text-color, white); border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; font-size: 11.5px; font-weight: 600; cursor: pointer; transition: all 0.2s;">Decline</button>
           </div>
         `;
       } else if (notif.type === 'accept_follow_request') {
-        messageText = `<strong>@${sender.username}</strong> accepted your follow request.`;
+        messageText = `<strong>@${sender.username}</strong> accepted your Hubbies request.`;
       } else if (notif.type === 'follow') {
         messageText = `<strong>@${sender.username}</strong> started following you.`;
       } else if (notif.type === 'like') {
         messageText = `<strong>@${sender.username}</strong> liked your post.`;
       } else if (notif.type === 'comment') {
         messageText = `<strong>@${sender.username}</strong> commented on your post.`;
+      } else if (notif.type === 'reel_mention') {
+        messageText = `<strong>@${sender.username}</strong> tagged you in a Reel.`;
+        if (notif.mentionStatus === 'pending') {
+          actionButtons = `
+            <div class="notif-action-btns" style="display: flex; gap: 6px; margin-top: 6px;">
+              <button type="button" class="btn-accept-reel-mention" data-reel-id="${notif.reelId}" data-notif-id="${notif._id || notif.id}" style="padding: 4px 12px; background: var(--primary, #a855f7); color: white; border: none; border-radius: 12px; font-size: 11.5px; font-weight: 600; cursor: pointer; transition: all 0.2s;">Accept</button>
+              <button type="button" class="btn-reject-reel-mention" data-reel-id="${notif.reelId}" data-notif-id="${notif._id || notif.id}" style="padding: 4px 12px; background: rgba(255,255,255,0.1); color: var(--text-color, white); border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; font-size: 11.5px; font-weight: 600; cursor: pointer; transition: all 0.2s;">Decline</button>
+            </div>
+          `;
+        } else if (notif.mentionStatus === 'accepted') {
+          messageText += ` <span style="font-size: 11px; color: #10b981; font-weight: 600;">(Accepted)</span>`;
+        } else if (notif.mentionStatus === 'rejected') {
+          messageText += ` <span style="font-size: 11px; color: #ef4444; font-weight: 600;">(Declined)</span>`;
+        }
       }
 
-      const timeAgo = formatTimeAgo(new Date(notif.createdAt || Date.now()));
+      const timeAgo = formatTimeAgo(new Date(notif.createdAt || notif.created_at || Date.now()));
 
       item.innerHTML = `
         <img src="${senderAvatar}" class="notification-avatar" alt="${sender.username}"/>
@@ -9704,11 +14874,30 @@ document.addEventListener('DOMContentLoaded', () => {
         </div>
       `;
 
-      item.addEventListener('click', (e) => {
+      item.addEventListener('click', async (e) => {
         if (e.target.closest('.btn-accept-request, .btn-reject-request')) return;
         e.stopPropagation();
-        if (sender._id) {
-          switchView('profile', sender._id);
+        
+        if (item.classList.contains('unread')) {
+          item.classList.remove('unread');
+          recalcNotificationBadges();
+          
+          const token = localStorage.getItem('invibe_jwt_token');
+          if (token && notif._id) {
+            try {
+              await fetch(`${API_URL}/api/notifications/${notif._id}/read`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}` }
+              });
+            } catch (err) {
+              console.error('Error marking notification read:', err);
+            }
+          }
+        }
+
+        const navTargetId = getUserIdentifier(sender) || senderId;
+        if (navTargetId && navTargetId !== 'usr_unknown') {
+          switchView('profile', navTargetId);
           notifPanel.style.display = 'none';
         }
       });
@@ -9716,24 +14905,61 @@ document.addEventListener('DOMContentLoaded', () => {
       // Attach accept / reject listeners
       const acceptBtn = item.querySelector('.btn-accept-request');
       const rejectBtn = item.querySelector('.btn-reject-request');
+      const actionArea = item.querySelector('.notif-action-btns');
 
       if (acceptBtn) {
         acceptBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
-          const senderId = acceptBtn.getAttribute('data-sender-id');
+          const targetId = acceptBtn.getAttribute('data-sender-id') || acceptBtn.getAttribute('data-notif-id');
           const token = localStorage.getItem('invibe_jwt_token');
+
+          if (!targetId || targetId === 'usr_unknown') {
+            showToast('Unable to identify requester.');
+            return;
+          }
+
+          acceptBtn.disabled = true;
+          if (rejectBtn) rejectBtn.disabled = true;
+          acceptBtn.textContent = 'Accepting...';
+
           try {
-            const res = await fetch(`${API_URL}/api/users/${senderId}/accept-follow-request`, {
+            const res = await fetch(`${API_URL}/api/users/${targetId}/accept-follow-request`, {
               method: 'POST',
               headers: { 'Authorization': `Bearer ${token}` }
             });
+            const data = await res.json();
             if (res.ok) {
-              showToast(`Accepted follow request from @${sender.username}! 🎉`);
-              item.remove();
-              updateAppUI();
+              showToast(data.message || `Accepted Hubbies request from @${sender.username}! 🎉`);
+              if (actionArea) {
+                actionArea.innerHTML = '<span style="color: #22c55e; font-size: 11.5px; font-weight: 600;">✓ Accepted</span>';
+              }
+              // Update any Follow buttons in DOM for this user
+              document.querySelectorAll(`[data-user-id="${targetId}"]`).forEach(btn => {
+                btn.classList.add('followed');
+                btn.classList.remove('requested');
+                btn.textContent = 'Hubbies';
+                btn.style.background = '#22c55e';
+                btn.style.color = '#ffffff';
+                btn.disabled = false;
+              });
+
+              if (typeof loadProfileStats === 'function') loadProfileStats();
+              if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
+              if (suggestedVibersModal && suggestedVibersModal.classList.contains('active')) {
+                openSuggestedVibersModal();
+              }
+            } else {
+              showToast(data.error || 'Failed to accept request.');
+              acceptBtn.disabled = false;
+              if (rejectBtn) rejectBtn.disabled = false;
+              acceptBtn.textContent = 'Accept';
             }
           } catch (err) {
             console.error("Accept error:", err);
+            showToast('Network error accepting request.');
+            acceptBtn.disabled = false;
+            if (rejectBtn) rejectBtn.disabled = false;
+            acceptBtn.textContent = 'Accept';
           }
         });
       }
@@ -9741,19 +14967,150 @@ document.addEventListener('DOMContentLoaded', () => {
       if (rejectBtn) {
         rejectBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
-          const senderId = rejectBtn.getAttribute('data-sender-id');
+          const targetId = rejectBtn.getAttribute('data-sender-id') || rejectBtn.getAttribute('data-notif-id');
           const token = localStorage.getItem('invibe_jwt_token');
+
+          if (!targetId || targetId === 'usr_unknown') {
+            showToast('Unable to identify requester.');
+            return;
+          }
+
+          if (acceptBtn) acceptBtn.disabled = true;
+          rejectBtn.disabled = true;
+          rejectBtn.textContent = 'Declining...';
+
           try {
-            const res = await fetch(`${API_URL}/api/users/${senderId}/reject-follow-request`, {
+            const res = await fetch(`${API_URL}/api/users/${targetId}/reject-follow-request`, {
               method: 'POST',
               headers: { 'Authorization': `Bearer ${token}` }
             });
+            const data = await res.json();
             if (res.ok) {
-              showToast(`Declined request from @${sender.username}`);
-              item.remove();
+              showToast(data.message || `Declined request from @${sender.username}`);
+              if (actionArea) {
+                actionArea.innerHTML = '<span style="color: var(--text-muted); font-size: 11.5px;">Declined</span>';
+              }
+              // Reset any Follow buttons in DOM for this user
+              document.querySelectorAll(`[data-user-id="${targetId}"]`).forEach(btn => {
+                btn.classList.remove('followed', 'requested');
+                btn.textContent = 'Follow';
+                btn.style.background = 'var(--primary, #a855f7)';
+                btn.style.color = '#ffffff';
+                btn.disabled = false;
+              });
+
+              if (typeof loadProfileStats === 'function') loadProfileStats();
+              if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
+            } else {
+              showToast(data.error || 'Failed to decline request.');
+              if (acceptBtn) acceptBtn.disabled = false;
+              rejectBtn.disabled = false;
+              rejectBtn.textContent = 'Decline';
             }
           } catch (err) {
             console.error("Decline error:", err);
+            showToast('Network error declining request.');
+            if (acceptBtn) acceptBtn.disabled = false;
+            rejectBtn.disabled = false;
+            rejectBtn.textContent = 'Decline';
+          }
+        });
+      }
+
+      // Attach reel mention accept / reject listeners
+      const acceptReelBtn = item.querySelector('.btn-accept-reel-mention');
+      const rejectReelBtn = item.querySelector('.btn-reject-reel-mention');
+
+      if (acceptReelBtn) {
+        acceptReelBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const reelId = acceptReelBtn.getAttribute('data-reel-id');
+          const notifId = acceptReelBtn.getAttribute('data-notif-id');
+          const token = localStorage.getItem('invibe_jwt_token');
+
+          acceptReelBtn.disabled = true;
+          if (rejectReelBtn) rejectReelBtn.disabled = true;
+          acceptReelBtn.textContent = 'Accepting...';
+
+          try {
+            const res = await fetch(`${API_URL}/api/reels/mentions/accept`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+              },
+              body: JSON.stringify({ reelId, notificationId: notifId })
+            });
+
+            if (res.ok) {
+              showToast('Tagged Reel accepted successfully! 🎉');
+              if (actionArea) {
+                actionArea.innerHTML = '<span style="color: #22c55e; font-size: 11.5px; font-weight: 600;">✓ Tagged Accepted</span>';
+              }
+              const activeProfileTab = document.querySelector('.profile-content-tab.active');
+              if (activeProfileTab && activeProfileTab.getAttribute('data-profile-tab') === 'tagged') {
+                const currentProfileId = document.getElementById('user-profile-view')?.getAttribute('data-user-id') || 'me';
+                loadUserProfile(currentProfileId);
+              }
+            } else {
+              showToast('Failed to accept tagged Reel.');
+              acceptReelBtn.disabled = false;
+              if (rejectReelBtn) rejectReelBtn.disabled = false;
+              acceptReelBtn.textContent = 'Accept';
+            }
+          } catch (err) {
+            console.error("Accept reel mention error:", err);
+            showToast('Network error.');
+            acceptReelBtn.disabled = false;
+            if (rejectReelBtn) rejectReelBtn.disabled = false;
+            acceptReelBtn.textContent = 'Accept';
+          }
+        });
+      }
+
+      if (rejectReelBtn) {
+        rejectReelBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const reelId = rejectReelBtn.getAttribute('data-reel-id');
+          const notifId = rejectReelBtn.getAttribute('data-notif-id');
+          const token = localStorage.getItem('invibe_jwt_token');
+
+          if (acceptReelBtn) acceptReelBtn.disabled = true;
+          rejectReelBtn.disabled = true;
+          rejectReelBtn.textContent = 'Declining...';
+
+          try {
+            const res = await fetch(`${API_URL}/api/reels/mentions/reject`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+              },
+              body: JSON.stringify({ reelId, notificationId: notifId })
+            });
+
+            if (res.ok) {
+              showToast('Tagged Reel declined.');
+              if (actionArea) {
+                actionArea.innerHTML = '<span style="color: var(--text-muted); font-size: 11.5px;">Tagged Declined</span>';
+              }
+              const activeProfileTab = document.querySelector('.profile-content-tab.active');
+              if (activeProfileTab && activeProfileTab.getAttribute('data-profile-tab') === 'tagged') {
+                const currentProfileId = document.getElementById('user-profile-view')?.getAttribute('data-user-id') || 'me';
+                loadUserProfile(currentProfileId);
+              }
+            } else {
+              showToast('Failed to decline tagged Reel.');
+              if (acceptReelBtn) acceptReelBtn.disabled = false;
+              rejectReelBtn.disabled = false;
+              rejectReelBtn.textContent = 'Decline';
+            }
+          } catch (err) {
+            console.error("Decline reel mention error:", err);
+            showToast('Network error.');
+            if (acceptReelBtn) acceptReelBtn.disabled = false;
+            rejectReelBtn.disabled = false;
+            rejectReelBtn.textContent = 'Decline';
           }
         });
       }
@@ -9777,19 +15134,6 @@ document.addEventListener('DOMContentLoaded', () => {
         notifPanel.style.display = 'none';
       } else {
         notifPanel.style.display = 'flex';
-        // Auto mark as read on open
-        const token = localStorage.getItem('invibe_jwt_token');
-        if (token) {
-          try {
-            await fetch(`${API_URL}/api/notifications/read`, {
-              method: 'POST',
-              headers: { 'Authorization': `Bearer ${token}` }
-            });
-            await loadNotifications();
-          } catch (err) {
-            console.error('Error marking read:', err);
-          }
-        }
       }
     });
   }
@@ -9834,52 +15178,36 @@ document.addEventListener('DOMContentLoaded', () => {
   // Listen to auth load/changes
   window.addEventListener('auth-changed', () => {
     loadNotifications();
-    loadChatThreads();
+    setupNotificationsRealtime();
+    // Only reset and re-initialize DM realtime when auth user changes
+    const authUserId = (() => { try { const u = getCurrentUser(); return (u?.id || u?._id || '').toString(); } catch (_) { return ''; } })();
+    if (!dmState._authUserId || dmState._authUserId !== authUserId) {
+      dmState._authUserId = authUserId;
+      // Reset loaded/loading state for new auth user
+      dmState.messagesByConversation.clear();
+      dmState.conversationIdByUser.clear();
+      dmState.loadedConversations.clear();
+      dmState.loadingConversations.clear();
+      dmState.activeConversationId = null;
+      loadChatThreads();
+      setupDMRealtime();
+      console.warn('[DM-RUNTIME] auth-changed: DM re-initialized for user:', authUserId);
+    } else {
+      // Same user – just refresh threads list
+      loadChatThreads();
+    }
+    window.ensureIncomingCallListeners();
     loadProfileStats();
     loadFollowSuggestions();
   });
 
-  // Initial load
+  // Initial load once
   loadNotifications();
   loadChatThreads();
 
-  // Polling for incoming calls every 2 seconds
-  setInterval(() => {
-    const token = localStorage.getItem('invibe_jwt_token');
-    if (!token) return;
-    checkForIncomingCall();
-  }, 2000);
-
-  // Polling interval (every 4 seconds for real-world updates)
-  setInterval(() => {
-    const token = localStorage.getItem('invibe_jwt_token');
-    if (!token) return;
-
-    loadNotifications();
-    loadChatThreads();
-    if (state.activeView === 'chats' && state.currentChatThread) {
-      fetchMessages(state.currentChatThread, false);
-
-      const activeThreadObj = chatThreads.find(t => t.user && t.user._id.toString() === state.currentChatThread.toString());
-      if (activeThreadObj && activeThreadObj.user) {
-        const u = activeThreadObj.user;
-        const isOnline = (new Date() - new Date(u.lastActive)) < 120000;
-        const statusHtml = isOnline
-          ? `<span class="online-indicator blue-diamond-status" style="position:static; display:inline-block; margin-right:4px; width:8px; height:8px;"></span> Online`
-          : `<span class="online-indicator black-diamond-status" style="position:static; display:inline-block; margin-right:4px; width:8px; height:8px;"></span> Offline`;
-        const headerStatus = document.querySelector('.chat-header-status');
-        if (headerStatus) headerStatus.innerHTML = statusHtml;
-      }
-    }
-  }, 4000);
-
   function setupVideoScrollObserver() {
-    const observerOptions = {
-      root: null,
-      threshold: [0, 0.25, 0.5, 0.75, 1.0]
-    };
-
-    const observer = new IntersectionObserver((entries) => {
+    // 1. Post Media Video Observer (Isolated from Reels)
+    const postObserver = new IntersectionObserver((entries) => {
       entries.forEach(entry => {
         const video = entry.target;
         if (entry.intersectionRatio < 0.5) {
@@ -9902,21 +15230,83 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }
       });
-    }, observerOptions);
+    }, { root: null, threshold: [0, 0.25, 0.5, 0.75, 1.0] });
 
-    document.querySelectorAll('.post-media-video, .reel-video').forEach(video => {
-      observer.observe(video);
+    document.querySelectorAll('.post-media-video').forEach(video => {
+      postObserver.observe(video);
+    });
+
+    // 2. Hubbing Reel Observer (Dedicated directly to Centralized Controller)
+    const reelObserver = new IntersectionObserver((entries) => {
+      if (window.hubbingPlaybackController) {
+        window.hubbingPlaybackController.onVisibilityChange(entries);
+      }
+    }, { root: null, threshold: [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] });
+
+    document.querySelectorAll('.reel-video, .reel-card').forEach(el => {
+      reelObserver.observe(el);
     });
 
     const mutationObserver = new MutationObserver((mutations) => {
       mutations.forEach(mutation => {
         mutation.addedNodes.forEach(node => {
           if (node.nodeType === Node.ELEMENT_NODE) {
-            const videos = node.querySelectorAll('.post-media-video, .reel-video');
-            videos.forEach(video => observer.observe(video));
-            if (node.classList.contains('post-media-video') || node.classList.contains('reel-video')) {
+            const postVideos = node.querySelectorAll('.post-media-video');
+            postVideos.forEach(video => postObserver.observe(video));
+            if (node.classList.contains('post-media-video')) {
+              postObserver.observe(node);
+            }
+
+            const reelElements = node.querySelectorAll('.reel-video, .reel-card');
+            reelElements.forEach(el => reelObserver.observe(el));
+            if (node.classList.contains('reel-video') || node.classList.contains('reel-card')) {
+              reelObserver.observe(node);
+            }
+          }
+        });
+      });
+    });
+    mutationObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function setupPostMusicScrollObserver() {
+    const observerOptions = {
+      root: null,
+      threshold: 0.1
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        const card = entry.target;
+        if (entry.intersectionRatio < 0.1) {
+          if (card._audio && !card._audio.paused) {
+            card._audio.pause();
+            const vinyl = card.querySelector('.music-vinyl-disc');
+            if (vinyl) vinyl.style.animationPlayState = 'paused';
+            const btn = card.querySelector('.post-music-speaker-btn');
+            if (btn) {
+              btn.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/></svg>
+              `;
+            }
+          }
+        }
+      });
+    }, observerOptions);
+
+    document.querySelectorAll('.feed-card').forEach(card => {
+      observer.observe(card);
+    });
+
+    const mutationObserver = new MutationObserver((mutations) => {
+      mutations.forEach(mutation => {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.classList.contains('feed-card')) {
               observer.observe(node);
             }
+            const cards = node.querySelectorAll('.feed-card');
+            cards.forEach(card => observer.observe(card));
           }
         });
       });
@@ -9973,6 +15363,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   setupVideoScrollObserver();
+  setupPostMusicScrollObserver();
 
   /* ========================================================= */
   /* DM ENHANCEMENTS LOGIC */
@@ -10447,12 +15838,26 @@ function initCreateHubbsUpload() {
 
   window.chUploads = window.chUploads || [];
 
+  // Expose file handler immediately
+  window.handleCreateHubbsFiles = handleFiles;
+
+  if (uploadBox.dataset.chUploadInitialized === 'true') {
+    if (typeof window.renderMediaPreviews === 'function') {
+      window.renderMediaPreviews();
+    }
+    return;
+  }
+  uploadBox.dataset.chUploadInitialized = 'true';
+
   // Triggers
   if (cameraBtn) {
     cameraBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      fileInput.setAttribute('capture', 'environment');
-      fileInput.click();
+      if (typeof window.openCameraCapture === 'function') {
+        window.openCameraCapture('hubbs');
+      } else if (typeof openCameraCapture === 'function') {
+        openCameraCapture('hubbs');
+      }
     });
   }
 
@@ -10494,18 +15899,19 @@ function initCreateHubbsUpload() {
     uploadBox.style.borderColor = '';
     uploadBox.style.background = '';
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      handleFiles(e.dataTransfer.files);
+      handleFiles(Array.from(e.dataTransfer.files));
     }
   });
 
   fileInput.addEventListener('change', (e) => {
     if (e.target.files && e.target.files.length > 0) {
-      handleFiles(e.target.files);
+      handleFiles(Array.from(e.target.files));
     }
     fileInput.value = ''; // Reset input to allow selecting same files again if removed
   });
 
   async function handleFiles(files) {
+    window.handleCreateHubbsFiles = handleFiles;
     const maxSize = 100 * 1024 * 1024; // 100MB
     const toast = document.getElementById('toast-notif');
 
@@ -10586,6 +15992,9 @@ function initCreateHubbsUpload() {
 
     uploadBox.style.opacity = '1';
     renderMediaPreviews();
+    if (window.HubbleEditor && typeof window.HubbleEditor.updateRender === 'function') {
+      window.HubbleEditor.updateRender();
+    }
   }
 
   function generateVideoThumbnail(file) {
@@ -10858,6 +16267,8 @@ function initCreateHubbsUpload() {
     }
   }
 
+  window.renderMediaPreviews = renderMediaPreviews;
+
   // Initial check
   renderMediaPreviews();
 }
@@ -10873,6 +16284,25 @@ window.toggleScheduling = function (checked) {
   const row = document.getElementById('ch-schedule-datetime-row');
   const dateInput = document.getElementById('ch-schedule-date');
   const timeInput = document.getElementById('ch-schedule-time');
+  const schedTrack = document.getElementById('ch-schedule-toggle-track');
+  const schedKnob = document.getElementById('ch-schedule-toggle-knob');
+  const schedStatus = document.getElementById('ch-schedule-status-text');
+
+  if (schedTrack && schedKnob && schedStatus) {
+    if (checked) {
+      schedTrack.style.backgroundColor = 'var(--primary)';
+      schedTrack.style.boxShadow = '0 0 8px rgba(108, 59, 255, 0.5)';
+      schedKnob.style.transform = 'translateX(20px)';
+      schedStatus.innerText = 'Enabled';
+      schedStatus.classList.add('enabled');
+    } else {
+      schedTrack.style.backgroundColor = '';
+      schedTrack.style.boxShadow = 'none';
+      schedKnob.style.transform = 'translateX(0)';
+      schedStatus.innerText = 'Disabled';
+      schedStatus.classList.remove('enabled');
+    }
+  }
 
   if (checked) {
     row.style.display = 'flex';
@@ -11093,7 +16523,9 @@ window.initReviewSlider = function () {
         v.loop = true;
         v.muted = state.isMuted || false;
         v.playsInline = true;
-        v.autoplay = true;
+        v.autoplay = false;
+        v.preload = 'auto';
+        v.pause();
       });
 
       if (!firstVideoBefore) {
@@ -11140,9 +16572,39 @@ window.initReviewSlider = function () {
         const el = document.createElement('div');
         el.style.cssText = `position: absolute; left: ${layer.x}%; top: ${layer.y}%; transform: translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale}); z-index: ${layer.zIndex}; pointer-events: none;`;
         if (layer.type === 'text') {
-          el.innerHTML = `<div style="color: ${layer.styles.color || 'white'}; font-family: ${layer.styles.font || 'inherit'}; font-size: ${layer.styles.size || 24}px; font-weight: ${layer.styles.bold ? 'bold' : 'normal'}; font-style: ${layer.styles.italic ? 'italic' : 'normal'}; text-shadow: ${layer.styles.shadow ? '0 2px 10px rgba(0,0,0,0.5)' : 'none'}; text-align: center; white-space: pre-wrap;">${layer.content}</div>`;
+          el.innerHTML = `<div style="color: ${layer.styles?.color || layer.color || 'white'}; font-family: ${layer.styles?.font || layer.fontFamily || 'inherit'}; font-size: ${layer.styles?.size || layer.fontSize || 24}px; font-weight: ${(layer.styles?.bold || layer.bold) ? 'bold' : 'normal'}; font-style: ${(layer.styles?.italic || layer.italic) ? 'italic' : 'normal'}; text-shadow: ${(layer.styles?.shadow || layer.shadow) ? '0 2px 10px rgba(0,0,0,0.5)' : 'none'}; text-align: center; white-space: pre-wrap;">${layer.content || layer.text || ''}</div>`;
         } else if (layer.type === 'sticker') {
-          el.innerHTML = `<div style="font-size: ${layer.styles.size || 80}px; pointer-events: none;">${layer.content}</div>`;
+          el.innerHTML = `<div style="font-size: ${layer.styles?.size || 80}px; pointer-events: none;">${layer.content || layer.emoji || ''}</div>`;
+        } else if (layer.type === 'music') {
+          const track = layer.track || window.HubbleEditor.state.musicTrack || {};
+          const artwork = track.artwork || layer.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80';
+          const title = track.title || layer.content || 'Music';
+          const artist = track.artist || layer.artist || '';
+
+          el.innerHTML = `
+            <div class="story-music-sticker-card" style="display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: rgba(20, 20, 25, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.2); border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: white; min-width: 140px; max-width: 260px; user-select: none;">
+              <div style="position: relative; width: 32px; height: 32px; flex-shrink: 0;">
+                <img src="${artwork}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(255,255,255,0.4);" alt="Artwork" />
+                <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.3); border-radius: 50%;">
+                  <span style="font-size: 11px;">🎵</span>
+                </div>
+              </div>
+              <div style="display: flex; flex-direction: column; min-width: 0; text-align: left;">
+                <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2;">${title}</span>
+                <span style="font-size: 10px; color: rgba(255,255,255,0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;">${artist}</span>
+              </div>
+            </div>
+          `;
+        } else if (layer.type === 'location') {
+          const loc = layer.loc || window.HubbleEditor.state.selectedLocation || {};
+          const locName = typeof loc === 'string' ? loc : (loc.displayName || loc.name || layer.content || 'Location');
+
+          el.innerHTML = `
+            <div class="story-location-sticker-card" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; background: linear-gradient(135deg, rgba(168,85,247,0.85) 0%, rgba(126,34,206,0.9) 100%); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.25); border-radius: 20px; box-shadow: 0 6px 20px rgba(168,85,247,0.35); color: white; user-select: none;">
+              <span style="font-size: 13px;">📍</span>
+              <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">${locName}</span>
+            </div>
+          `;
         }
         interactionWrapper.appendChild(el);
       });
@@ -11161,27 +16623,26 @@ window.initReviewSlider = function () {
   if (firstVideoBefore) {
     firstVideoBefore.addEventListener('play', () => {
       firstVideoAfter.play();
-      if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
-        window.HubbleEditor.GlobalAudio.sync(firstVideoBefore.currentTime);
-        window.HubbleEditor.GlobalAudio.play();
+      if (window.StoryAudioManager) {
+        window.StoryAudioManager.sync(firstVideoBefore.currentTime);
+        if (!window.StoryAudioManager.isMuted()) {
+          window.StoryAudioManager.play('preview');
+        }
       }
     });
     firstVideoBefore.addEventListener('pause', () => {
       firstVideoAfter.pause();
-      if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
-        window.HubbleEditor.GlobalAudio.pause();
-      }
     });
     firstVideoBefore.addEventListener('seeking', () => {
       firstVideoAfter.currentTime = firstVideoBefore.currentTime;
-      if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
-        window.HubbleEditor.GlobalAudio.sync(firstVideoBefore.currentTime);
+      if (window.StoryAudioManager) {
+        window.StoryAudioManager.sync(firstVideoBefore.currentTime);
       }
     });
     firstVideoBefore.addEventListener('seeked', () => {
       firstVideoAfter.currentTime = firstVideoBefore.currentTime;
-      if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
-        window.HubbleEditor.GlobalAudio.sync(firstVideoBefore.currentTime);
+      if (window.StoryAudioManager) {
+        window.StoryAudioManager.sync(firstVideoBefore.currentTime);
       }
     });
 
@@ -11284,9 +16745,149 @@ window.saveReviewDraft = function (btn) {
 };
 
 
+async function createMutedVideoBlob(fileOrBlob) {
+  if (!fileOrBlob) return null;
+
+  // 1. First attempt: Fast lossless packet-copy demux/remux with mediabunny (discards audio tracks)
+  try {
+    const input = new Input({
+      source: new BlobSource(fileOrBlob),
+      formats: ALL_FORMATS
+    });
+    const inputFormat = await input.getFormat();
+    const isMp4 = inputFormat.name.includes('MP4') || inputFormat.name.includes('QuickTime') || inputFormat.name.includes('ISO') || (fileOrBlob.type && fileOrBlob.type.includes('mp4'));
+    const outputFormat = isMp4 ? new Mp4OutputFormat() : new WebMOutputFormat();
+    const target = new BufferTarget();
+    const output = new Output({
+      target: target,
+      format: outputFormat
+    });
+    const conversion = await Conversion.init({
+      input,
+      output,
+      audio: () => ({ discard: true })
+    });
+    if (conversion.isValid) {
+      await conversion.execute();
+      if (target.buffer && target.buffer.byteLength > 0) {
+        const mimeType = isMp4 ? 'video/mp4' : 'video/webm';
+        console.log(`[Mute Video] Successfully remuxed muted video without audio track (${mimeType}, ${target.buffer.byteLength} bytes)`);
+        return new Blob([target.buffer], { type: mimeType });
+      }
+    }
+  } catch (err) {
+    console.warn('[Mute Video] Mediabunny remux notice, falling back to MediaStream capture:', err);
+  }
+
+  // 2. Fallback: Browser MediaRecorder on video-only stream
+  try {
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous';
+    const videoUrl = URL.createObjectURL(fileOrBlob);
+    video.src = videoUrl;
+
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = resolve;
+      video.onerror = reject;
+    });
+
+    const stream = video.captureStream ? video.captureStream() : (video.mozCaptureStream ? video.mozCaptureStream() : null);
+    if (stream && stream.getVideoTracks().length > 0) {
+      const videoTrack = stream.getVideoTracks()[0];
+      const mutedStream = new MediaStream([videoTrack]);
+      const mimeType = (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4')) ? 'video/mp4' : 'video/webm';
+      
+      const chunks = [];
+      const recorder = new MediaRecorder(mutedStream, { mimeType });
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      const recordPromise = new Promise((resolve) => {
+        recorder.onstop = () => {
+          resolve(new Blob(chunks, { type: mimeType }));
+        };
+      });
+
+      recorder.start();
+      video.currentTime = 0;
+      await video.play();
+
+      await new Promise((resolve) => {
+        video.onended = resolve;
+      });
+
+      recorder.stop();
+      URL.revokeObjectURL(videoUrl);
+      const mutedBlob = await recordPromise;
+      if (mutedBlob && mutedBlob.size > 0) {
+        console.log(`[Mute Video] Fallback recorder produced muted video (${mutedBlob.type}, ${mutedBlob.size} bytes)`);
+        return mutedBlob;
+      }
+    }
+    URL.revokeObjectURL(videoUrl);
+  } catch (err2) {
+    console.error('[Mute Video] MediaStream fallback failed:', err2);
+  }
+
+  return fileOrBlob;
+}
+
+
 async function resolveMediaToDataUrl(upload) {
   if (!upload) return null;
-  const isVideo = upload.type && upload.type.startsWith('video');
+  const isVideo = (upload.type && upload.type.startsWith('video')) || (upload.file && upload.file.type && upload.file.type.startsWith('video'));
+
+  // Video handling: Check mute state and remove audio track if muted
+  if (isVideo) {
+    let fileObj = upload.file || upload.blob;
+    if (!fileObj) {
+      let url = upload.editedUrl || upload.url || upload.src || upload.thumbUrl || upload.base64 || upload.dataUrl;
+      if (url && url.startsWith('blob:')) {
+        try {
+          const res = await fetch(url);
+          fileObj = await res.blob();
+        } catch (_) {}
+      }
+    }
+
+    const isMuted = !!(
+      (upload.editorState && upload.editorState.isMuted) ||
+      upload.isMuted ||
+      (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.isMuted)
+    );
+
+    if (fileObj) {
+      let finalBlob = fileObj;
+      if (isMuted) {
+        console.log('[resolveMediaToDataUrl] Processing video to remove audio track (MUTE enabled)...');
+        try {
+          const mutedBlob = await createMutedVideoBlob(fileObj);
+          if (mutedBlob) {
+            finalBlob = mutedBlob;
+            upload.file = mutedBlob;
+            upload.blob = mutedBlob;
+          }
+        } catch (muteErr) {
+          console.error('[resolveMediaToDataUrl] Failed to mute video:', muteErr);
+        }
+      }
+
+      try {
+        const dataUrl = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (e) => resolve(e.target.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(finalBlob);
+        });
+        if (dataUrl) return dataUrl;
+      } catch (e) {
+        console.warn('FileReader error on video fileObj:', e);
+      }
+    }
+  }
 
   // Rasterize edited image if editorState is present
   if (!isVideo && upload.editorState) {
@@ -11393,6 +16994,49 @@ async function resolveMediaToDataUrl(upload) {
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(layer.content || layer.emoji || '', x, y);
+          } else if (layer.type === 'location') {
+            const loc = layer.loc || state.selectedLocation || {};
+            const locName = typeof loc === 'string' ? loc : (loc.displayName || loc.name || layer.content || 'Location');
+            ctx.font = 'bold 24px Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const text = '📍 ' + locName;
+            const metrics = ctx.measureText(text);
+            const padX = 20;
+            const bgW = metrics.width + padX * 2;
+            const bgH = 38;
+            ctx.fillStyle = 'rgba(168,85,247,0.9)';
+            ctx.beginPath();
+            if (ctx.roundRect) {
+              ctx.roundRect(x - bgW / 2, y - bgH / 2, bgW, bgH, 19);
+            } else {
+              ctx.rect(x - bgW / 2, y - bgH / 2, bgW, bgH);
+            }
+            ctx.fill();
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(text, x, y);
+          } else if (layer.type === 'music') {
+            const track = layer.track || state.musicTrack || {};
+            const title = track.title || layer.content || 'Music';
+            const artist = track.artist || layer.artist || '';
+            const text = `🎵 ${title}${artist ? ' • ' + artist : ''}`;
+            ctx.font = 'bold 22px Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const metrics = ctx.measureText(text);
+            const padX = 20;
+            const bgW = Math.min(canvas.width * 0.85, metrics.width + padX * 2);
+            const bgH = 42;
+            ctx.fillStyle = 'rgba(20,20,25,0.85)';
+            ctx.beginPath();
+            if (ctx.roundRect) {
+              ctx.roundRect(x - bgW / 2, y - bgH / 2, bgW, bgH, 21);
+            } else {
+              ctx.rect(x - bgW / 2, y - bgH / 2, bgW, bgH);
+            }
+            ctx.fill();
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(text, x, y);
           }
           ctx.restore();
         });
@@ -11473,7 +17117,99 @@ async function resolveMediaToDataUrl(upload) {
   return url;
 }
 
+async function generateCompositeImageBlob(uploads, layout) {
+  return new Promise(async (resolve) => {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1080;
+      canvas.height = 1920;
+      const ctx = canvas.getContext('2d');
+      
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      let cols = 1, rows = 1;
+      if (layout === '2x2-grid' || uploads.length === 4) { cols = 2; rows = 2; }
+      else if (layout === 'side-by-side' || uploads.length === 2) { cols = 2; rows = 1; }
+      else if (layout === 'vertical-split') { cols = 1; rows = 2; }
+      else if (uploads.length >= 5) { cols = 2; rows = Math.ceil(uploads.length / 2); }
+      else if (uploads.length === 3) { cols = 2; rows = 2; } 
+
+      const gap = 15;
+      const totalGapX = gap * (cols - 1);
+      const totalGapY = gap * (rows - 1);
+      const cellW = (canvas.width - totalGapX) / cols;
+      const cellH = (canvas.height - totalGapY) / rows;
+
+      const images = [];
+      for (let i = 0; i < uploads.length; i++) {
+        const url = await resolveMediaToDataUrl(uploads[i]);
+        if (!url) continue;
+        
+        const img = new Image();
+        await new Promise((res) => {
+          img.onload = res;
+          img.onerror = res;
+          img.src = url;
+        });
+        images.push(img);
+      }
+
+      images.forEach((img, idx) => {
+        if (!img.width) return;
+        let row, col, w, h, cx, cy;
+        
+        if (uploads.length === 3 && idx === 0) {
+          col = 0; row = 0;
+          w = canvas.width; h = cellH;
+          cx = 0; cy = 0;
+        } else if (uploads.length === 3) {
+          col = idx - 1; row = 1;
+          w = cellW; h = cellH;
+          cx = col * (cellW + gap); cy = row * (cellH + gap);
+        } else {
+          col = idx % cols;
+          row = Math.floor(idx / cols);
+          w = cellW; h = cellH;
+          cx = col * (cellW + gap); cy = row * (cellH + gap);
+        }
+
+        const imgRatio = img.width / img.height;
+        const cellRatio = w / h;
+        let sx, sy, sw, sh;
+        
+        if (imgRatio > cellRatio) {
+           sh = img.height;
+           sw = img.height * cellRatio;
+           sx = (img.width - sw) / 2;
+           sy = 0;
+        } else {
+           sw = img.width;
+           sh = img.width / cellRatio;
+           sx = 0;
+           sy = (img.height - sh) / 2;
+        }
+
+        ctx.drawImage(img, sx, sy, sw, sh, cx, cy, w, h);
+      });
+      
+      canvas.toBlob((blob) => {
+        resolve(blob);
+      }, 'image/jpeg', 0.95);
+    } catch (e) {
+      console.error('[Compositing Error]', e);
+      resolve(null);
+    }
+  });
+}
+
 window.publishHubb = async function () {
+  if (window.isPublishingHubb) {
+    console.warn('[ShareHubs Publish] Publish already in progress, ignoring duplicate submission');
+    return;
+  }
+  window.isPublishingHubb = true;
+
   console.log('[ShareHubs Publish] Share button clicked, initiating publishing flow');
 
   const captionEl = document.getElementById('ch-caption-input');
@@ -11481,14 +17217,28 @@ window.publishHubb = async function () {
 
   if ((!window.chUploads || window.chUploads.length === 0) && !captionText) {
     if (window.showToast) window.showToast('Please upload media or enter a caption.');
+    window.isPublishingHubb = false;
     return;
   }
 
+  // Pause any active playback during upload
+  const activeVideos = document.querySelectorAll('#review-slider-wrapper video, #he-media-layer video');
+  activeVideos.forEach(v => {
+    try { v.pause(); } catch (_) {}
+  });
+  if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
+    try { window.HubbleEditor.GlobalAudio.pause(); } catch (_) {}
+  }
+
   const pubBtn = document.getElementById('review-publish-btn');
+  const isScheduled = !!window.chScheduledAt;
+  const scheduledIso = window.chScheduledAt;
+
   if (pubBtn) {
     pubBtn.disabled = true;
+    pubBtn.style.pointerEvents = 'none';
     pubBtn.style.opacity = '0.7';
-    pubBtn.innerHTML = '<i data-lucide="loader" class="animate-spin" style="width: 18px; height: 18px;"></i> Sharing HUB...';
+    pubBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 18px; height: 18px;"></i> ${isScheduled ? 'Scheduling HUB...' : 'Sharing HUB...'}`;
     if (window.lucide) window.lucide.createIcons();
   }
 
@@ -11499,22 +17249,57 @@ window.publishHubb = async function () {
       throw new Error('Please log in before sharing a HUB.');
     }
 
-    let uploadedMediaUrl = null;
-    let finalMediaType = 'image';
+    let allSuccess = true;
+    let anySuccess = false;
+    let lastData = null;
+    let finalMediaItems = [];
 
-    // Process first media item from window.chUploads for Stories
-    if (window.chUploads && window.chUploads.length > 0) {
-      const upload = window.chUploads[0];
+    let uploadsToProcess = window.chUploads ? [...window.chUploads] : [];
 
-      // Ensure the editor state is attached to the upload before resolving
-      if (window.HubbleEditor && window.HubbleEditor.state) {
-        upload.editorState = JSON.parse(JSON.stringify(window.HubbleEditor.state));
+    // Check if we need to composite images
+    const allImages = uploadsToProcess.length > 0 && uploadsToProcess.every(u => {
+       const type = u.type || (u.file ? u.file.type : '');
+       return !type.startsWith('video');
+    });
+
+    if (uploadsToProcess.length > 1 && allImages) {
+      console.log('[ShareHubs Publish] Multiple images detected. Generating composite image.');
+      if (pubBtn) pubBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 18px; height: 18px;"></i> Compositing...`;
+      if (window.lucide) window.lucide.createIcons();
+      
+      const layout = (window.HubbleEditor && window.HubbleEditor.activeLayout) || 'original';
+      const effectiveLayout = window.getEffectiveLayout ? window.getEffectiveLayout(layout, uploadsToProcess) : '2x2-grid';
+      
+      const compositeBlob = await generateCompositeImageBlob(uploadsToProcess, effectiveLayout);
+      
+      if (compositeBlob) {
+        if (pubBtn) pubBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 18px; height: 18px;"></i> ${isScheduled ? 'Scheduling HUB...' : 'Sharing HUB...'}`;
+        if (window.lucide) window.lucide.createIcons();
+        
+        // Wrap into single upload object format
+        const compositeUpload = {
+          file: compositeBlob,
+          type: 'image/jpeg',
+          editorState: null // Apply null because original edits are already rasterized into the composite!
+        };
+        uploadsToProcess = [compositeUpload];
       }
+    }
 
-      const dataUrl = await resolveMediaToDataUrl(upload);
-      if (dataUrl) {
+    // Process ALL media items from uploadsToProcess for Stories
+    if (uploadsToProcess && uploadsToProcess.length > 0) {
+      for (const upload of uploadsToProcess) {
+        // Ensure the editor state is attached to the upload before resolving if not already present
+        if (!upload.editorState && window.HubbleEditor && window.HubbleEditor.state) {
+          upload.editorState = JSON.parse(JSON.stringify(window.HubbleEditor.state));
+        }
+
+        const dataUrl = await resolveMediaToDataUrl(upload);
+        if (!dataUrl) continue;
+
         const rawType = upload.type || (upload.file ? upload.file.type : '');
-        finalMediaType = (rawType && rawType.startsWith('video')) ? 'video' : 'image';
+        let finalMediaType = (rawType && rawType.startsWith('video')) ? 'video' : 'image';
+        let uploadedMediaUrl = null;
 
         // Attempt direct Supabase storage upload
         try {
@@ -11552,47 +17337,113 @@ window.publishHubb = async function () {
         if (!uploadedMediaUrl) {
           uploadedMediaUrl = dataUrl;
         }
+
+        if (uploadedMediaUrl) {
+          finalMediaItems.push({ url: uploadedMediaUrl, type: finalMediaType });
+        }
       }
     }
 
-    if (!uploadedMediaUrl) {
+    if (finalMediaItems.length > 0) {
+      const musicTrack = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack) || null;
+      const selectedLocation = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.selectedLocation) || null;
+      const editorLayers = (window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.layers)
+        ? JSON.parse(JSON.stringify(window.HubbleEditor.state.layers))
+        : (window.chUploads && window.chUploads[0]?.editorState?.layers ? JSON.parse(JSON.stringify(window.chUploads[0].editorState.layers)) : []);
+
+      const musicPayload = musicTrack ? {
+        id: musicTrack.id || musicTrack.trackId || String(Date.now()),
+        trackId: musicTrack.trackId || musicTrack.id || '',
+        title: musicTrack.title || 'Music',
+        artist: musicTrack.artist || '',
+        artwork: musicTrack.artwork || musicTrack.albumArt || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80',
+        albumArt: musicTrack.artwork || musicTrack.albumArt || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80',
+        previewUrl: musicTrack.previewUrl || musicTrack.url || '',
+        url: musicTrack.previewUrl || musicTrack.url || '',
+        isMuted: !!musicTrack.isMuted,
+        muted: !!musicTrack.isMuted
+      } : null;
+
+      // Format payload specifically for story endpoints
+      const payload = {
+        mediaUrl: finalMediaItems[0].url,
+        mediaType: finalMediaItems[0].type,
+        mediaItems: finalMediaItems,
+        caption: captionText,
+        music: musicPayload,
+        location: selectedLocation ? (selectedLocation.displayName || selectedLocation.name) : null,
+        locationData: selectedLocation,
+        layers: editorLayers,
+        scheduledAt: scheduledIso || null
+      };
+
+      const API_URL = window.API_URL || '';
+      const endpoint = isScheduled ? `${API_URL}/api/stories/schedule` : `${API_URL}/api/stories`;
+
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (res.ok) {
+          lastData = await res.json();
+          anySuccess = true;
+          console.log(`[ShareHubs Publish] Story successfully ${isScheduled ? 'scheduled' : 'created'} with ${finalMediaItems.length} items.`);
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          console.error('[ShareHubs Publish Error] STORY API FAILED:', errData);
+        }
+      } catch (apiErr) {
+        console.error('[ShareHubs Publish Error] API Fetch failed:', apiErr);
+      }
+    }
+
+    if (!anySuccess) {
       console.error('[ShareHubs Publish Error] MEDIA UPLOAD FAILED: No valid media could be generated');
       throw new Error('No valid media could be generated for upload.');
     }
 
-    // Format payload specifically for /api/stories
-    const payload = {
-      mediaUrl: uploadedMediaUrl,
-      mediaType: finalMediaType,
-      scheduledAt: window.chScheduledAt || null
-    };
+    if (anySuccess) {
+      console.log(`[ShareHubs Publish] Story successfully ${isScheduled ? 'scheduled' : 'created'}:`, lastData);
 
-    const API_URL = window.API_URL || '';
-    let endpoint = `${API_URL}/api/stories`;
-    if (window.chScheduledAt) {
-      endpoint = `${API_URL}/api/stories/schedule`;
-    }
+      // Halt and release all media and audio instances immediately
+      if (typeof window.cleanupStoryMedia === 'function') {
+        window.cleanupStoryMedia();
+      }
 
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      console.log('[ShareHubs Publish] Story successfully created:', data);
+      // If we published an existing draft, remove it from drafts database
+      if (window.currentDraftId) {
+        try {
+          if (window.DraftsDB && window.DraftsDB.deleteDraft) {
+            await window.DraftsDB.deleteDraft(window.currentDraftId);
+          }
+        } catch (_) {}
+        window.currentDraftId = null;
+        window.currentDraftCreatedAt = null;
+        if (typeof window.renderDraftsList === 'function') {
+          window.renderDraftsList();
+        }
+      }
 
       // Clear creator state
       window.chUploads = [];
       window.chScheduledAt = null;
       if (captionEl) captionEl.value = '';
+      if (window.HubbleEditor && window.HubbleEditor.state) {
+        window.HubbleEditor.state.musicTrack = null;
+        window.HubbleEditor.state.selectedLocation = null;
+      }
+      if (window.renderAttachedStoryBadges) {
+        window.renderAttachedStoryBadges();
+      }
 
       if (window.showToast) {
-        window.showToast('HUB shared to your story! 🚀');
+        window.showToast(isScheduled ? 'HUBBS Scheduled successfully! 📅🚀' : 'HUBBS Posted successfully! 🚀✨');
       }
 
       // Return to home feed and reload stories
@@ -11606,15 +17457,6 @@ window.publishHubb = async function () {
       } else if (typeof window.loadStories === 'function') {
         await window.loadStories();
       }
-    } else {
-      const errData = await res.json().catch(() => ({}));
-      const errMsg = errData.error || errData.message || 'Unable to share HUB story. Please try again.';
-      console.error('[ShareHubs Publish Error] STORY API FAILED:', { status: res.status, error: errMsg });
-      if (window.showToast) {
-        window.showToast(errMsg, 'error');
-      } else {
-        alert(errMsg);
-      }
     }
   } catch (err) {
     console.error('[ShareHubs Publish Error] PUBLISH FAILED:', err.message || err);
@@ -11624,8 +17466,10 @@ window.publishHubb = async function () {
       alert(err.message || 'Unable to share HUB. Please try again.');
     }
   } finally {
+    window.isPublishingHubb = false;
     if (pubBtn) {
       pubBtn.disabled = false;
+      pubBtn.style.pointerEvents = 'auto';
       pubBtn.style.opacity = '1';
       pubBtn.innerHTML = '<span id="review-publish-text">Share the HUB</span> <i id="review-publish-icon" data-lucide="send" style="width: 18px; height: 18px;"></i>';
       if (window.lucide) window.lucide.createIcons();
@@ -11658,7 +17502,7 @@ window.openPublishedStory = function (card) {
   if (avatar) avatar.src = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&h=150&q=80';
 
   const name = document.getElementById('story-viewer-name');
-  if (name) name.innerText = 'Your Story';
+  if (name) name.innerText = 'Your HUBBs';
 
   const time = document.getElementById('story-viewer-time');
   if (time) time.innerText = 'Just now';
@@ -11714,7 +17558,9 @@ window.openPublishedStory = function (card) {
       mediaNode.loop = true;
       mediaNode.muted = true;
       mediaNode.playsInline = true;
-      mediaNode.autoplay = true;
+      mediaNode.autoplay = false;
+      mediaNode.preload = 'auto';
+      mediaNode.pause();
     } else {
       mediaNode = document.createElement('img');
       mediaNode.src = mData.url;
@@ -11733,9 +17579,39 @@ window.openPublishedStory = function (card) {
         const el = document.createElement('div');
         el.style.cssText = `position: absolute; left: ${layer.x}%; top: ${layer.y}%; transform: translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale}); z-index: ${layer.zIndex}; pointer-events: none;`;
         if (layer.type === 'text') {
-          el.innerHTML = `<div style="color: ${layer.styles.color || 'white'}; font-family: ${layer.styles.font || 'inherit'}; font-size: ${layer.styles.size || 24}px; font-weight: ${layer.styles.bold ? 'bold' : 'normal'}; font-style: ${layer.styles.italic ? 'italic' : 'normal'}; text-shadow: ${layer.styles.shadow ? '0 2px 10px rgba(0,0,0,0.5)' : 'none'}; text-align: center; white-space: pre-wrap;">${layer.content}</div>`;
+          el.innerHTML = `<div style="color: ${layer.styles?.color || layer.color || 'white'}; font-family: ${layer.styles?.font || layer.fontFamily || 'inherit'}; font-size: ${layer.styles?.size || layer.fontSize || 24}px; font-weight: ${(layer.styles?.bold || layer.bold) ? 'bold' : 'normal'}; font-style: ${(layer.styles?.italic || layer.italic) ? 'italic' : 'normal'}; text-shadow: ${(layer.styles?.shadow || layer.shadow) ? '0 2px 10px rgba(0,0,0,0.5)' : 'none'}; text-align: center; white-space: pre-wrap;">${layer.content || layer.text || ''}</div>`;
         } else if (layer.type === 'sticker') {
-          el.innerHTML = `<div style="font-size: ${layer.styles.size || 80}px; pointer-events: none;">${layer.content}</div>`;
+          el.innerHTML = `<div style="font-size: ${layer.styles?.size || 80}px; pointer-events: none;">${layer.content || layer.emoji || ''}</div>`;
+        } else if (layer.type === 'music') {
+          const track = layer.track || window.HubbleEditor.state.musicTrack || {};
+          const artwork = track.artwork || layer.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80';
+          const title = track.title || layer.content || 'Music';
+          const artist = track.artist || layer.artist || '';
+
+          el.innerHTML = `
+            <div class="story-music-sticker-card" style="display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: rgba(20, 20, 25, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.2); border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: white; min-width: 140px; max-width: 260px; user-select: none;">
+              <div style="position: relative; width: 32px; height: 32px; flex-shrink: 0;">
+                <img src="${artwork}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(255,255,255,0.4);" alt="Artwork" />
+                <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.3); border-radius: 50%;">
+                  <span style="font-size: 11px;">🎵</span>
+                </div>
+              </div>
+              <div style="display: flex; flex-direction: column; min-width: 0; text-align: left;">
+                <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2;">${title}</span>
+                <span style="font-size: 10px; color: rgba(255,255,255,0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;">${artist}</span>
+              </div>
+            </div>
+          `;
+        } else if (layer.type === 'location') {
+          const loc = layer.loc || window.HubbleEditor.state.selectedLocation || {};
+          const locName = typeof loc === 'string' ? loc : (loc.displayName || loc.name || layer.content || 'Location');
+
+          el.innerHTML = `
+            <div class="story-location-sticker-card" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; background: linear-gradient(135deg, rgba(168,85,247,0.85) 0%, rgba(126,34,206,0.9) 100%); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.25); border-radius: 20px; box-shadow: 0 6px 20px rgba(168,85,247,0.35); color: white; user-select: none;">
+              <span style="font-size: 13px;">📍</span>
+              <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">${locName}</span>
+            </div>
+          `;
         }
         interactionWrapper.appendChild(el);
       });
@@ -11975,6 +17851,26 @@ window.HubbleEditor = {
       btn.onclick = (e) => {
         e.preventDefault();
 
+        // Music Tool Button
+        if (btn.id === 'ch-tool-music-btn' || btn.classList.contains('ch-tool-music')) {
+          if (typeof window.openStoryMusicPicker === 'function') {
+            window.openStoryMusicPicker();
+          } else if (typeof window.openMusicPicker === 'function') {
+            window.openMusicPicker();
+          }
+          return;
+        }
+
+        // Location Tool Button
+        if (btn.id === 'ch-tool-location-btn' || btn.classList.contains('ch-tool-location')) {
+          if (typeof window.openStoryLocationPicker === 'function') {
+            window.openStoryLocationPicker();
+          } else if (typeof window.openLocationPicker === 'function') {
+            window.openLocationPicker();
+          }
+          return;
+        }
+
         if (!window.chUploads || window.chUploads.length === 0) {
           if (window.showToast) window.showToast('Please upload media first.');
           return;
@@ -11982,22 +17878,24 @@ window.HubbleEditor = {
 
         const tools = ['filters', 'crop', 'rotate', 'adjust', 'stickers', 'text'];
 
-        // Remove active class from all
-        buttons.forEach(b => {
-          b.classList.remove('active');
-          b.style.background = 'rgba(255,255,255,0.05)';
-          b.style.borderColor = 'rgba(255,255,255,0.1)';
-          b.style.boxShadow = 'none';
-          b.style.color = 'var(--text-main)';
-          const span = b.nextElementSibling;
-          if (span) {
-            span.style.color = 'var(--text-muted)';
-            span.style.fontWeight = 'normal';
-            span.style.textShadow = 'none';
+        // Remove active class from canvas-editing tools only (0-5)
+        buttons.forEach((b, i) => {
+          if (i < 6) {
+            b.classList.remove('active');
+            b.style.background = 'rgba(255,255,255,0.05)';
+            b.style.borderColor = 'rgba(255,255,255,0.1)';
+            b.style.boxShadow = 'none';
+            b.style.color = 'var(--text-main)';
+            const span = b.nextElementSibling;
+            if (span) {
+              span.style.color = 'var(--text-muted)';
+              span.style.fontWeight = 'normal';
+              span.style.textShadow = 'none';
+            }
           }
         });
 
-        // Add active to current
+        // Add active to current canvas tool
         btn.classList.add('active');
         btn.style.background = 'rgba(168, 85, 247, 0.2)';
         btn.style.borderColor = 'rgba(168, 85, 247, 0.5)';
@@ -12012,7 +17910,7 @@ window.HubbleEditor = {
 
         if (tools[index] === 'text' && HubbleEditor.activeSelectedLayerId) {
           this.openTextTool(HubbleEditor.activeSelectedLayerId);
-        } else {
+        } else if (tools[index]) {
           this.openTool(tools[index]);
         }
       };
@@ -12485,24 +18383,15 @@ window.HubbleEditor = {
     }
 
     this.updateRender();
+    const currentVideo = document.querySelector('#he-media-layer video');
+    if (currentVideo) {
+      currentVideo.pause();
+    }
   },
 
   cleanupMedia() {
-    const videos = [
-      ...document.querySelectorAll('#he-media-layer video'),
-      ...document.querySelectorAll('#review-slider-wrapper video')
-    ];
-    videos.forEach(v => {
-      v.pause();
-      v.removeAttribute('src');
-      v.load();
-    });
-    const mediaLayer = document.getElementById('he-media-layer');
-    if (mediaLayer) mediaLayer.innerHTML = '';
-
-    if (this.GlobalAudio) {
-      this.GlobalAudio.pause();
-      this.GlobalAudio.audio.currentTime = 0;
+    if (typeof window.cleanupStoryMedia === 'function') {
+      window.cleanupStoryMedia();
     }
   },
 
@@ -12726,6 +18615,63 @@ window.HubbleEditor = {
     this.updateRender();
   },
 
+  deleteLayer(layerId) {
+    this.pushHistory();
+    const layer = this.state.layers.find(l => l.id === layerId);
+    if (!layer) return;
+    this.state.layers = this.state.layers.filter(l => l.id !== layerId);
+
+    if (layer.type === 'music') {
+      this.state.musicTrack = null;
+      if (window.StoryAudioManager) window.StoryAudioManager.destroy();
+      if (window.chUploads && window.chUploads[this.activeMediaIndex]?.editorState) {
+        window.chUploads[this.activeMediaIndex].editorState.musicTrack = null;
+        if (window.chUploads[this.activeMediaIndex].editorState.layers) {
+          window.chUploads[this.activeMediaIndex].editorState.layers = window.chUploads[this.activeMediaIndex].editorState.layers.filter(l => l.type !== 'music');
+        }
+      }
+      const indicator = document.getElementById('ch-music-selected-indicator');
+      if (indicator) indicator.style.display = 'none';
+      if (window.showToast) window.showToast('Music removed.');
+    } else if (layer.type === 'location') {
+      this.state.selectedLocation = null;
+      if (window.chUploads && window.chUploads[this.activeMediaIndex]?.editorState) {
+        window.chUploads[this.activeMediaIndex].editorState.selectedLocation = null;
+        if (window.chUploads[this.activeMediaIndex].editorState.layers) {
+          window.chUploads[this.activeMediaIndex].editorState.layers = window.chUploads[this.activeMediaIndex].editorState.layers.filter(l => l.type !== 'location');
+        }
+      }
+      const indicator = document.getElementById('ch-location-selected-indicator');
+      if (indicator) indicator.style.display = 'none';
+      if (window.showToast) window.showToast('Location removed.');
+    }
+
+    if (this.textState && this.textState.layerId === layerId) {
+      this.textState = { text: '', color: '#ffffff', font: 'inherit', bold: false, italic: false, layerId: null };
+      this.renderPanels('text');
+    }
+    this.activeSelectedLayerId = null;
+    this.updateRender();
+    if (window.renderAttachedStoryBadges) window.renderAttachedStoryBadges();
+    if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+  },
+
+  createDeleteButton(layer) {
+    const deleteBtn = document.createElement('div');
+    deleteBtn.className = 'he-delete-btn';
+    deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+    deleteBtn.style.cssText = 'position: absolute; top: -14px; right: -14px; background: rgba(255,59,48,0.95); border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: all; box-shadow: 0 4px 12px rgba(0,0,0,0.4); z-index: 102; transition: transform 0.15s ease;';
+    deleteBtn.title = 'Remove';
+    deleteBtn.onmouseenter = () => { deleteBtn.style.transform = 'scale(1.1)'; };
+    deleteBtn.onmouseleave = () => { deleteBtn.style.transform = 'scale(1)'; };
+    deleteBtn.onmousedown = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.deleteLayer(layer.id);
+    };
+    return deleteBtn;
+  },
+
   addLayerControls(el, layer, interactionLayer) {
     const corners = [
       { class: 'he-resize-nw', cursor: 'nwse-resize', top: '-6px', left: '-6px' },
@@ -12755,11 +18701,11 @@ window.HubbleEditor = {
         const onMouseMove = (moveEv) => {
           const currentDist = Math.hypot(moveEv.clientX - centerX, moveEv.clientY - centerY);
           let newScale = startScale * (currentDist / startDist);
-          if (newScale < 0.1) newScale = 0.1;
-          if (newScale > 10) newScale = 10;
+          if (newScale < 0.2) newScale = 0.2;
+          if (newScale > 6) newScale = 6;
 
-          layer.scale = newScale;
-          el.style.transform = `translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale})`;
+          layer.scale = Math.round(newScale * 100) / 100;
+          el.style.transform = `translate(-50%, -50%) rotate(${layer.rotation || 0}deg) scale(${layer.scale})`;
         };
 
         const onMouseUp = () => {
@@ -12773,6 +18719,84 @@ window.HubbleEditor = {
       };
       el.appendChild(handle);
     });
+
+    // Rotate Stalk & Handle
+    const rotateStalk = document.createElement('div');
+    rotateStalk.className = 'he-rotate-stalk';
+    rotateStalk.style.cssText = 'position: absolute; top: -22px; left: 50%; transform: translateX(-50%); width: 1.5px; height: 18px; background: rgba(168,85,247,0.8); pointer-events: none; z-index: 99;';
+    el.appendChild(rotateStalk);
+
+    const rotateHandle = document.createElement('div');
+    rotateHandle.className = 'he-rotate-handle';
+    rotateHandle.style.cssText = 'position: absolute; top: -30px; left: 50%; transform: translateX(-50%); width: 14px; height: 14px; background: #a855f7; border: 2px solid white; border-radius: 50%; z-index: 100; cursor: grab; box-shadow: 0 2px 6px rgba(0,0,0,0.4); pointer-events: all;';
+    rotateHandle.title = 'Rotate';
+
+    rotateHandle.onmousedown = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.pushHistory();
+
+      const rect = interactionLayer.getBoundingClientRect();
+      const centerX = rect.left + (layer.x / 100) * rect.width;
+      const centerY = rect.top + (layer.y / 100) * rect.height;
+
+      const onMouseMove = (moveEv) => {
+        const rad = Math.atan2(moveEv.clientY - centerY, moveEv.clientX - centerX);
+        let deg = (rad * (180 / Math.PI)) + 90; // offset so top handle is 0
+        while (deg < 0) deg += 360;
+        while (deg >= 360) deg -= 360;
+
+        // Snap to 0, 90, 180, 270 degrees
+        const snapAngles = [0, 90, 180, 270, 360];
+        snapAngles.forEach(snap => {
+          if (Math.abs(deg - snap) < 5) deg = (snap === 360) ? 0 : snap;
+        });
+
+        layer.rotation = Math.round(deg);
+        el.style.transform = `translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale || 1})`;
+      };
+
+      const onMouseUp = () => {
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+        this.updateRender();
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    };
+    el.appendChild(rotateHandle);
+
+    // Mute / Unmute Toggle on Music Sticker Selection
+    if (layer.type === 'music') {
+      const isMuted = layer.isMuted || false;
+      const muteToggle = document.createElement('div');
+      muteToggle.className = 'he-mute-badge-btn';
+      muteToggle.style.cssText = 'position: absolute; bottom: -28px; left: 50%; transform: translateX(-50%); background: rgba(20,20,25,0.92); border: 1px solid rgba(255,255,255,0.25); border-radius: 14px; padding: 3px 10px; display: flex; align-items: center; gap: 5px; cursor: pointer; pointer-events: all; box-shadow: 0 4px 12px rgba(0,0,0,0.4); z-index: 100; font-size: 10px; color: white; white-space: nowrap; user-select: none; backdrop-filter: blur(8px);';
+      muteToggle.innerHTML = isMuted
+        ? '<span style="font-size: 12px;">🔇</span> <span style="font-weight: 600;">Unmute</span>'
+        : '<span style="font-size: 12px;">🔊</span> <span style="font-weight: 600;">Mute</span>';
+
+      muteToggle.onmousedown = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        layer.isMuted = !layer.isMuted;
+        if (HubbleEditor.state.musicTrack) {
+          HubbleEditor.state.musicTrack.isMuted = layer.isMuted;
+        }
+        if (window.StoryAudioManager) {
+          if (layer.isMuted) {
+            window.StoryAudioManager.mute();
+          } else {
+            window.StoryAudioManager.unmute();
+          }
+        }
+        HubbleEditor.updateRender();
+        if (window.saveCurrentDraft) window.saveCurrentDraft(true);
+        if (window.showToast) window.showToast(layer.isMuted ? 'Music muted 🔇' : 'Music unmuted 🔊');
+      };
+      el.appendChild(muteToggle);
+    }
   },
 
   updateRender() {
@@ -12805,16 +18829,27 @@ window.HubbleEditor = {
       if (media.type.startsWith('video/')) {
         node = document.createElement('video');
         node.src = URL.createObjectURL(media.file);
-        node.loop = true; node.muted = window.HubbleEditor.state.isMuted; node.autoplay = true; node.playsInline = true;
+        node.loop = true;
+        node.muted = window.HubbleEditor.state.isMuted;
+        node.autoplay = false;
+        node.playsInline = true;
+        node.preload = 'auto';
 
-        // Sync Audio
+        // Sync Audio timestamp if media is scrubbing/playing
         node.addEventListener('play', () => {
-          window.HubbleEditor.GlobalAudio.sync(node.currentTime);
-          window.HubbleEditor.GlobalAudio.play();
+          if (window.StoryAudioManager) {
+            window.StoryAudioManager.sync(node.currentTime);
+            if (!window.StoryAudioManager.isMuted()) {
+              window.StoryAudioManager.play('editor');
+            }
+          }
         });
-        node.addEventListener('pause', () => window.HubbleEditor.GlobalAudio.pause());
-        node.addEventListener('seeking', () => window.HubbleEditor.GlobalAudio.sync(node.currentTime));
-        node.addEventListener('seeked', () => window.HubbleEditor.GlobalAudio.sync(node.currentTime));
+        node.addEventListener('seeking', () => {
+          if (window.StoryAudioManager) window.StoryAudioManager.sync(node.currentTime);
+        });
+        node.addEventListener('seeked', () => {
+          if (window.StoryAudioManager) window.StoryAudioManager.sync(node.currentTime);
+        });
 
       } else {
         node = document.createElement('img');
@@ -12824,6 +18859,9 @@ window.HubbleEditor = {
       node.style.cssText = 'width: 100%; height: 100%; object-fit: contain; transform-origin: center center; transition: all 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);';
       node.draggable = false;
       mediaLayer.appendChild(node);
+      if (node.tagName === 'VIDEO') {
+        node.pause();
+      }
     }
 
     // Ensure we have a reference to the active media node
@@ -12859,39 +18897,63 @@ window.HubbleEditor = {
       interactionLayer.style.clipPath = 'none';
     }
 
-    // Render Interaction Layers (Stickers / Text)
+    // Render Interaction Layers (Stickers / Text / Music / Location)
     interactionLayer.innerHTML = '';
     this.state.layers.forEach((layer, idx) => {
       const el = document.createElement('div');
       el.dataset.layerId = layer.id;
-      el.style.cssText = `position: absolute; left: ${layer.x}%; top: ${layer.y}%; transform: translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale}); z-index: ${layer.zIndex}; pointer-events: all; cursor: grab;`;
+      el.style.cssText = `position: absolute; left: ${layer.x}%; top: ${layer.y}%; transform: translate(-50%, -50%) rotate(${layer.rotation || 0}deg) scale(${layer.scale || 1}); z-index: ${layer.zIndex || 10}; pointer-events: all; cursor: grab;`;
 
       if (layer.type === 'text') {
-        el.innerHTML = `<div style="color: ${layer.styles.color || 'white'}; font-family: ${layer.styles.font || 'inherit'}; font-size: ${layer.styles.size || 24}px; font-weight: ${layer.styles.bold ? 'bold' : 'normal'}; font-style: ${layer.styles.italic ? 'italic' : 'normal'}; text-shadow: ${layer.styles.shadow ? '0 2px 10px rgba(0,0,0,0.5)' : 'none'}; text-align: center; white-space: pre-wrap;">${layer.content}</div>`;
+        el.innerHTML = `<div style="color: ${layer.styles?.color || layer.color || 'white'}; font-family: ${layer.styles?.font || layer.fontFamily || 'inherit'}; font-size: ${layer.styles?.size || layer.fontSize || 24}px; font-weight: ${(layer.styles?.bold || layer.bold) ? 'bold' : 'normal'}; font-style: ${(layer.styles?.italic || layer.italic) ? 'italic' : 'normal'}; text-shadow: ${(layer.styles?.shadow || layer.shadow) ? '0 2px 10px rgba(0,0,0,0.5)' : 'none'}; text-align: center; white-space: pre-wrap;">${layer.content || layer.text || ''}</div>`;
       } else if (layer.type === 'sticker') {
-        el.innerHTML = `<div style="font-size: ${layer.styles.size || 80}px; pointer-events: none;">${layer.content}</div>`;
+        el.innerHTML = `<div style="font-size: ${layer.styles?.size || 80}px; pointer-events: none;">${layer.content || layer.emoji || ''}</div>`;
+      } else if (layer.type === 'music') {
+        const track = layer.track || window.HubbleEditor.state.musicTrack || {};
+        const artwork = track.artwork || layer.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&h=150&q=80';
+        const title = track.title || layer.content || 'Music';
+        const artist = track.artist || layer.artist || '';
+        const isMuted = layer.isMuted || false;
+
+        el.innerHTML = `
+          <div class="story-music-sticker-card" style="display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: rgba(20, 20, 25, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.2); border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: white; min-width: 140px; max-width: 260px; user-select: none;">
+            <div style="position: relative; width: 32px; height: 32px; flex-shrink: 0;">
+              <img src="${artwork}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(255,255,255,0.4); ${isMuted ? '' : 'animation: rotateDisc 8s linear infinite;'}" alt="Artwork" />
+              <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.3); border-radius: 50%;">
+                <span style="font-size: 11px;">${isMuted ? '🔇' : '🎵'}</span>
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; min-width: 0; text-align: left;">
+              <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2;">${title}</span>
+              <span style="font-size: 10px; color: rgba(255,255,255,0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;">${artist}</span>
+            </div>
+          </div>
+        `;
+      } else if (layer.type === 'location') {
+        const loc = layer.loc || window.HubbleEditor.state.selectedLocation || {};
+        const locName = typeof loc === 'string' ? loc : (loc.displayName || loc.name || layer.content || 'Location');
+
+        el.innerHTML = `
+          <div class="story-location-sticker-card" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; background: linear-gradient(135deg, rgba(168,85,247,0.85) 0%, rgba(126,34,206,0.9) 100%); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.25); border-radius: 20px; box-shadow: 0 6px 20px rgba(168,85,247,0.35); color: white; user-select: none;">
+            <span style="font-size: 13px;">📍</span>
+            <span style="font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">${locName}</span>
+          </div>
+        `;
+      }
+
+      // Boundary check: dim if dragged far off-canvas, but maintain active state
+      if (layer.x < -10 || layer.x > 110 || layer.y < -10 || layer.y > 110) {
+        el.style.opacity = '0.2';
+      } else {
+        el.style.opacity = '1';
       }
 
       const isActive = HubbleEditor.activeSelectedLayerId === layer.id;
       if (isActive) {
-        el.style.border = '2px dashed rgba(255,255,255,0.8)';
+        el.style.border = '2px dashed rgba(255,255,255,0.85)';
         el.style.padding = '8px';
         el.style.borderRadius = '12px';
-        const deleteBtn = document.createElement('div');
-        deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
-        deleteBtn.style.cssText = 'position: absolute; top: -14px; right: -14px; background: rgba(255,59,48,0.9); border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: all; box-shadow: 0 4px 10px rgba(0,0,0,0.3); z-index: 100;';
-        deleteBtn.onmousedown = (ev) => {
-          ev.stopPropagation();
-          HubbleEditor.pushHistory();
-          HubbleEditor.state.layers = HubbleEditor.state.layers.filter(l => l.id !== layer.id);
-          if (HubbleEditor.textState && HubbleEditor.textState.layerId === layer.id) {
-            HubbleEditor.textState = { text: '', color: '#ffffff', font: 'inherit', bold: false, italic: false, layerId: null };
-            HubbleEditor.renderPanels('text');
-          }
-          HubbleEditor.activeSelectedLayerId = null;
-          HubbleEditor.updateRender();
-        };
-        el.appendChild(deleteBtn);
+        el.appendChild(HubbleEditor.createDeleteButton(layer));
         HubbleEditor.addLayerControls(el, layer, interactionLayer);
       } else {
         el.style.border = 'none';
@@ -12916,26 +18978,11 @@ window.HubbleEditor = {
         // Fast active state DOM update
         Array.from(interactionLayer.children).forEach(child => {
           if (child.dataset.layerId == layer.id) {
-            child.style.border = '2px dashed rgba(255,255,255,0.8)';
+            child.style.border = '2px dashed rgba(255,255,255,0.85)';
             child.style.padding = '8px';
             child.style.borderRadius = '12px';
             if (!child.querySelector('.he-delete-btn')) {
-              const deleteBtn = document.createElement('div');
-              deleteBtn.className = 'he-delete-btn';
-              deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
-              deleteBtn.style.cssText = 'position: absolute; top: -14px; right: -14px; background: rgba(255,59,48,0.9); border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: all; box-shadow: 0 4px 10px rgba(0,0,0,0.3); z-index: 100;';
-              deleteBtn.onmousedown = (ev) => {
-                ev.stopPropagation();
-                HubbleEditor.pushHistory();
-                HubbleEditor.state.layers = HubbleEditor.state.layers.filter(l => l.id !== layer.id);
-                if (HubbleEditor.textState && HubbleEditor.textState.layerId === layer.id) {
-                  HubbleEditor.textState = { text: '', color: '#ffffff', font: 'inherit', bold: false, italic: false, layerId: null };
-                  HubbleEditor.renderPanels('text');
-                }
-                HubbleEditor.activeSelectedLayerId = null;
-                HubbleEditor.updateRender();
-              };
-              child.appendChild(deleteBtn);
+              child.appendChild(HubbleEditor.createDeleteButton(layer));
               HubbleEditor.addLayerControls(child, layer, interactionLayer);
             }
           } else {
@@ -12944,7 +18991,7 @@ window.HubbleEditor = {
             child.style.borderRadius = '0';
             const dBtn = child.querySelector('.he-delete-btn');
             if (dBtn) dBtn.remove();
-            child.querySelectorAll('.he-resize-handle').forEach(h => h.remove());
+            child.querySelectorAll('.he-resize-handle, .he-rotate-handle, .he-rotate-stalk, .he-mute-badge-btn').forEach(h => h.remove());
           }
         });
 
@@ -12961,7 +19008,7 @@ window.HubbleEditor = {
         const startTop = layer.y;
 
         // Bring to front
-        layer.zIndex = Math.max(...this.state.layers.map(l => l.zIndex)) + 1;
+        layer.zIndex = Math.max(10, ...this.state.layers.map(l => l.zIndex || 10)) + 1;
         el.style.zIndex = layer.zIndex;
 
         const move = (ev) => {
@@ -12969,11 +19016,24 @@ window.HubbleEditor = {
           const rect = interactionLayer.getBoundingClientRect();
           const dx = ((ev.clientX - startX) / rect.width) * 100;
           const dy = ((ev.clientY - startY) / rect.height) * 100;
-          layer.x = startLeft + dx;
-          layer.y = startTop + dy;
+          let newX = startLeft + dx;
+          let newY = startTop + dy;
+
+          // Safe area snapping to horizontal center (50%) and vertical center (50%)
+          if (Math.abs(newX - 50) < 2) newX = 50;
+          if (Math.abs(newY - 50) < 2) newY = 50;
+
+          layer.x = Math.round(newX * 10) / 10;
+          layer.y = Math.round(newY * 10) / 10;
+
           requestAnimationFrame(() => {
             el.style.left = layer.x + '%';
             el.style.top = layer.y + '%';
+            if (layer.x < -10 || layer.x > 110 || layer.y < -10 || layer.y > 110) {
+              el.style.opacity = '0.2';
+            } else {
+              el.style.opacity = '1';
+            }
           });
         };
         const up = () => {
@@ -13001,6 +19061,7 @@ window.HubbleEditor = {
               child.style.borderRadius = '0';
               const dBtn = child.querySelector('.he-delete-btn');
               if (dBtn) dBtn.remove();
+              child.querySelectorAll('.he-resize-handle, .he-rotate-handle, .he-rotate-stalk, .he-mute-badge-btn').forEach(h => h.remove());
             });
           }
         }
@@ -13335,389 +19396,69 @@ window.HubbleEditor = {
   },
 
   GlobalAudio: {
-    audio: new Audio(),
+    get audio() {
+      return window.StoryAudioManager ? window.StoryAudioManager.audio : null;
+    },
     init() {
-      this.audio.loop = true;
+      if (window.StoryAudioManager) window.StoryAudioManager.init();
     },
     play() {
-      if (window.HubbleEditor.state.musicTrack) {
-        this.audio.play().catch(e => console.error("Audio play error", e));
-      }
+      if (window.StoryAudioManager) window.StoryAudioManager.play('editor');
     },
     pause() {
-      this.audio.pause();
+      if (window.StoryAudioManager) window.StoryAudioManager.pause();
+    },
+    resume() {
+      if (window.StoryAudioManager) window.StoryAudioManager.resume();
     },
     setTrack(trackUrl) {
-      this.audio.src = trackUrl;
-      this.audio.load();
+      if (window.StoryAudioManager) window.StoryAudioManager.load(trackUrl, 'editor');
     },
     sync(time) {
-      if (Math.abs(this.audio.currentTime - time) > 0.2) {
-        this.audio.currentTime = time;
-      }
+      if (window.StoryAudioManager) window.StoryAudioManager.sync(time);
     },
     stop() {
-      this.audio.pause();
-      this.audio.currentTime = 0;
+      if (window.StoryAudioManager) window.StoryAudioManager.stop();
+    },
+    destroy() {
+      if (window.StoryAudioManager) window.StoryAudioManager.destroy();
     }
   },
 
   openLocationSelector() {
-    const renderContainer = document.getElementById('he-render-container');
-    if (!renderContainer) return;
-
-    let locationOverlay = document.getElementById('he-location-overlay');
-
-    if (locationOverlay) {
-      // Toggle off if already open
-      locationOverlay.remove();
-      if (this._locationSearchTimeout) clearTimeout(this._locationSearchTimeout);
-      this.state.selectedLocation = null;
-      return;
-    }
-
-    locationOverlay = document.createElement('div');
-    locationOverlay.id = 'he-location-overlay';
-    // Style as a glassmorphism widget placed at top-left inside media preview
-    locationOverlay.style.cssText = `
-        position: absolute;
-        top: 20px;
-        left: 20px;
-        width: 280px;
-        max-width: calc(100% - 40px);
-        z-index: 50; /* Ensure it's above canvas but inside render container */
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-    `;
-
-    // Prevent dragging/zooming when interacting with search overlay
-    locationOverlay.addEventListener('mousedown', e => e.stopPropagation());
-    locationOverlay.addEventListener('wheel', e => e.stopPropagation());
-    locationOverlay.addEventListener('touchstart', e => e.stopPropagation());
-
-    const searchInputWrapper = document.createElement('div');
-    searchInputWrapper.style.cssText = `
-        position: relative;
-        width: 100%;
-        background: rgba(0,0,0,0.5);
-        backdrop-filter: blur(12px);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 12px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        transition: border-color 0.2s;
-    `;
-
-    const searchIcon = document.createElement('i');
-    searchIcon.setAttribute('data-lucide', 'map-pin');
-    searchIcon.style.cssText = 'position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: rgba(255,255,255,0.6);';
-    searchInputWrapper.appendChild(searchIcon);
-
-    const searchInput = document.createElement('input');
-    searchInput.id = 'he-location-search-input';
-    searchInput.type = 'text';
-    searchInput.placeholder = '📍 Search location...';
-    // If we have a selected location, show its name
-    if (this.state.selectedLocation && this.state.selectedLocation.displayName) {
-      searchInput.value = this.state.selectedLocation.displayName;
-    }
-    searchInput.style.cssText = `
-        width: 100%;
-        background: transparent;
-        border: none;
-        padding: 12px 14px 12px 38px;
-        color: white;
-        font-family: inherit;
-        font-size: 0.9rem;
-        outline: none;
-        box-sizing: border-box;
-        pointer-events: auto;
-        user-select: auto;
-    `;
-
-    // Ensure clicking the input actually focuses it, bypassing any global preventDefault
-    searchInput.addEventListener('mousedown', e => {
-      e.stopPropagation();
-    });
-    searchInput.addEventListener('click', e => {
-      e.stopPropagation();
-      searchInput.focus();
-    });
-
-    // Prevent typing from triggering editor shortcuts (e.g. Backspace deleting layers)
-    searchInput.addEventListener('keydown', e => {
-      e.stopPropagation();
-      if (e.key === 'Escape') {
-        document.getElementById('he-location-results-container').style.display = 'none';
-        searchInput.blur();
-      }
-    });
-
-    searchInput.addEventListener('input', e => {
-      if (window.HubbleEditor) window.HubbleEditor.handleLocationSearch(e.target.value);
-    });
-
-    searchInput.addEventListener('focus', () => {
-      searchInputWrapper.style.borderColor = 'var(--primary)';
-      document.getElementById('he-location-results-container').style.display = 'flex';
-      // Only trigger search if there is a query, else show empty
-      if (searchInput.value.trim().length >= 2) {
-        this.handleLocationSearch(searchInput.value);
-      } else {
-        this.renderLocationResults(null, 'empty_default');
-      }
-    });
-
-    searchInput.addEventListener('blur', () => {
-      searchInputWrapper.style.borderColor = 'rgba(255,255,255,0.1)';
-    });
-
-    searchInputWrapper.appendChild(searchInput);
-
-    const resultsContainer = document.createElement('div');
-    resultsContainer.id = 'he-location-results-container';
-    resultsContainer.style.cssText = `
-        display: none;
-        flex-direction: column;
-        gap: 8px;
-        width: 100%;
-        background: rgba(0,0,0,0.6);
-        backdrop-filter: blur(12px);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 12px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.4);
-        /* Approx height for 3 items (approx 58px each + gaps/padding) */
-        max-height: 200px;
-        overflow-y: auto;
-        padding: 8px;
-        box-sizing: border-box;
-    `;
-
-    // Add custom thin scrollbar css rules for this container implicitly
-    // (We will add the scrollbar styling in style.css or rely on the global one if it exists)
-    resultsContainer.classList.add('he-thin-scrollbar');
-
-    locationOverlay.appendChild(searchInputWrapper);
-    locationOverlay.appendChild(resultsContainer);
-
-    renderContainer.appendChild(locationOverlay);
-
-    if (window.lucide) window.lucide.createIcons();
-
-    // Close dropdown on outside click
-    const outsideClickListener = (e) => {
-      if (!locationOverlay.contains(e.target)) {
-        resultsContainer.style.display = 'none';
-      }
-    };
-    document.addEventListener('mousedown', outsideClickListener);
-
-    // Cleanup listener when overlay is removed
-    const observer = new MutationObserver((mutations) => {
-      mutations.forEach((mutation) => {
-        mutation.removedNodes.forEach((node) => {
-          if (node === locationOverlay) {
-            document.removeEventListener('mousedown', outsideClickListener);
-            observer.disconnect();
-          }
-        });
-      });
-    });
-    observer.observe(renderContainer, { childList: true });
-
-    // Initial render empty
-    this.renderLocationResults(null, 'empty_default');
-
-    searchInput.focus();
-  },
-
-  _locationSearchTimeout: null,
-  _locationSearchAbortController: null,
-  _lastLocationResults: null,
-  _lastLocationState: 'default',
-
-  handleLocationSearch(query) {
-    if (this._locationSearchTimeout) clearTimeout(this._locationSearchTimeout);
-    if (this._locationSearchAbortController) this._locationSearchAbortController.abort();
-
-    if (!query || query.trim().length < 2) {
-      this.renderLocationResults(null, 'empty_default');
-      return;
-    }
-
-    this.renderLocationResults(null, 'loading');
-
-    this._locationSearchTimeout = setTimeout(async () => {
-      this._locationSearchAbortController = new AbortController();
-      try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&addressdetails=1&limit=5`, {
-          signal: this._locationSearchAbortController.signal,
-          headers: { 'Accept-Language': 'en-US,en;q=0.9' }
-        });
-        if (!res.ok) throw new Error('Network error');
-        const data = await res.json();
-
-        if (data && data.length > 0) {
-          const results = data.map(item => {
-            const addr = item.address;
-            const mainName = item.name || addr.city || addr.town || addr.village || 'Unknown';
-            const parts = [];
-            if (addr.city && addr.city !== mainName) parts.push(addr.city);
-            if (addr.state) parts.push(addr.state);
-            if (addr.country) parts.push(addr.country);
-            return {
-              id: item.place_id,
-              displayName: mainName,
-              subText: parts.join(', '),
-              lat: item.lat,
-              lon: item.lon,
-              type: item.type
-            };
-          });
-          this.renderLocationResults(results, 'results');
-        } else {
-          this.renderLocationResults(null, 'empty');
-        }
-      } catch (err) {
-        if (err.name !== 'AbortError') {
-          console.error("Location search error:", err);
-          this.renderLocationResults(null, 'error');
-        }
-      }
-    }, 300);
-  },
-
-  renderLocationResults(results, state) {
-    this._lastLocationResults = results;
-    this._lastLocationState = state;
-
-    const container = document.getElementById('he-location-results-container');
-    if (!container) return;
-
-    const buildItemHTML = (id, mainText, subText, isSelected) => {
-      const bg = isSelected ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.02)';
-      const border = isSelected ? 'rgba(168,85,247,0.5)' : 'transparent';
-      const checkIcon = isSelected ? `<i data-lucide="check" style="color: var(--primary); width: 16px; height: 16px; margin-left: auto;"></i>` : '';
-      return `
-          <div onclick="if(window.HubbleEditor) window.HubbleEditor.selectLocation('${id.replace(/'/g, "\\'")}', '${mainText.replace(/'/g, "\\'")}', '${subText ? subText.replace(/'/g, "\\'") : ''}')" style="display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 12px; background: ${bg}; border: 1px solid ${border}; cursor: pointer; transition: all 0.2s;" onmouseover="if(!${isSelected}){this.style.background='rgba(255,255,255,0.05)'; this.style.borderColor='rgba(255,255,255,0.1)';}" onmouseout="if(!${isSelected}){this.style.background='rgba(255,255,255,0.02)'; this.style.borderColor='transparent';}">
-            <div style="width: 32px; height: 32px; border-radius: 50%; background: rgba(255,255,255,0.05); display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-              <i data-lucide="map-pin" style="color: ${isSelected ? 'var(--primary)' : 'rgba(255,255,255,0.6)'}; width: 14px; height: 14px;"></i>
-            </div>
-            <div style="display: flex; flex-direction: column; overflow: hidden; text-align: left;">
-                <span style="color: white; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${mainText}</span>
-                ${subText ? `<span style="color: rgba(255,255,255,0.4); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${subText}</span>` : ''}
-            </div>
-            ${checkIcon}
-          </div>
-        `;
-    };
-
-    if (state === 'empty_default') {
-      container.style.display = 'none'; // hide if nothing typed
-    } else if (state === 'loading') {
-      container.style.display = 'flex';
-      container.innerHTML = `
-        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; gap: 12px; color: rgba(255,255,255,0.6);">
-            <div class="he-spinner" style="width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.2); border-top-color: var(--primary); border-radius: 50%; animation: he-spin 1s linear infinite;"></div>
-        </div>`;
-    } else if (state === 'empty') {
-      container.style.display = 'flex';
-      container.innerHTML = `
-        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; gap: 8px; color: rgba(255,255,255,0.6);">
-            <span style="font-size: 0.85rem;">No locations found.</span>
-        </div>`;
-    } else if (state === 'error') {
-      container.style.display = 'flex';
-      container.innerHTML = `
-        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; gap: 8px; color: rgba(255,255,255,0.6);">
-            <span style="font-size: 0.85rem;">Couldn't load locations.</span>
-        </div>`;
-    } else if (state === 'results' && results) {
-      container.style.display = 'flex';
-      let html = `<div style="display: flex; flex-direction: column; gap: 8px;">`;
-      results.forEach(res => {
-        const isSelected = this.state.selectedLocation && String(this.state.selectedLocation.id) === String(res.id);
-        html += buildItemHTML(String(res.id), res.displayName, res.subText, isSelected);
-      });
-      html += `</div>`;
-      container.innerHTML = html;
-      if (window.lucide) window.lucide.createIcons();
+    if (window.openStoryLocationPicker) {
+      window.openStoryLocationPicker();
     }
   },
 
   selectLocation(id, displayName, subText) {
-    this.state.selectedLocation = {
-      id: id,
-      displayName: displayName,
-      subText: subText
-    };
-
-    const searchInput = document.getElementById('he-location-search-input');
-    if (searchInput) {
-      searchInput.value = displayName;
+    if (window.selectStoryLocation) {
+      window.selectStoryLocation({ id, name: displayName, displayName, subText });
+    } else {
+      this.state.selectedLocation = { id, displayName, subText };
     }
+  },
 
-    const resultsContainer = document.getElementById('he-location-results-container');
-    if (resultsContainer) {
-      resultsContainer.style.display = 'none';
+  removeLocation() {
+    if (window.removeStoryLocation) {
+      window.removeStoryLocation();
+    } else {
+      this.state.selectedLocation = null;
     }
   },
 
   openMusicSelector() {
-    const modal = document.getElementById('he-music-modal');
-    const list = document.getElementById('he-music-list');
-    const removeBtn = document.getElementById('he-music-remove-btn');
-    if (!modal || !list) return;
-
-    // Mock Tracks
-    const tracks = [
-      { id: 'm1', title: 'Summer Vibes', artist: 'Chill Wave', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3' },
-      { id: 'm2', title: 'Urban Flow', artist: 'Beat Maker', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3' },
-      { id: 'm3', title: 'Ambient Journey', artist: 'Space Echo', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3' },
-      { id: 'm4', title: 'Acoustic Sunrise', artist: 'Folk Tales', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3' }
-    ];
-
-    list.innerHTML = '';
-    tracks.forEach(t => {
-      const isSelected = window.HubbleEditor.state.musicTrack && window.HubbleEditor.state.musicTrack.id === t.id;
-      const el = document.createElement('div');
-      el.style.cssText = `display: flex; align-items: center; justify-content: space-between; padding: 12px; border-radius: 12px; background: ${isSelected ? 'rgba(168,85,247,0.2)' : 'rgba(255,255,255,0.05)'}; border: 1px solid ${isSelected ? 'var(--primary)' : 'rgba(255,255,255,0.1)'}; cursor: pointer; transition: all 0.2s;`;
-      el.innerHTML = `
-        <div style="display: flex; flex-direction: column; gap: 4px;">
-          <span style="color: white; font-weight: 600; font-size: 0.95rem;">${t.title}</span>
-          <span style="color: rgba(255,255,255,0.5); font-size: 0.8rem;">${t.artist}</span>
-        </div>
-        ${isSelected ? '<i data-lucide="check-circle" style="color: var(--primary); width: 20px; height: 20px;"></i>' : '<i data-lucide="play-circle" style="color: rgba(255,255,255,0.5); width: 20px; height: 20px;"></i>'}
-      `;
-      el.onclick = () => {
-        window.HubbleEditor.pushHistory();
-        window.HubbleEditor.state.musicTrack = t;
-        window.HubbleEditor.GlobalAudio.setTrack(t.url);
-        window.HubbleEditor.openMusicSelector(); // re-render
-
-        const canvasVideo = document.querySelector('#he-media-layer video');
-        if (canvasVideo && !canvasVideo.paused) {
-          window.HubbleEditor.GlobalAudio.play();
-        }
-      };
-      list.appendChild(el);
-    });
-
-    removeBtn.style.display = window.HubbleEditor.state.musicTrack ? 'block' : 'none';
-
-    modal.style.display = 'flex';
-    setTimeout(() => modal.style.opacity = '1', 10);
-    if (window.lucide) window.lucide.createIcons();
+    if (window.openStoryMusicPicker) {
+      window.openStoryMusicPicker();
+    }
   },
 
   removeMusic() {
-    window.HubbleEditor.pushHistory();
-    window.HubbleEditor.state.musicTrack = null;
-    window.HubbleEditor.GlobalAudio.stop();
-    const modal = document.getElementById('he-music-modal');
-    if (modal) {
-      modal.style.opacity = '0';
-      setTimeout(() => modal.style.display = 'none', 300);
+    if (window.removeStoryMusic) {
+      window.removeStoryMusic();
+    } else {
+      this.state.musicTrack = null;
+      if (window.StoryAudioManager) window.StoryAudioManager.destroy();
     }
   },
 
@@ -13736,6 +19477,16 @@ window.HubbleEditor = {
       state.isMuted = forceMute;
     } else {
       state.isMuted = !state.isMuted;
+    }
+
+    // Sync isMuted to current active item in window.chUploads
+    const activeIdx = window.HubbleEditor.activeMediaIndex || 0;
+    if (window.chUploads && window.chUploads[activeIdx]) {
+      if (!window.chUploads[activeIdx].editorState) {
+        window.chUploads[activeIdx].editorState = {};
+      }
+      window.chUploads[activeIdx].editorState.isMuted = state.isMuted;
+      window.chUploads[activeIdx].isMuted = state.isMuted;
     }
 
     // Smooth Mute: Update volume to 0/1 to prevent decoder stutter on some browsers
@@ -13806,7 +19557,7 @@ window.HubbleEditor = {
       }
     });
 
-    showPlayBtn('pause'); // Set initial state
+    showPlayBtn(videoNode && !videoNode.paused ? 'pause' : 'play'); // Set initial state
 
     const bottomRow = document.createElement('div');
     bottomRow.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 0 20px; pointer-events: all; gap: 16px; margin-top: auto; width: 100%; box-sizing: border-box;';
@@ -13968,185 +19719,7 @@ if (document.readyState === 'complete' || document.readyState === 'interactive')
   document.addEventListener('DOMContentLoaded', () => setTimeout(() => window.HubbleEditor.init(), 500));
 }
 
-// ==================== COLLABORATOR SELECTION LOGIC ====================
-window.selectedCollaborators = [];
-window.collaborationEnabled = true;
-let cachedHubbers = null;
 
-window.toggleCollaboration = function (enabled) {
-  window.collaborationEnabled = enabled;
-  const contentDiv = document.getElementById('ch-collab-content');
-  const msgDiv = document.getElementById('ch-collab-disabled-msg');
-  const addBtn = document.getElementById('btn-add-collaborators');
-
-  if (window.renderCollaboratorChips) window.renderCollaboratorChips();
-
-  if (!contentDiv || !msgDiv || !addBtn) return;
-
-  if (enabled) {
-    contentDiv.style.opacity = '1';
-    contentDiv.style.pointerEvents = 'auto';
-    msgDiv.style.display = 'none';
-    addBtn.style.display = 'flex';
-  } else {
-    contentDiv.style.opacity = '0.55';
-    addBtn.style.display = 'none';
-
-    if (window.selectedCollaborators.length === 0) {
-      msgDiv.style.display = 'block';
-    } else {
-      msgDiv.style.display = 'none';
-    }
-  }
-};
-
-window.openCollaboratorModal = async function () {
-  if (window.collaborationEnabled === false) return;
-
-  const modal = document.getElementById('collaborator-modal');
-  const searchInput = document.getElementById('collaborator-search-input');
-  if (searchInput) searchInput.value = '';
-  modal.style.display = 'flex';
-
-  if (cachedHubbers === null) {
-    const listContainer = document.getElementById('collaborator-list-container');
-    listContainer.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-muted);">Loading Hubbers...</div>';
-
-    const token = localStorage.getItem('invibe_jwt_token');
-    const currentUserStr = localStorage.getItem('invibeUser');
-    if (!token || !currentUserStr) return;
-
-    const currentUser = JSON.parse(currentUserStr);
-    const userId = currentUser.id || currentUser._id;
-
-    try {
-      const res = await fetch(`${API_URL}/api/users/${userId}/followers-list`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error('Failed to load hubbers');
-      cachedHubbers = await res.json();
-    } catch (err) {
-      console.error(err);
-      cachedHubbers = [];
-    }
-  }
-
-  window.renderCollaboratorModalList();
-};
-
-window.closeCollaboratorModal = function () {
-  const modal = document.getElementById('collaborator-modal');
-  modal.style.display = 'none';
-};
-
-window.renderCollaboratorModalList = function (query = '') {
-  const listContainer = document.getElementById('collaborator-list-container');
-  if (!listContainer) return;
-
-  if (!cachedHubbers || cachedHubbers.length === 0) {
-    listContainer.innerHTML = `
-      <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; text-align: center;">
-        <i data-lucide="users" style="width: 48px; height: 48px; color: var(--text-muted); margin-bottom: 16px;"></i>
-        <h4 style="margin: 0 0 8px 0; font-size: 1.1rem; color: var(--text);">No Hubbers Found</h4>
-        <p style="margin: 0; color: var(--text-muted); font-size: 0.9rem;">You don't have any Hubbers yet.<br>Connect with people first before collaborating.</p>
-      </div>
-    `;
-    if (window.lucide) window.lucide.createIcons();
-    return;
-  }
-
-  const lowerQuery = query.toLowerCase();
-  const filtered = cachedHubbers.filter(h => {
-    const name = (h.name || '').toLowerCase();
-    const username = (h.username || '').toLowerCase();
-    return name.includes(lowerQuery) || username.includes(lowerQuery);
-  });
-
-  if (filtered.length === 0) {
-    listContainer.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-muted);">No matching Hubbers found.</div>';
-    return;
-  }
-
-  const selectedIds = window.selectedCollaborators.map(c => c._id || c.id);
-
-  listContainer.innerHTML = filtered.map(h => {
-    const isSelected = selectedIds.includes(h._id || h.id);
-    const avatar = h.profilePic || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=40&q=80';
-    return `
-      <div onclick='window.toggleCollaboratorSelection(${JSON.stringify(h).replace(/'/g, "&#39;")})' style="display: flex; align-items: center; justify-content: space-between; padding: 10px; border-radius: 12px; cursor: ${isSelected ? 'default' : 'pointer'}; background: ${isSelected ? 'rgba(168,85,247,0.1)' : 'transparent'}; border: 1px solid ${isSelected ? 'var(--primary)' : 'transparent'}; transition: all 0.2s; opacity: ${isSelected ? '0.6' : '1'};">
-        <div style="display: flex; align-items: center; gap: 12px;">
-          <img src="${avatar}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover;">
-          <div style="display: flex; flex-direction: column;">
-            <span style="font-weight: 600; font-size: 0.9rem; color: var(--text);">${h.name || h.username}</span>
-            <span style="font-size: 0.8rem; color: var(--text-muted);">@${h.username}</span>
-          </div>
-        </div>
-        ${isSelected ? '<span style="font-size: 0.8rem; color: var(--primary); font-weight: 600;">Added</span>' : '<i data-lucide="plus" style="width: 16px; height: 16px; color: var(--text-muted);"></i>'}
-      </div>
-    `;
-  }).join('');
-
-  if (window.lucide) window.lucide.createIcons();
-};
-
-window.toggleCollaboratorSelection = function (hubberObj) {
-  const hubberId = hubberObj._id || hubberObj.id;
-  const isSelected = window.selectedCollaborators.some(c => (c._id || c.id) === hubberId);
-
-  if (isSelected) {
-    return; // Prevent duplicates / already added
-  } else {
-    window.selectedCollaborators.push(hubberObj);
-  }
-
-  window.renderCollaboratorChips();
-  // Re-render modal to reflect "Added" state if modal is open
-  const searchInput = document.getElementById('collaborator-search-input');
-  if (searchInput) {
-    window.renderCollaboratorModalList(searchInput.value);
-  } else {
-    window.renderCollaboratorModalList();
-  }
-};
-
-window.removeCollaborator = function (hubberId) {
-  window.selectedCollaborators = window.selectedCollaborators.filter(c => (c._id || c.id) !== hubberId);
-  window.renderCollaboratorChips();
-
-  // Re-render modal if open
-  const searchInput = document.getElementById('collaborator-search-input');
-  if (document.getElementById('collaborator-modal').style.display === 'flex') {
-    window.renderCollaboratorModalList(searchInput ? searchInput.value : '');
-  }
-};
-
-window.renderCollaboratorChips = function () {
-  const container = document.getElementById('ch-selected-collaborators');
-  const label = document.getElementById('ch-collaborators-label');
-  if (!container) return;
-
-  if (window.selectedCollaborators.length > 0) {
-    if (label) label.style.display = 'block';
-  } else {
-    if (label) label.style.display = 'none';
-  }
-
-  const isEnabled = window.collaborationEnabled !== false;
-
-  container.innerHTML = window.selectedCollaborators.map(c => {
-    const id = c._id || c.id;
-    const avatar = c.profilePic || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=30&q=80';
-    return `
-      <div style="display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 6px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); border-radius: 20px;">
-        <img src="${avatar}" style="width: 20px; height: 20px; border-radius: 50%; object-fit: cover;">
-        <span style="font-size: 0.8rem; color: var(--text);">${c.name || c.username}</span>
-        ${isEnabled ? `<i data-lucide="x" style="width: 12px; height: 12px; cursor: pointer; color: var(--text-muted);" onclick="window.removeCollaborator('${id}')"></i>` : ''}
-      </div>
-    `;
-  }).join('');
-
-  if (window.lucide) window.lucide.createIcons();
-};
 
 document.addEventListener('DOMContentLoaded', () => {
   const api = (
@@ -14163,6 +19736,17 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   if (typeof window.loadFeedReels === 'function') {
     window.loadFeedReels();
+  }
+
+  // Check for deep-linked Reel on load
+  const urlParams = new URLSearchParams(window.location.search);
+  const reelId = urlParams.get('reelId');
+  if (reelId) {
+    setTimeout(() => {
+      if (typeof window.navigateToPost === 'function') {
+        window.navigateToPost(reelId, 'reel');
+      }
+    }, 1000);
   }
 });
 

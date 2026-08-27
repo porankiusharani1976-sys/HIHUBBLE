@@ -1407,3 +1407,188 @@
   justify-content: center;
 }
 
+/* ==================== AUTH SYSTEM LIGHT THEME ==================== */
+.light-theme .welcome-glass-container,
+body.light-theme .welcome-glass-container,
+.light-theme .auth-glass-container,
+body.light-theme .auth-glass-container {
+  background: rgba(255, 255, 255, 0.94) !important;
+  border: 1px solid rgba(168, 85, 247, 0.3) !important;
+  box-shadow: 0 30px 60px rgba(108, 59, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.8) !important;
+}
+
+.light-theme .welcome-top,
+body.light-theme .welcome-top {
+  border-right-color: rgba(168, 85, 247, 0.2) !important;
+  border-bottom-color: rgba(168, 85, 247, 0.2) !important;
+}
+
+.light-theme .brand-bubble-glass,
+body.light-theme .brand-bubble-glass {
+  background: rgba(168, 85, 247, 0.06) !important;
+  border: 1.5px solid rgba(168, 85, 247, 0.3) !important;
+  box-shadow: 0 20px 40px rgba(108, 59, 255, 0.08), inset 0 2px 2px rgba(255, 255, 255, 0.8) !important;
+}
+
+.light-theme .brand-bubble-footer,
+body.light-theme .brand-bubble-footer {
+  background: rgba(255, 255, 255, 0.92) !important;
+  border: 1px solid rgba(168, 85, 247, 0.25) !important;
+}
+
+.light-theme .footer-dot,
+body.light-theme .footer-dot {
+  color: #475569 !important;
+}
+
+.light-theme .brand-hubble,
+body.light-theme .brand-hubble {
+  color: #2E1065 !important;
+}
+
+.light-theme .welcome-subtitle,
+body.light-theme .welcome-subtitle {
+  color: #581C87 !important;
+}
+
+.light-theme .auth-toggle-tabs,
+body.light-theme .auth-toggle-tabs {
+  background: rgba(168, 85, 247, 0.08) !important;
+  border-color: rgba(168, 85, 247, 0.25) !important;
+}
+
+.light-theme .auth-tab-btn:not(.active),
+body.light-theme .auth-tab-btn:not(.active) {
+  color: #581C87 !important;
+}
+
+.light-theme .onboard-input-box i,
+.light-theme .onboard-input-box svg,
+body.light-theme .onboard-input-box i,
+body.light-theme .onboard-input-box svg {
+  color: var(--primary, #6C3BFF) !important;
+}
+
+.light-theme .onboard-input-box input,
+body.light-theme .onboard-input-box input {
+  background: #FFFFFF !important;
+  border: 1.5px solid rgba(168, 85, 247, 0.3) !important;
+  color: #2E1065 !important;
+}
+
+.light-theme .onboard-input-box input::placeholder,
+body.light-theme .onboard-input-box input::placeholder {
+  color: rgba(88, 28, 135, 0.55) !important;
+}
+
+.light-theme .onboard-input-box input:focus,
+body.light-theme .onboard-input-box input:focus {
+  border-color: var(--primary, #6C3BFF) !important;
+  box-shadow: 0 0 16px rgba(108, 59, 255, 0.25) !important;
+  background: #FFFFFF !important;
+}
+
+.light-theme .welcome-btn.btn-secondary,
+body.light-theme .welcome-btn.btn-secondary {
+  background: #FFFFFF !important;
+  color: #2E1065 !important;
+  border: 1px solid rgba(168, 85, 247, 0.35) !important;
+}
+
+.light-theme .welcome-btn.btn-secondary:hover,
+body.light-theme .welcome-btn.btn-secondary:hover {
+  background: rgba(168, 85, 247, 0.1) !important;
+}
+
+.light-theme .auth-back-btn,
+body.light-theme .auth-back-btn {
+  color: #581C87 !important;
+}
+
+.light-theme .auth-back-btn:hover,
+body.light-theme .auth-back-btn:hover {
+  color: #2E1065 !important;
+}
+
+.light-theme .otp-modal-content,
+body.light-theme .otp-modal-content,
+.light-theme .camera-modal-content,
+body.light-theme .camera-modal-content,
+.light-theme .auth-modal-content,
+body.light-theme .auth-modal-content {
+  background: rgba(255, 255, 255, 0.96) !important;
+  border: 1px solid rgba(168, 85, 247, 0.3) !important;
+  box-shadow: 0 20px 50px rgba(108, 59, 255, 0.15) !important;
+  color: #2E1065 !important;
+}
+
+.light-theme .camera-subtitle,
+body.light-theme .camera-subtitle {
+  color: #581C87 !important;
+}
+
+.light-theme .otp-input,
+body.light-theme .otp-input {
+  background: #FFFFFF !important;
+  border: 1.5px solid rgba(168, 85, 247, 0.3) !important;
+  color: #2E1065 !important;
+}
+
+.light-theme .otp-input:focus,
+body.light-theme .otp-input:focus {
+  border-color: var(--primary, #6C3BFF) !important;
+  box-shadow: 0 0 12px rgba(108, 59, 255, 0.25) !important;
+}
+
+.light-theme .otp-resend,
+body.light-theme .otp-resend {
+  color: #581C87 !important;
+}
+
+.light-theme .forgot-password-link,
+body.light-theme .forgot-password-link {
+  color: var(--primary, #6C3BFF) !important;
+}
+
+.light-theme .two-factor-label,
+body.light-theme .two-factor-label {
+  color: #2E1065 !important;
+}
+
+.light-theme .two-factor-opt-btn,
+body.light-theme .two-factor-opt-btn {
+  background: #FFFFFF !important;
+  border: 1px solid rgba(168, 85, 247, 0.25) !important;
+  color: #581C87 !important;
+}
+
+.light-theme .two-factor-opt-btn.active,
+body.light-theme .two-factor-opt-btn.active {
+  background: rgba(108, 59, 255, 0.12) !important;
+  border-color: var(--primary, #6C3BFF) !important;
+  color: var(--primary, #6C3BFF) !important;
+}
+
+.light-theme .otp-delivery-tabs,
+body.light-theme .otp-delivery-tabs {
+  background: rgba(168, 85, 247, 0.08) !important;
+  border-color: rgba(168, 85, 247, 0.25) !important;
+}
+
+.light-theme .otp-delivery-tab,
+body.light-theme .otp-delivery-tab {
+  color: #581C87 !important;
+}
+
+.light-theme .webcam-circle-container,
+body.light-theme .webcam-circle-container {
+  background: #F3E8FF !important;
+  border-color: var(--primary, #6C3BFF) !important;
+  box-shadow: 0 0 30px rgba(108, 59, 255, 0.25) !important;
+}
+
+.light-theme .webcam-status-text,
+body.light-theme .webcam-status-text {
+  color: #581C87 !important;
+}
+

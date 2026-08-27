@@ -1,4 +1,8 @@
+// HI-HUBBLE utils — SMTP, OTP, Auth Middleware
+// Credentials are read from server-side .env only. Never exposed to frontend.
 import dotenv from 'dotenv';
+dotenv.config(); // Must be first — loads .env before any process.env reads below
+
 import nodemailer from 'nodemailer';
 import jwt from 'jsonwebtoken';
 import { supabase } from './supabase.js';
@@ -13,9 +17,10 @@ export const otps = new Map();
 // Map to enforce 25-second cooldown between consecutive email requests
 export const lastEmailSentMap = new Map();
 
-// Initialize Nodemailer transport using Gmail SMTP
-const emailUser = process.env.GMAIL_USER || process.env.EMAIL_USER || '';
-const rawPass = process.env.GMAIL_APP_PASSWORD || process.env.EMAIL_PASS || '';
+// Initialize Nodemailer transport using Gmail SMTP credentials from .env
+// Priority: EMAIL_PASS (plain 16-char) > GMAIL_APP_PASSWORD (may have spaces, stripped)
+const emailUser = process.env.EMAIL_USER || process.env.GMAIL_USER || '';
+const rawPass = process.env.EMAIL_PASS || process.env.GMAIL_APP_PASSWORD || '';
 const emailPass = rawPass.replace(/\s+/g, '');
 
 const transporter = nodemailer.createTransport({
@@ -29,14 +34,33 @@ const transporter = nodemailer.createTransport({
   }
 });
 
+// Verify SMTP connection at startup (safe diagnostic only — no credentials in logs)
+transporter.verify((err) => {
+  if (err) {
+    console.error('[SMTP] Connection verification FAILED at startup:', err.message);
+    console.error('[SMTP] Code:', err.code || 'N/A');
+    console.error('[SMTP] Check that EMAIL_USER and EMAIL_PASS in .env are correct Gmail App Password credentials.');
+    console.error('[SMTP] Generate a new App Password at: https://myaccount.google.com/apppasswords');
+  } else {
+    console.log('[SMTP] Gmail SMTP connection verified successfully. Ready to send emails.');
+    console.log('[SMTP] Sender account configured:', emailUser);
+  }
+});
+
 /**
- * Send 6-Digit Verification Code OTP via Email
+ * Send 6-Digit Verification Code OTP via Email.
+ *
+ * Returns { success: true } ONLY if the email was actually submitted to the SMTP server.
+ * Returns { success: false, details, cooldown? } on any failure.
+ *
+ * IMPORTANT: This function does NOT silently swallow sendMail() errors.
+ * If SMTP fails, the caller receives a real error so the user can be informed.
  */
 export async function sendOTPEmailHelper(targetEmail, otpCode) {
   const normalizedEmail = targetEmail.trim().toLowerCase();
   const now = Date.now();
 
-  // Enforce 25-second cooldown between consecutive emails
+  // Enforce 25-second cooldown between consecutive emails to the same address
   const lastSent = lastEmailSentMap.get(normalizedEmail);
   if (lastSent && (now - lastSent) < 25000) {
     const waitSecs = Math.ceil((25000 - (now - lastSent)) / 1000);
@@ -47,10 +71,19 @@ export async function sendOTPEmailHelper(targetEmail, otpCode) {
     };
   }
 
+  // Abort early if SMTP credentials are not configured
+  if (!emailUser || !emailPass) {
+    console.error('[SMTP] Cannot send email: EMAIL_USER or EMAIL_PASS is not set in .env');
+    return {
+      success: false,
+      details: 'Email service is not configured. Please contact support.'
+    };
+  }
+
   const mailOptions = {
     from: `"HI-HUBBLE" <${emailUser}>`,
     to: normalizedEmail,
-    subject: `Your Hi-HUBBLE Verification Code: ${otpCode}`,
+    subject: `Your Hi-HUBBLE Verification Code`,
     html: `
       <div style="background-color: #0b0914; color: #ffffff; font-family: 'Outfit', 'Inter', Helvetica, Arial, sans-serif; padding: 40px 20px; text-align: center; border-radius: 16px; max-width: 520px; margin: 0 auto; border: 1px solid rgba(255,255,255,0.1);">
         <div style="margin-bottom: 24px;">
@@ -66,7 +99,8 @@ export async function sendOTPEmailHelper(targetEmail, otpCode) {
             ${otpCode}
           </div>
           
-          <p style="color: #94a3b8; font-size: 12px; margin: 0;">This verification code will expire in <strong>5 minutes</strong>.</p>
+          <p style="color: #94a3b8; font-size: 12px; margin: 8px 0 0 0;">This verification code will expire in <strong>5 minutes</strong>.</p>
+          <p style="color: #64748b; font-size: 11px; margin: 8px 0 0 0;">Do not share this code with anyone.</p>
         </div>
         
         <p style="color: #64748b; font-size: 12px; margin: 0;">If you did not request this verification code, please ignore this email.</p>
@@ -74,18 +108,15 @@ export async function sendOTPEmailHelper(targetEmail, otpCode) {
     `
   };
 
-  try {
-    await transporter.sendMail(mailOptions);
-    lastEmailSentMap.set(normalizedEmail, now);
-    return { success: true };
-  } catch (err) {
-    console.error('[Nodemailer Error] Email send failed:', err.message);
-    return {
-      success: false,
-      details: err.message
-    };
-  }
+  // Attempt SMTP send — do NOT silently swallow errors
+  await transporter.sendMail(mailOptions);
+
+  // Only reached if sendMail() succeeded (did not throw)
+  lastEmailSentMap.set(normalizedEmail, now);
+  console.log('[SMTP] Verification email dispatched successfully to:', normalizedEmail);
+  return { success: true };
 }
+
 
 /**
  * Middleware to authenticate requests using JWTs or local session fallback
@@ -96,6 +127,10 @@ export async function authenticateToken(req, res, next) {
 
   if (!token && req.headers['x-user-token']) {
     token = req.headers['x-user-token'];
+  }
+
+  if (!token && req.query && req.query.token) {
+    token = req.query.token;
   }
 
   if (!token || token === 'undefined' || token === 'null') {

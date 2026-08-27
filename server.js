@@ -20,6 +20,7 @@ import callsRoutes from './routes/calls.js';
 dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 app.set('etag', false);
 
 // Enable CORS for all routes and preflight requests
@@ -27,7 +28,8 @@ app.use(cors({
   origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Token', 'Accept', 'Cache-Control']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Token', 'Accept', 'Cache-Control'],
+  exposedHeaders: ['X-Conversation-Id']
 }));
 
 // Security & Cache Control Headers Middleware
@@ -69,7 +71,10 @@ app.use(notificationsRoutes);
 app.use(chatsRoutes);
 app.use(callsRoutes);
 
-const PORT = process.env.PORT || 3000;
+// Catch unmatched API routes and return JSON 404 (prevent SPA HTML fallback on API calls)
+app.all('/api/{*splat}', (req, res) => {
+  res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
+});
 
 // Fallback all other requests to frontend SPA
 app.get('/{*splat}', (req, res) => {
@@ -89,9 +94,9 @@ export async function processScheduledItems() {
   try {
     const now = new Date().toISOString();
 
-    // 1. Process Database scheduled stories in Supabase
+    // 1. Process Database scheduled stories in Supabase (transition status from scheduled -> published)
     try {
-      const { data: updatedStories } = await supabase
+      const { data: updatedStories, error: dbErr } = await supabase
         .from('stories')
         .update({ status: 'published', isScheduled: false })
         .eq('status', 'scheduled')
@@ -164,52 +169,6 @@ export async function processScheduledItems() {
         // Save remaining scheduled posts safely
         try {
           fs.writeFileSync(postsFile, JSON.stringify(remainingPosts, null, 2), 'utf8');
-        } catch (_) {}
-      }
-    }
-
-    // 3. Process local scheduled stories (/tmp fallback)
-    const storiesFile = path.join(os.tmpdir(), 'scheduled_stories.json');
-    if (fs.existsSync(storiesFile)) {
-      let scheduledStories = [];
-      try {
-        scheduledStories = JSON.parse(fs.readFileSync(storiesFile, 'utf8'));
-      } catch (_) {}
-
-      const dueStories = scheduledStories.filter(s => s.scheduledAt <= now);
-      const remainingStories = scheduledStories.filter(s => s.scheduledAt > now);
-
-      if (dueStories.length > 0) {
-        for (const story of dueStories) {
-          try {
-            console.log(`[Scheduler] Publishing scheduled story by user ${story.userId}`);
-
-            const uploaded = await uploadMediaItem(story.userId, story.mediaUrl, story.mediaType);
-
-            const { error: storyErr } = await supabase
-              .from('stories')
-              .insert([{
-                author_id: story.userId,
-                media_url: uploaded.url,
-                media_type: uploaded.type,
-                caption: story.caption || '',
-                status: 'published'
-              }]);
-
-            if (storyErr) {
-              console.error(`[Scheduler] Failed to create story row:`, storyErr.message);
-            } else {
-              console.log(`[Scheduler] Successfully auto-published scheduled story`);
-              countProcessed++;
-            }
-          } catch (pubErr) {
-            console.error(`[Scheduler] Error auto-publishing story:`, pubErr.message);
-          }
-        }
-
-        // Save remaining scheduled stories safely
-        try {
-          fs.writeFileSync(storiesFile, JSON.stringify(remainingStories, null, 2), 'utf8');
         } catch (_) {}
       }
     }

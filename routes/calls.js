@@ -1,160 +1,309 @@
 import express from 'express';
 import { supabase } from '../supabase.js';
 import { authenticateToken } from '../utils.js';
+import { isUserConversationMember } from './chats.js';
 
 const router = express.Router();
 
+// =========================================================
+// 1. INITIATE A VOICE / VIDEO CALL
+// =========================================================
 router.post('/api/calls/initiate', authenticateToken, async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
+  const currentUserId = req.user.id;
+
   try {
-    const { recipientId, offer } = req.body;
-    if (!recipientId || !offer) {
-      return res.status(400).json({ error: 'recipientId and offer are required.' });
+    const { conversationId, isVideo } = req.body;
+    if (!conversationId) {
+      return res.status(400).json({ error: 'conversationId is required.' });
     }
 
-    const { error: cleanupError } = await supabase.from('calls').update({ status: 'ended' })
-      .in('status', ['ringing', 'connected'])
-      .or(`caller.eq.${req.user.id},recipient.eq.${req.user.id},caller.eq.${recipientId},recipient.eq.${recipientId}`);
-    
-    if (cleanupError) throw cleanupError;
-
-    const { data: newCall, error } = await supabase.from('calls').insert([{
-      caller: req.user.id,
-      recipient: recipientId,
-      status: 'ringing',
-      offer: typeof offer === 'string' ? offer : JSON.stringify(offer),
-      callerCandidates: [],
-      recipientCandidates: []
-    }]).select().single();
-    if (error) throw error;
-
-    res.status(201).json(newCall);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/api/calls/incoming', authenticateToken, async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  try {
-    if (!req.user) return res.json(null);
-    const { data: incomingCall, error } = await supabase.from('calls')
-      .select('*, initiator:profiles!initiator_id(id, full_name, username, profile_image_url)')
-      .eq('status', 'ringing')
-      .neq('initiator_id', req.user.id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    
-    if (error) {
-      return res.json(null);
+    // Strict BOLA check: Ensure initiating user is a member of the conversation
+    const isMember = await isUserConversationMember(conversationId, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a member of this conversation.' });
     }
 
-    res.json(incomingCall || null);
-  } catch (err) {
-    res.json(null);
-  }
-});
+    const nowIso = new Date().toISOString();
 
-router.post('/api/calls/accept', authenticateToken, async (req, res) => {
-  try {
-    const { callId, answer } = req.body;
-    if (!callId || !answer) {
-      return res.status(400).json({ error: 'callId and answer are required.' });
-    }
+    // Mark previous ringing calls for this conversation as ended
+    await supabase.from('calls')
+      .update({ status: 'ended', ended_at: nowIso })
+      .eq('conversation_id', conversationId)
+      .in('status', ['initiating', 'ringing']);
 
-    const { data: call, error } = await supabase.from('calls').update({
-      status: 'connected',
-      answer: typeof answer === 'string' ? answer : JSON.stringify(answer)
-    }).eq('_id', callId).select().single();
-    
-    if (error) throw error;
-    res.json({ success: true, call });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    // Create new call record adhering to verified schema
+    const { data: newCall, error } = await supabase
+      .from('calls')
+      .insert([{
+        conversation_id: conversationId,
+        initiator_id: currentUserId,
+        status: 'ringing',
+        is_video: !!isVideo,
+        started_at: nowIso,
+        created_at: nowIso
+      }])
+      .select()
+      .single();
 
-router.post('/api/calls/decline', authenticateToken, async (req, res) => {
-  try {
-    const { callId } = req.body;
-    if (!callId) return res.status(400).json({ error: 'callId is required.' });
-
-    const { error } = await supabase.from('calls').update({ status: 'declined' }).eq('_id', callId);
     if (error) throw error;
 
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    // Log call initiation in call_history
+    try {
+      await supabase.from('call_history').insert([{
+        call_id: newCall.id,
+        user_id: currentUserId,
+        event_type: 'initiated',
+        created_at: nowIso
+      }]);
+    } catch (_) {}
 
-router.post('/api/calls/end', authenticateToken, async (req, res) => {
-  try {
-    const { callId } = req.body;
-    if (!callId) return res.status(400).json({ error: 'callId is required.' });
-
-    const { error } = await supabase.from('calls').update({ status: 'ended' }).eq('_id', callId);
-    if (error) throw error;
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/api/calls/ice-candidate', authenticateToken, async (req, res) => {
-  try {
-    const { callId, candidate, role } = req.body;
-    if (!callId || !candidate || !role) {
-      return res.status(400).json({ error: 'callId, candidate, and role are required.' });
-    }
-
-    const { data: call, error: callError } = await supabase.from('calls').select('callerCandidates, recipientCandidates').eq('_id', callId).single();
-    if (callError || !call) return res.status(404).json({ error: 'Call not found.' });
-
-    const updates = {};
-    if (role === 'caller') {
-      updates.callerCandidates = [...(call.callerCandidates || []), candidate];
-    } else if (role === 'recipient') {
-      updates.recipientCandidates = [...(call.recipientCandidates || []), candidate];
-    } else {
-      return res.status(400).json({ error: 'Invalid role. Must be "caller" or "recipient".' });
-    }
-
-    const { error } = await supabase.from('calls').update(updates).eq('_id', callId);
-    if (error) throw error;
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/api/calls/:callId/state', authenticateToken, async (req, res) => {
-  try {
-    const { data: call, error } = await supabase.from('calls').select('*').eq('_id', req.params.callId).single();
-    if (error || !call) return res.status(404).json({ error: 'Call not found.' });
-
-    const isUserCaller = call.caller === req.user.id;
-    const peerCandidates = isUserCaller ? call.recipientCandidates : call.callerCandidates;
-
-    res.json({
-      status: call.status,
-      offer: call.offer,
-      answer: call.answer,
-      peerCandidates
+    res.status(201).json({
+      _id: newCall.id,
+      id: newCall.id,
+      conversation_id: newCall.conversation_id,
+      initiator_id: newCall.initiator_id,
+      status: newCall.status,
+      is_video: newCall.is_video,
+      created_at: newCall.created_at
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// =========================================================
+// 2. CHECK FOR INCOMING CALLS
+// =========================================================
+router.get('/api/calls/incoming', authenticateToken, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  if (!req.user) return res.json(null);
+  const currentUserId = req.user.id;
+
+  try {
+    // 1. Get user's conversation IDs
+    const { data: userMems } = await supabase
+      .from('conversation_members')
+      .select('conversation_id')
+      .eq('user_id', currentUserId);
+
+    const convIds = (userMems || []).map(m => m.conversation_id);
+    if (convIds.length === 0) return res.json(null);
+
+    // 2. Find active ringing calls in user's conversations initiated by someone else
+    const { data: incomingCall, error } = await supabase
+      .from('calls')
+      .select(`
+        id, conversation_id, initiator_id, status, is_video, created_at,
+        initiator:profiles!initiator_id(id, full_name, username, profile_image_url)
+      `)
+      .in('conversation_id', convIds)
+      .eq('status', 'ringing')
+      .neq('initiator_id', currentUserId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !incomingCall) return res.json(null);
+
+    res.json({
+      _id: incomingCall.id,
+      id: incomingCall.id,
+      conversationId: incomingCall.conversation_id,
+      initiator: incomingCall.initiator,
+      isVideo: incomingCall.is_video,
+      status: incomingCall.status,
+      createdAt: incomingCall.created_at
+    });
+  } catch (err) {
+    res.json(null);
+  }
+});
+
+// =========================================================
+// 3. ACCEPT CALL
+// =========================================================
+router.post('/api/calls/accept', authenticateToken, async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
+  const currentUserId = req.user.id;
+  const { callId } = req.body;
+
+  if (!callId) return res.status(400).json({ error: 'callId is required.' });
+
+  try {
+    // Strict BOLA check: Ensure call exists and user is a participant
+    const { data: call, error: callErr } = await supabase
+      .from('calls')
+      .select('id, conversation_id, initiator_id')
+      .eq('id', callId)
+      .maybeSingle();
+
+    if (callErr || !call) return res.status(404).json({ error: 'Call not found.' });
+
+    const isMember = await isUserConversationMember(call.conversation_id, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this call.' });
+    }
+
+    const nowIso = new Date().toISOString();
+    const { data: updatedCall, error } = await supabase
+      .from('calls')
+      .update({ status: 'in_progress', started_at: nowIso })
+      .eq('id', callId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Log call acceptance in call_history
+    try {
+      await supabase.from('call_history').insert([{
+        call_id: callId,
+        user_id: currentUserId,
+        event_type: 'accepted',
+        created_at: nowIso
+      }]);
+    } catch (_) {}
+
+    res.json({ success: true, call: updatedCall });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================================
+// 4. DECLINE CALL
+// =========================================================
+router.post('/api/calls/decline', authenticateToken, async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
+  const currentUserId = req.user.id;
+  const { callId } = req.body;
+
+  if (!callId) return res.status(400).json({ error: 'callId is required.' });
+
+  try {
+    // Strict BOLA check
+    const { data: call, error: callErr } = await supabase
+      .from('calls')
+      .select('id, conversation_id, initiator_id')
+      .eq('id', callId)
+      .maybeSingle();
+
+    if (callErr || !call) return res.status(404).json({ error: 'Call not found.' });
+
+    const isMember = await isUserConversationMember(call.conversation_id, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this call.' });
+    }
+
+    const nowIso = new Date().toISOString();
+    await supabase.from('calls')
+      .update({ status: 'rejected', ended_at: nowIso })
+      .eq('id', callId);
+
+    try {
+      await supabase.from('call_history').insert([{
+        call_id: callId,
+        user_id: currentUserId,
+        event_type: 'rejected',
+        created_at: nowIso
+      }]);
+    } catch (_) {}
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================================
+// 5. END CALL
+// =========================================================
+router.post('/api/calls/end', authenticateToken, async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
+  const currentUserId = req.user.id;
+  const { callId, durationSeconds } = req.body;
+
+  if (!callId) return res.status(400).json({ error: 'callId is required.' });
+
+  try {
+    // Strict BOLA check
+    const { data: call, error: callErr } = await supabase
+      .from('calls')
+      .select('id, conversation_id, initiator_id')
+      .eq('id', callId)
+      .maybeSingle();
+
+    if (callErr || !call) return res.status(404).json({ error: 'Call not found.' });
+
+    const isMember = await isUserConversationMember(call.conversation_id, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this call.' });
+    }
+
+    const nowIso = new Date().toISOString();
+    await supabase.from('calls')
+      .update({
+        status: 'ended',
+        duration_seconds: durationSeconds || 0,
+        ended_at: nowIso
+      })
+      .eq('id', callId);
+
+    try {
+      await supabase.from('call_history').insert([{
+        call_id: callId,
+        user_id: currentUserId,
+        event_type: 'ended',
+        created_at: nowIso
+      }]);
+    } catch (_) {}
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================================
+// 6. GET CALL STATE
+// =========================================================
+router.get('/api/calls/:callId/state', authenticateToken, async (req, res) => {
+  try {
+    const { data: call, error } = await supabase
+      .from('calls')
+      .select('id, conversation_id, initiator_id, status, is_video, duration_seconds, started_at, ended_at, created_at')
+      .eq('id', req.params.callId)
+      .maybeSingle();
+
+    if (error || !call) return res.status(404).json({ error: 'Call not found.' });
+
+    // Strict BOLA check: Ensure requesting user is a participant of the call's conversation
+    const isMember = await isUserConversationMember(call.conversation_id, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not authorized to view this call.' });
+    }
+
+    res.json({
+      _id: call.id,
+      id: call.id,
+      conversationId: call.conversation_id,
+      initiatorId: call.initiator_id,
+      status: call.status,
+      isVideo: call.is_video,
+      startedAt: call.started_at,
+      endedAt: call.ended_at
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================================
+// 7. ICE SERVERS FOR WEBRTC
+// =========================================================
 router.get('/api/calls/ice-servers', authenticateToken, async (req, res) => {
   try {
-    const turnUrl = process.env.TURN_URL;
-    const turnUsername = process.env.TURN_USERNAME;
-    const turnCredential = process.env.TURN_PASSWORD;
-
     const iceServers = [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
@@ -162,15 +311,13 @@ router.get('/api/calls/ice-servers', authenticateToken, async (req, res) => {
       { urls: 'stun:stun3.l.google.com:19302' },
       { urls: 'stun:stun4.l.google.com:19302' }
     ];
-
-    if (turnUrl && turnUsername && turnCredential) {
+    if (process.env.TURN_URL) {
       iceServers.push({
-        urls: turnUrl,
-        username: turnUsername,
-        credential: turnCredential
+        urls: process.env.TURN_URL,
+        username: process.env.TURN_USERNAME,
+        credential: process.env.TURN_PASSWORD
       });
     }
-
     res.json({ iceServers });
   } catch (err) {
     res.status(500).json({ error: err.message });

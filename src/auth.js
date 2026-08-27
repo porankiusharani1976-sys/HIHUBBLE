@@ -251,15 +251,48 @@ export async function initAuth() {
     hideError(inlineOtpErrorMsg);
   }
 
+  function isTokenExpired(token) {
+    if (!token || !token.includes('.')) return false;
+    try {
+      const parts = token.split('.');
+      if (parts.length < 2) return true;
+      const base64Url = parts[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+      const payload = JSON.parse(jsonPayload);
+      if (payload.exp) {
+        const currentTime = Math.floor(Date.now() / 1000);
+        return payload.exp < currentTime;
+      }
+      return false;
+    } catch (e) {
+      console.warn("Error decoding token:", e);
+      return true;
+    }
+  }
+
   // Check existing session
   const storedUser = localStorage.getItem('invibeUser');
   const isLoggedIn = localStorage.getItem('invibeIsLoggedIn') === 'true';
+  const curTok = localStorage.getItem('invibe_jwt_token');
 
-  if (isLoggedIn && storedUser) {
+  let sessionValid = isLoggedIn && storedUser;
+  if (sessionValid && curTok) {
+    if (isTokenExpired(curTok)) {
+      console.warn("Session token has expired. Logging out.");
+      localStorage.removeItem('invibeIsLoggedIn');
+      localStorage.removeItem('invibeUser');
+      localStorage.removeItem('invibe_jwt_token');
+      sessionValid = false;
+    }
+  }
+
+  if (sessionValid) {
     try {
       const u = JSON.parse(storedUser);
       if (u && (u.id || u._id)) {
-        const curTok = localStorage.getItem('invibe_jwt_token');
         if (!curTok || curTok === 'null' || curTok === 'undefined' || curTok.trim() === '') {
           localStorage.setItem('invibe_jwt_token', (u.id || u._id).toString());
         }
@@ -271,7 +304,7 @@ export async function initAuth() {
   }
 
   // =========================================================================
-  // 1. SIGN UP FLOW (Direct Supabase Auth + Profiles Table Upsert)
+  // 1. SIGN UP FLOW (Custom HI-HUBBLE Backend SMTP 6-Digit Email OTP)
   // =========================================================================
   async function handleSignUpSubmit() {
     const fullName = fullNameInput ? fullNameInput.value.trim() : '';
@@ -289,7 +322,7 @@ export async function initAuth() {
 
     if (gotoCameraBtn) {
       gotoCameraBtn.disabled = true;
-      gotoCameraBtn.innerHTML = '<i data-lucide="loader" class="spin"></i> Creating Account...';
+      gotoCameraBtn.innerHTML = '<i data-lucide="loader" class="spin"></i> Sending Code...';
       if (window.debouncedCreateIcons) window.debouncedCreateIcons();
     }
 
@@ -297,100 +330,59 @@ export async function initAuth() {
       const normalizedEmail = email.toLowerCase();
       const normalizedUsername = username.toLowerCase();
 
-      // Check if email or username already exists in public.profiles table
-      const { data: emailExists, error: eCheckErr } = await supabase.from('profiles').select('id').eq('email', normalizedEmail).maybeSingle();
+      // Pre-check if email or username already exists in public.profiles table
+      const { data: emailExists } = await supabase.from('profiles').select('id').eq('email', normalizedEmail).maybeSingle();
       if (emailExists) {
         logAuthDiagnostic('handleSignUpSubmit', { message: 'Duplicate email registration attempt', email: normalizedEmail });
         return showError(usernameError, 'This email address is already registered.');
       }
 
-      const { data: usernameExists, error: uCheckErr } = await supabase.from('profiles').select('id').eq('username', normalizedUsername).maybeSingle();
+      const { data: usernameExists } = await supabase.from('profiles').select('id').eq('username', normalizedUsername).maybeSingle();
       if (usernameExists) {
         logAuthDiagnostic('handleSignUpSubmit', { message: 'Duplicate username registration attempt', username: normalizedUsername });
         return showError(usernameError, 'This username is already taken.');
       }
 
-      // Execute official Supabase Auth signUp
-      let authUserId = null;
-      let sessionToken = null;
-
-      try {
-        const { data: authData, error: authErr } = await supabase.auth.signUp({
+      // Dispatch 6-digit verification code OTP via HI-HUBBLE backend SMTP endpoint
+      const res = await fetch('/api/auth/signup-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName,
           email: normalizedEmail,
-          password: password,
-          options: {
-            data: {
-              username: normalizedUsername,
-              full_name: fullName
-            }
-          }
-        });
+          username: normalizedUsername,
+          password,
+          phoneNumber: phone
+        })
+      });
 
-        if (authErr) {
-          logAuthDiagnostic('supabase.auth.signUp', { message: authErr.message, status: authErr.status, code: authErr.code });
-        } else if (authData?.user) {
-          authUserId = authData.user.id;
-          sessionToken = authData.session?.access_token || null;
-        }
-      } catch (authException) {
-        logAuthDiagnostic('supabase.auth.signUp Exception', { message: authException.message });
-      }
-
-      // Fallback ID if Supabase Auth requires custom confirmation or rate-limited
-      if (!authUserId) {
-        authUserId = crypto.randomUUID();
-      }
-
-      // Hash password for public.profiles fallback match
-      const salt = await bcrypt.genSalt(10);
-      const password_hash = await bcrypt.hash(password, salt);
-
-      // Create user profile in public.profiles table
-      const { data: newUser, error: createError } = await supabase.from('profiles').upsert({
-        id: authUserId,
-        full_name: fullName,
-        username: normalizedUsername,
-        email: normalizedEmail,
-        password_hash: password_hash,
-        phone_number: phone || null,
-        is_online: true,
-        last_active_at: new Date().toISOString()
-      }).select().single();
-
-      if (createError) {
-        logAuthDiagnostic('profiles.upsert', { message: createError.message, code: createError.code, details: createError.details });
-        throw new Error(`Failed to save user profile: ${createError.message}`);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to send verification code.');
       }
 
       signedUpUser = {
-        id: newUser.id,
-        username: newUser.username,
-        email: newUser.email,
-        fullName: newUser.full_name || newUser.username,
-        phoneNumber: newUser.phone_number || null,
-        profileImage: newUser.profile_image_url || null
+        email: normalizedEmail,
+        fullName,
+        username: normalizedUsername,
+        password,
+        phoneNumber: phone || null
       };
 
-      if (sessionToken) {
-        localStorage.setItem('invibe_jwt_token', sessionToken);
-      } else if (signedUpUser?.id) {
-        localStorage.setItem('invibe_jwt_token', signedUpUser.id);
-      }
-
-      // Smoothly transition card to Inline Verification / OTP / Camera step
+      // Smoothly transition card to 6-digit OTP verification step UI
       if (step1) step1.style.display = 'none';
       if (stepLogin) stepLogin.style.display = 'none';
       if (stepOtp) stepOtp.style.display = 'flex';
 
       if (inlineOtpInstruction) {
-        inlineOtpInstruction.textContent = `Confirmation link sent to ${normalizedEmail}. Enter 6-digit pin or click Verify to continue.`;
+        inlineOtpInstruction.textContent = `Please enter the 6-digit code sent to ${normalizedEmail}.`;
       }
 
       clearOtpInputs();
       startOtpTimer(25);
     } catch (err) {
       logAuthDiagnostic('handleSignUpSubmit Exception', { message: err.message });
-      showError(usernameError, err.message || 'Failed to create account. Please check your details.');
+      showError(usernameError, err.message || 'Failed to send verification code. Please try again.');
     } finally {
       if (gotoCameraBtn) {
         gotoCameraBtn.disabled = false;
@@ -416,17 +408,62 @@ export async function initAuth() {
   }
 
   // =========================================================================
-  // 2. VERIFY INLINE 6-DIGIT OTP CODE & TRANSITION TO LIVE PHOTOGRAPH
+  // 2. VERIFY INLINE 6-DIGIT OTP CODE (Custom HI-HUBBLE Backend Verification)
   // =========================================================================
   if (btnVerifyOtpStep) {
     btnVerifyOtpStep.addEventListener('click', async (e) => {
       e.preventDefault();
       hideError(inlineOtpErrorMsg);
+
+      const targetEmail = signedUpUser?.email || (emailInput ? emailInput.value.trim().toLowerCase() : '');
+      if (!targetEmail) {
+        return showError(inlineOtpErrorMsg, 'Session expired. Please return to Sign Up.');
+      }
+
       btnVerifyOtpStep.disabled = true;
       btnVerifyOtpStep.innerHTML = '<i data-lucide="loader" class="spin"></i> Verifying...';
       if (window.debouncedCreateIcons) window.debouncedCreateIcons();
 
       try {
+        const otpCode = getEnteredOtpCode();
+        if (!otpCode || otpCode.length !== 6) {
+          return showError(inlineOtpErrorMsg, 'Please enter the complete 6-digit verification code.');
+        }
+
+        logAuthDiagnostic('btnVerifyOtpStep Click', { targetEmail });
+
+        // Verify 6-digit OTP code via HI-HUBBLE backend endpoint
+        const res = await fetch('/api/auth/verify-action-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: targetEmail,
+            otp: otpCode
+          })
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Invalid or expired verification code.');
+        }
+
+        if (data.user) {
+          signedUpUser = {
+            id: data.user.id,
+            username: data.user.username,
+            email: data.user.email,
+            fullName: data.user.fullName || data.user.full_name || data.user.username,
+            profileImage: data.user.profile_image_url || null
+          };
+          localStorage.setItem('invibeUser', JSON.stringify(signedUpUser));
+        }
+
+        if (data.token) {
+          localStorage.setItem('invibe_jwt_token', data.token);
+        }
+
+        logAuthDiagnostic('btnVerifyOtpStep Success', { userId: signedUpUser?.id });
+
         // Transition card from Inline OTP Step to Step 3: Webcam Live Photo
         if (stepOtp) stepOtp.style.display = 'none';
         if (step1) step1.style.display = 'none';
@@ -435,6 +472,7 @@ export async function initAuth() {
 
         startWebcam();
       } catch (err) {
+        logAuthDiagnostic('btnVerifyOtpStep Exception', { message: err.message });
         showError(inlineOtpErrorMsg, err.message);
       } finally {
         if (btnVerifyOtpStep) {
@@ -447,10 +485,35 @@ export async function initAuth() {
   }
 
   if (inlineResendOtpLink) {
-    inlineResendOtpLink.addEventListener('click', (e) => {
+    inlineResendOtpLink.addEventListener('click', async (e) => {
       e.preventDefault();
       if (isResendCooldown) return;
-      handleSignUpSubmit();
+
+      const targetEmail = signedUpUser?.email || (emailInput ? emailInput.value.trim().toLowerCase() : '');
+      if (!targetEmail) return;
+
+      try {
+        const res = await fetch('/api/auth/signup-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fullName: signedUpUser?.fullName || 'User',
+            email: targetEmail,
+            username: signedUpUser?.username || targetEmail.split('@')[0],
+            password: signedUpUser?.password || 'default_pass',
+            phoneNumber: signedUpUser?.phoneNumber || null
+          })
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          showError(inlineOtpErrorMsg, data.error || 'Failed to resend code.');
+        } else {
+          startOtpTimer(25);
+        }
+      } catch (err) {
+        showError(inlineOtpErrorMsg, err.message);
+      }
     });
   }
 
@@ -702,6 +765,21 @@ function hideError(elem) {
  * Global Logout Handler
  */
 export function handleLogout() {
+  const token = localStorage.getItem('invibe_jwt_token');
+  if (token) {
+    try {
+      if (navigator.sendBeacon) {
+        const blob = new Blob([JSON.stringify({})], { type: 'application/json' });
+        navigator.sendBeacon(`/api/users/logout-presence?token=${encodeURIComponent(token)}`, blob);
+      }
+      fetch('/api/users/logout-presence', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        keepalive: true
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
   localStorage.removeItem('invibeUser');
   localStorage.removeItem('invibeProfileImage');
   localStorage.removeItem('invibeIsLoggedIn');
@@ -750,7 +828,7 @@ export function updateAppUI() {
   if (createPostAvatar && profileImage) createPostAvatar.src = profileImage;
 
   // Stories "Your Vibe" avatar
-  const storyAvatar = document.querySelector('.story-card.current-user .story-avatar-container img');
+  const storyAvatar = document.querySelector('.story-card.current-user .story-avatar-container img') || document.querySelector('#story-btn-current img');
   if (storyAvatar && profileImage) storyAvatar.src = profileImage;
 
   // My Profile view (middle panel)
@@ -764,11 +842,33 @@ export function updateAppUI() {
   const myProfileUsername = document.querySelector('.profile-screen-handle');
   if (myProfileUsername && user.username) myProfileUsername.textContent = '@' + user.username;
 
+  // Synchronize all live feed post author avatars and comments for current user
+  const userId = (user.id || user._id || '').toString();
+  const currentUsername = (user.username || '').toLowerCase();
+  if (profileImage) {
+    document.querySelectorAll('#home-feed-posts .feed-card').forEach(card => {
+      const avatarEl = card.querySelector('.author-avatar');
+      const authorId = avatarEl?.getAttribute('data-user-id') || '';
+      const handleEl = card.querySelector('.author-handle');
+      const handleText = handleEl?.textContent?.replace('@', '').trim().toLowerCase() || '';
+
+      if (avatarEl && ((userId && authorId === userId) || (currentUsername && handleText === currentUsername))) {
+        avatarEl.src = profileImage;
+      }
+    });
+
+    document.querySelectorAll('.comment-author-avatar').forEach(img => {
+      const cAuthorId = img.getAttribute('data-user-id') || '';
+      if (userId && cAuthorId === userId) {
+        img.src = profileImage;
+      }
+    });
+  }
+
   // Query backend for exact profile & follower/following counts
   const userFollowersEl = document.getElementById('user-followers-count');
   const userFollowingEl = document.getElementById('user-following-count');
 
-  const userId = user.id || user._id;
   if (userId) {
     supabase.from('profiles').select('follower_count, following_count, post_count, full_name, username').eq('id', userId).maybeSingle()
       .then(({ data: u }) => {

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">HI-HUBBLE</string>
+    <string name="title_activity_main">HI-HUBBLE</string>
+    <string name="package_name">com.hihubble.app</string>
+    <string name="custom_url_scheme">com.hihubble.app</string>
+</resources>

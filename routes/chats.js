@@ -18,6 +18,128 @@ async function resolveProfile(targetId) {
   return profile;
 }
 
+// Helper to reliably compute canonical direct conversation user ordering using string comparison
+function getCanonicalUserOrder(userA, userB) {
+  const strA = String(userA);
+  const strB = String(userB);
+  const isALessOrEqual = strA.localeCompare(strB) <= 0;
+  return {
+    direct_user1_id: isALessOrEqual ? strA : strB,
+    direct_user2_id: isALessOrEqual ? strB : strA
+  };
+}
+
+// Helper to find all shared direct conversation IDs between userA and userB
+async function getAllSharedDirectConversationIds(userA_id, userB_id) {
+  if (!userA_id || !userB_id) return [];
+  const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(userA_id, userB_id);
+
+  const { data: convByDirect } = await supabase
+    .from('conversations')
+    .select('id')
+    .eq('type', 'direct')
+    .or(`and(direct_user1_id.eq.${direct_user1_id},direct_user2_id.eq.${direct_user2_id}),and(direct_user1_id.eq.${direct_user2_id},direct_user2_id.eq.${direct_user1_id})`);
+
+  const { data: memA } = await supabase
+    .from('conversation_members')
+    .select('conversation_id')
+    .eq('user_id', userA_id);
+
+  const convIdsA = (memA || []).map(m => m.conversation_id);
+  let sharedConvIds = [];
+  if (convIdsA.length > 0) {
+    const { data: memB } = await supabase
+      .from('conversation_members')
+      .select('conversation_id')
+      .eq('user_id', userB_id)
+      .in('conversation_id', convIdsA);
+    sharedConvIds = (memB || []).map(m => m.conversation_id);
+  }
+
+  return Array.from(new Set([
+    ...(convByDirect || []).map(c => c.id),
+    ...sharedConvIds
+  ]));
+}
+
+// Helper to reliably check if a user is a member of a conversation
+export async function isUserConversationMember(conversationId, userId) {
+  if (!conversationId || !userId) return false;
+
+  // Check direct_user1_id / direct_user2_id on conversations table
+  const { data: conv } = await supabase
+    .from('conversations')
+    .select('id, type, direct_user1_id, direct_user2_id, created_by')
+    .eq('id', conversationId)
+    .maybeSingle();
+
+  if (!conv) return false;
+
+  if (conv.type === 'direct') {
+    if (conv.direct_user1_id === userId || conv.direct_user2_id === userId) {
+      return true;
+    }
+  }
+
+  // Check conversation_members table
+  const { data: member } = await supabase
+    .from('conversation_members')
+    .select('user_id')
+    .eq('conversation_id', conversationId)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  return !!member;
+}
+
+// Helper to find the canonical direct conversation between userA and userB
+async function findDirectConversation(userA_id, userB_id) {
+  if (!userA_id || !userB_id) return null;
+  const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(userA_id, userB_id);
+
+  const allCandidateIds = await getAllSharedDirectConversationIds(userA_id, userB_id);
+  if (allCandidateIds.length === 0) return null;
+
+  // Fetch all candidates and pick the one with latest message
+  const { data: candidates } = await supabase
+    .from('conversations')
+    .select('id, type, direct_user1_id, direct_user2_id, last_message_at')
+    .in('id', allCandidateIds)
+    .eq('type', 'direct');
+
+  if (!candidates || candidates.length === 0) return null;
+
+  let bestCandidate = candidates[0];
+  let latestTime = 0;
+
+  for (const c of candidates) {
+    const t = c.last_message_at ? new Date(c.last_message_at).getTime() : 0;
+    if (t >= latestTime) {
+      latestTime = t;
+      bestCandidate = c;
+    }
+  }
+
+  // Ensure member records exist for both participants in the chosen conversation
+  try {
+    await supabase.from('conversation_members').upsert([
+      { conversation_id: bestCandidate.id, user_id: userA_id, role: 'member' },
+      { conversation_id: bestCandidate.id, user_id: userB_id, role: 'member' }
+    ], { onConflict: 'conversation_id,user_id' });
+  } catch (_) {}
+
+  // Backfill direct_user1_id and direct_user2_id if missing
+  if (!bestCandidate.direct_user1_id || !bestCandidate.direct_user2_id) {
+    try {
+      await supabase.from('conversations')
+        .update({ direct_user1_id, direct_user2_id })
+        .eq('id', bestCandidate.id);
+    } catch (_) {}
+  }
+
+  return bestCandidate;
+}
+
 // =========================================================
 // 1. GET INBOX CONVERSATION THREADS
 // =========================================================
@@ -29,7 +151,7 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
     // 1. Find all conversations the user is a member of
     const { data: userMemberships, error: memErr } = await supabase
       .from('conversation_members')
-      .select('conversation_id, unread_count, last_read_at')
+      .select('conversation_id, unread_count, last_read_at, role, muted, archived, pinned')
       .eq('user_id', currentUserId);
 
     if (memErr) throw memErr;
@@ -37,10 +159,19 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
     const convIds = (userMemberships || []).map(m => m.conversation_id);
     const unreadMap = new Map((userMemberships || []).map(m => [m.conversation_id, m.unread_count || 0]));
 
+    // Fetch active online user IDs within 90-second TTL
+    const ninetySecAgo = new Date(Date.now() - 90 * 1000).toISOString();
+    const { data: activeOnlineRows } = await supabase
+      .from('online_users')
+      .select('user_id')
+      .eq('status', 'online')
+      .gte('last_seen', ninetySecAgo);
+    const activeOnlineSet = new Set((activeOnlineRows || []).map(r => r.user_id));
+
+    // If user has no conversations yet, suggest recent connections / active users as empty threads
     if (convIds.length === 0) {
-      // 1. Fetch user's followers & following IDs from database
       const { data: followsData } = await supabase
-        .from('followers')
+        .from('follows')
         .select('follower_id, following_id')
         .or(`follower_id.eq.${currentUserId},following_id.eq.${currentUserId}`);
 
@@ -80,7 +211,7 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
           fullName: p.full_name || p.username,
           username: p.username,
           profileImage: p.profile_image_url || '',
-          isOnline: !!p.is_online,
+          isOnline: activeOnlineSet.has(p.id),
           lastSeen: p.last_active_at
         },
         lastMessage: null,
@@ -89,10 +220,10 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
       return res.json(emptyThreads);
     }
 
-    // 2. Fetch conversations
+    // 2. Fetch conversations using verified schema columns
     const { data: conversations, error: convErr } = await supabase
       .from('conversations')
-      .select('*')
+      .select('id, type, title, name, description, group_avatar, group_image_url, created_by, last_message_at, direct_user1_id, direct_user2_id, created_at, updated_at')
       .in('id', convIds)
       .order('last_message_at', { ascending: false });
 
@@ -106,19 +237,18 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
 
     if (allMemErr) throw allMemErr;
 
-    // 4. Fetch latest message for each conversation
+    // 4. Fetch latest message & typing status for each thread
     const threadResults = await Promise.all(
       (conversations || []).map(async (conv) => {
         const { data: lastMsg } = await supabase
           .from('messages')
-          .select('*')
+          .select('id, conversation_id, sender_id, recipient_id, content, media_url, media_type, status, is_read, is_deleted, deleted_for_everyone, created_at')
           .eq('conversation_id', conv.id)
           .eq('deleted_for_everyone', false)
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle();
 
-        // Get typing status
         const { data: typingData } = await supabase
           .from('typing_status')
           .select('user_id, is_typing, profile:profiles(username)')
@@ -129,8 +259,22 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
 
         if (conv.type === 'direct') {
           const otherMember = (allMembers || []).find(m => m.conversation_id === conv.id && m.user_id !== currentUserId);
-          const p = otherMember?.profile;
-          if (!p || p.username.startsWith('search_test_')) return null;
+          let p = otherMember?.profile;
+
+          // Fallback to direct_user1_id / direct_user2_id lookup if profile join incomplete
+          if (!p) {
+            const otherUserId = conv.direct_user1_id === currentUserId ? conv.direct_user2_id : conv.direct_user1_id;
+            if (otherUserId) {
+              const { data: fetchedProfile } = await supabase
+                .from('profiles')
+                .select('id, username, full_name, profile_image_url, is_online, last_active_at')
+                .eq('id', otherUserId)
+                .maybeSingle();
+              p = fetchedProfile;
+            }
+          }
+
+          if (!p || (p.username && p.username.startsWith('search_test_'))) return null;
 
           return {
             conversationId: conv.id,
@@ -140,7 +284,7 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
               fullName: p.full_name || p.username,
               username: p.username,
               profileImage: p.profile_image_url || '',
-              isOnline: !!p.is_online,
+              isOnline: activeOnlineSet.has(p.id),
               lastSeen: p.last_active_at
             },
             lastMessage: lastMsg ? {
@@ -157,17 +301,16 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
             typingUsername: typingData?.profile?.username || null
           };
         } else {
-          // Group Chat Thread
           return {
             conversationId: conv.id,
             type: 'group',
-            groupName: conv.name || 'Group Chat',
-            groupImageUrl: conv.group_image_url || '',
+            groupName: conv.name || conv.title || 'Group Chat',
+            groupImageUrl: conv.group_image_url || conv.group_avatar || '',
             user: {
               _id: conv.id,
-              fullName: conv.name || 'Group Chat',
+              fullName: conv.name || conv.title || 'Group Chat',
               username: 'group',
-              profileImage: conv.group_image_url || '',
+              profileImage: conv.group_image_url || conv.group_avatar || '',
               isOnline: false
             },
             lastMessage: lastMsg ? {
@@ -187,7 +330,22 @@ router.get('/api/chats/threads', authenticateToken, async (req, res) => {
       })
     );
 
-    res.json((threadResults || []).filter(Boolean));
+    const filtered = (threadResults || []).filter(Boolean);
+    const seenDirectUserIds = new Set();
+    const deduplicatedThreads = [];
+
+    for (const thread of filtered) {
+      if (thread.type === 'direct') {
+        const targetUserId = thread.user?._id;
+        if (targetUserId && seenDirectUserIds.has(targetUserId.toString())) {
+          continue; // Skip duplicate direct thread for same partner
+        }
+        if (targetUserId) seenDirectUserIds.add(targetUserId.toString());
+      }
+      deduplicatedThreads.push(thread);
+    }
+
+    res.json(deduplicatedThreads);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -208,48 +366,52 @@ router.post('/api/chats/direct/:targetId', authenticateToken, async (req, res) =
 
     const targetUserId = targetProfile.id;
 
-    // Check if 1-on-1 direct conversation already exists
-    const { data: myMemberships } = await supabase.from('conversation_members').select('conversation_id').eq('user_id', currentUserId);
-    const myConvIds = (myMemberships || []).map(m => m.conversation_id);
+    // Check live online presence from online_users table (90s TTL)
+    const ninetySecAgo = new Date(Date.now() - 90 * 1000).toISOString();
+    const { data: activeOnlineRow } = await supabase
+      .from('online_users')
+      .select('status, last_seen')
+      .eq('user_id', targetUserId)
+      .eq('status', 'online')
+      .gte('last_seen', ninetySecAgo)
+      .maybeSingle();
+    const isTargetOnline = !!activeOnlineRow;
 
-    if (myConvIds.length > 0) {
-      const { data: sharedMembership } = await supabase
-        .from('conversation_members')
-        .select('conversation_id, conversation:conversations!inner(type)')
-        .eq('user_id', targetUserId)
-        .in('conversation_id', myConvIds)
-        .eq('conversation.type', 'direct')
-        .maybeSingle();
+    // 1. Check existing direct conversation via canonical helper (handles legacy data)
+    const existingConv = await findDirectConversation(currentUserId, targetUserId);
 
-      if (sharedMembership) {
-        return res.json({
-          conversationId: sharedMembership.conversation_id,
-          targetUser: {
-            _id: targetProfile.id,
-            fullName: targetProfile.full_name || targetProfile.username,
-            username: targetProfile.username,
-            profileImage: targetProfile.profile_image_url || '',
-            isOnline: !!targetProfile.is_online,
-            lastSeen: targetProfile.last_active_at
-          }
-        });
-      }
+    if (existingConv) {
+      return res.json({
+        conversationId: existingConv.id,
+        targetUser: {
+          _id: targetProfile.id,
+          fullName: targetProfile.full_name || targetProfile.username,
+          username: targetProfile.username,
+          profileImage: targetProfile.profile_image_url || '',
+          isOnline: isTargetOnline,
+          lastSeen: targetProfile.last_active_at
+        }
+      });
     }
 
-    // Create new direct conversation
+    // 2. Create new direct conversation storing direct_user1_id and direct_user2_id
+    const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(currentUserId, targetUserId);
+    const nowIso = new Date().toISOString();
     const { data: newConv, error: createErr } = await supabase
       .from('conversations')
       .insert([{
         type: 'direct',
         created_by: currentUserId,
-        last_message_at: new Date().toISOString()
+        direct_user1_id,
+        direct_user2_id,
+        last_message_at: nowIso
       }])
       .select()
       .single();
 
     if (createErr) throw createErr;
 
-    // Add both members
+    // Add both member records
     await supabase.from('conversation_members').insert([
       { conversation_id: newConv.id, user_id: currentUserId, role: 'member' },
       { conversation_id: newConv.id, user_id: targetUserId, role: 'member' }
@@ -262,7 +424,7 @@ router.post('/api/chats/direct/:targetId', authenticateToken, async (req, res) =
         fullName: targetProfile.full_name || targetProfile.username,
         username: targetProfile.username,
         profileImage: targetProfile.profile_image_url || '',
-        isOnline: !!targetProfile.is_online,
+        isOnline: isTargetOnline,
         lastSeen: targetProfile.last_active_at
       }
     });
@@ -270,6 +432,28 @@ router.post('/api/chats/direct/:targetId', authenticateToken, async (req, res) =
     res.status(500).json({ error: err.message });
   }
 });
+
+// Helper to resolve Supabase Storage URLs
+function resolveStoragePublicUrl(storagePathOrUrl, bucketName = 'chat-media') {
+  if (!storagePathOrUrl || typeof storagePathOrUrl !== 'string') return '';
+  const trimmed = storagePathOrUrl.trim();
+  if (!trimmed) return '';
+
+  // If already an HTTP(S) URL or base64 data URL
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:')) {
+    return trimmed;
+  }
+
+  // Hub keys like "story_...", "reel_...", "post_..." are logical reference IDs, NOT storage paths
+  if (trimmed.startsWith('story_') || trimmed.startsWith('reel_') || trimmed.startsWith('post_') || trimmed.startsWith('reel')) {
+    return trimmed;
+  }
+
+  // If it's a relative storage path (e.g. "chat-media/convId/..." or "convId/userId/filename.png")
+  const cleanPath = trimmed.replace(/^\/?(chat-media|chat-attachments)\//, '');
+  const { data } = supabase.storage.from(bucketName).getPublicUrl(cleanPath);
+  return data?.publicUrl || trimmed;
+}
 
 // =========================================================
 // 3. FETCH MESSAGES FOR CONVERSATION
@@ -280,118 +464,183 @@ router.get('/api/chats/messages/:convId', authenticateToken, async (req, res) =>
   const convId = req.params.convId;
 
   try {
-    // If param is a target user ID/username or conversation ID, resolve conversation ID
     let conversationId = convId;
-
-    // 1. Check if convId exists in conversations table (only if valid UUID)
-    let convExists = null;
+    let targetUserId = null;
+    let allConvIds = [];
     const isConvUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(convId);
+
     if (isConvUuid) {
-      const { data } = await supabase
+      const { data: convCheck } = await supabase
         .from('conversations')
-        .select('id')
+        .select('id, type, direct_user1_id, direct_user2_id')
         .eq('id', convId)
         .maybeSingle();
-      convExists = data;
-    }
 
-    if (!convExists) {
-      // 2. convId is a target user ID or username! Resolve profile & find shared conversation
+      if (convCheck) {
+        // Strict BOLA check: Ensure requesting user is a member of this conversation
+        const isMember = await isUserConversationMember(convCheck.id, currentUserId);
+        if (!isMember) {
+          return res.status(403).json({ error: 'Forbidden: You are not authorized to view messages in this conversation.' });
+        }
+
+        conversationId = convCheck.id;
+        if (convCheck.type === 'direct') {
+          targetUserId = convCheck.direct_user1_id === currentUserId ? convCheck.direct_user2_id : convCheck.direct_user1_id;
+          if (!targetUserId) {
+            const { data: members } = await supabase
+              .from('conversation_members')
+              .select('user_id')
+              .eq('conversation_id', convCheck.id)
+              .neq('user_id', currentUserId);
+            if (members && members.length > 0) targetUserId = members[0].user_id;
+          }
+        }
+      } else {
+        // Param is a target user UUID — resolve to profile
+        const targetProfile = await resolveProfile(convId);
+        if (targetProfile) {
+          targetUserId = targetProfile.id;
+          const directConv = await findDirectConversation(currentUserId, targetProfile.id);
+          if (directConv) conversationId = directConv.id;
+        }
+      }
+    } else {
+      // Param is a username — resolve to profile
       const targetProfile = await resolveProfile(convId);
       if (targetProfile) {
-        const { data: myMems } = await supabase
-          .from('conversation_members')
-          .select('conversation_id')
-          .eq('user_id', currentUserId);
-
-        const myIds = (myMems || []).map(m => m.conversation_id);
-
-        if (myIds.length > 0) {
-          const { data: shared } = await supabase
-            .from('conversation_members')
-            .select('conversation_id')
-            .eq('user_id', targetProfile.id)
-            .in('conversation_id', myIds)
-            .maybeSingle();
-
-          if (shared) {
-            conversationId = shared.conversation_id;
-          }
-        }
-
-        if (!conversationId || conversationId === convId) {
-          const { data: dmMsg } = await supabase
-            .from('messages')
-            .select('conversation_id')
-            .or(`and(sender_id.eq.${currentUserId},recipient_id.eq.${targetProfile.id}),and(sender_id.eq.${targetProfile.id},recipient_id.eq.${currentUserId})`)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-          if (dmMsg && dmMsg.conversation_id) {
-            conversationId = dmMsg.conversation_id;
-          }
-        }
+        targetUserId = targetProfile.id;
+        const directConv = await findDirectConversation(currentUserId, targetProfile.id);
+        if (directConv) conversationId = directConv.id;
       }
     }
 
-    // Fetch messages
+    if (targetUserId) {
+      allConvIds = await getAllSharedDirectConversationIds(currentUserId, targetUserId);
+    }
+    if (conversationId && !allConvIds.includes(conversationId)) {
+      allConvIds.push(conversationId);
+    }
+
+    if (allConvIds.length === 0) {
+      res.setHeader('X-Conversation-Id', '');
+      return res.json([]);
+    }
+
+    // Verify current user has access to each conversation in allConvIds
+    for (const cId of allConvIds) {
+      const allowed = await isUserConversationMember(cId, currentUserId);
+      if (!allowed) {
+        return res.status(403).json({ error: 'Forbidden: You are not authorized to view messages in this conversation.' });
+      }
+    }
+
+    const primaryConvId = conversationId || allConvIds[0];
+    res.setHeader('X-Conversation-Id', primaryConvId);
+
+    // Fetch messages across all linked conversation IDs
     const { data: messages, error } = await supabase
       .from('messages')
       .select(`
-        *,
-        sender:profiles!sender_id(id, username, full_name, profile_image_url),
-        voice_note:voice_notes!message_id(duration, waveform, audio_url)
+        id, conversation_id, sender_id, recipient_id, content, media_url, media_type, media_name, media_size,
+        reply_to_id, status, is_read, is_deleted, is_pinned, is_starred, is_edited, deleted_for_everyone, created_at, updated_at,
+        sender:profiles!sender_id(id, username, full_name, profile_image_url)
       `)
-      .eq('conversation_id', conversationId)
+      .in('conversation_id', allConvIds)
       .eq('deleted_for_everyone', false)
       .order('created_at', { ascending: true });
 
     if (error) throw error;
 
-    // Filter out messages deleted for me
-    const filtered = (messages || []).filter(m => !(m.deleted_for_me || []).includes(currentUserId));
+    const msgIds = (messages || []).map(m => m.id);
+
+    // Fetch message_attachments for these messages
+    let attachmentsMap = new Map();
+    if (msgIds.length > 0) {
+      const { data: attData } = await supabase
+        .from('message_attachments')
+        .select('id, message_id, storage_path, file_name, mime_type, file_size, file_type')
+        .in('message_id', msgIds);
+
+      (attData || []).forEach(att => {
+        if (!attachmentsMap.has(att.message_id)) attachmentsMap.set(att.message_id, att);
+      });
+    }
 
     // Fetch reactions for these messages
-    const msgIds = filtered.map(m => m.id);
     let reactionsMap = new Map();
     if (msgIds.length > 0) {
-      const { data: rxData } = await supabase.from('message_reactions').select('*').in('message_id', msgIds);
+      const { data: rxData } = await supabase
+        .from('message_reactions')
+        .select('id, message_id, user_id, emoji, created_at')
+        .in('message_id', msgIds);
+
       (rxData || []).forEach(rx => {
         if (!reactionsMap.has(rx.message_id)) reactionsMap.set(rx.message_id, []);
         reactionsMap.get(rx.message_id).push(rx);
       });
     }
 
-    // Mark messages as read for current user
-    await supabase.from('messages').update({ status: 'read', is_read: true }).eq('conversation_id', conversationId).neq('sender_id', currentUserId);
-    await supabase.from('conversation_members').update({ unread_count: 0, last_read_at: new Date().toISOString() }).eq('conversation_id', conversationId).eq('user_id', currentUserId);
+    // Mark messages as read for current user across all linked conversations
+    await supabase.from('messages')
+      .update({ status: 'read', is_read: true })
+      .in('conversation_id', allConvIds)
+      .neq('sender_id', currentUserId);
 
-    const formattedMessages = filtered.map(m => ({
-      _id: m.id,
-      id: m.id,
-      conversationId: m.conversation_id,
-      sender: m.sender ? {
-        _id: m.sender.id,
-        fullName: m.sender.full_name || m.sender.username,
-        username: m.sender.username,
-        profileImage: m.sender.profile_image_url || ''
-      } : m.sender_id,
-      recipient: m.recipient_id,
-      content: m.content,
-      mediaUrl: m.media_url,
-      mediaType: m.media_type || 'text',
-      mediaName: m.media_name,
-      mediaSize: m.media_size,
-      replyToId: m.reply_to_id,
-      status: m.status,
-      isPinned: !!m.is_pinned,
-      isStarred: !!m.is_starred,
-      isEdited: !!m.is_edited,
-      reactions: reactionsMap.get(m.id) || [],
-      voiceNote: Array.isArray(m.voice_note) ? m.voice_note[0] : m.voice_note,
-      createdAt: m.created_at
-    }));
+    await supabase.from('conversation_members')
+      .update({ unread_count: 0, last_read_at: new Date().toISOString() })
+      .in('conversation_id', allConvIds)
+      .eq('user_id', currentUserId);
+
+    // Record read status in message_reads
+    if (msgIds.length > 0) {
+      const readRows = msgIds.map(mId => ({
+        message_id: mId,
+        user_id: currentUserId,
+        read_at: new Date().toISOString()
+      }));
+      await supabase.from('message_reads').upsert(readRows, { onConflict: 'message_id,user_id', ignoreDuplicates: true });
+    }
+
+    const formattedMessages = (messages || []).map(m => {
+      const att = attachmentsMap.get(m.id);
+      const rawPath = att?.storage_path || m.media_url || '';
+      const resolvedMediaUrl = resolveStoragePublicUrl(rawPath);
+      const effectiveType = m.media_type || att?.file_type || (rawPath ? 'image' : 'text');
+
+      return {
+        _id: m.id,
+        id: m.id,
+        conversationId: m.conversation_id,
+        sender: m.sender ? {
+          _id: m.sender.id,
+          fullName: m.sender.full_name || m.sender.username,
+          username: m.sender.username,
+          profileImage: m.sender.profile_image_url || ''
+        } : m.sender_id,
+        recipient: m.recipient_id,
+        content: m.content,
+        mediaUrl: resolvedMediaUrl,
+        mediaType: effectiveType,
+        mediaName: m.media_name || att?.file_name || (effectiveType === 'image' ? 'image.png' : null),
+        mediaSize: m.media_size || att?.file_size || null,
+        durationSeconds: att?.duration_seconds || null,
+        attachment: att ? {
+          id: att.id,
+          storagePath: att.storage_path,
+          fileName: att.file_name,
+          mimeType: att.mime_type,
+          fileSize: att.file_size,
+          durationSeconds: att.duration_seconds || null
+        } : null,
+        replyToId: m.reply_to_id,
+        status: m.status,
+        isPinned: !!m.is_pinned,
+        isStarred: !!m.is_starred,
+        isEdited: !!m.is_edited,
+        reactions: reactionsMap.get(m.id) || [],
+        createdAt: m.created_at
+      };
+    });
 
     res.json(formattedMessages);
   } catch (err) {
@@ -400,7 +649,7 @@ router.get('/api/chats/messages/:convId', authenticateToken, async (req, res) =>
 });
 
 // =========================================================
-// SEARCH INSIDE MESSAGES (MUST BE PLACED BEFORE /api/chats/:targetUserId)
+// SEARCH INSIDE MESSAGES
 // =========================================================
 router.get('/api/chats/search', authenticateToken, async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
@@ -410,7 +659,6 @@ router.get('/api/chats/search', authenticateToken, async (req, res) => {
   if (!queryText) return res.json([]);
 
   try {
-    // 1. Fetch conversations user belongs to
     const { data: memberships } = await supabase
       .from('conversation_members')
       .select('conversation_id')
@@ -418,17 +666,15 @@ router.get('/api/chats/search', authenticateToken, async (req, res) => {
 
     const convIds = (memberships || []).map(m => m.conversation_id);
 
-    // 2. Fetch search results matching content text
     const { data: searchResults, error: searchErr } = await supabase
       .from('messages')
-      .select('*')
+      .select('id, conversation_id, sender_id, recipient_id, content, media_url, media_type, created_at')
       .ilike('content', `%${queryText}%`)
       .order('created_at', { ascending: false })
       .limit(50);
 
     if (searchErr) throw searchErr;
 
-    // 3. Filter messages relevant to current user
     const userMessages = (searchResults || []).filter(msg => {
       if (msg.sender_id === currentUserId || msg.recipient_id === currentUserId) return true;
       if (convIds.includes(msg.conversation_id)) return true;
@@ -441,35 +687,8 @@ router.get('/api/chats/search', authenticateToken, async (req, res) => {
   }
 });
 
-// Fallback 1-on-1 direct user message endpoint
-router.get('/api/chats/:targetUserId', authenticateToken, async (req, res) => {
-  const currentUserId = req.user.id;
-  const targetParam = req.params.targetUserId;
-  try {
-    const targetProfile = await resolveProfile(targetParam);
-    if (!targetProfile) return res.json([]);
-
-    const { data: myMems } = await supabase.from('conversation_members').select('conversation_id').eq('user_id', currentUserId);
-    const myIds = (myMems || []).map(m => m.conversation_id);
-    const { data: shared } = await supabase.from('conversation_members').select('conversation_id').eq('user_id', targetProfile.id).in('conversation_id', myIds).maybeSingle();
-
-    if (!shared) return res.json([]);
-
-    const { data: messages } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('conversation_id', shared.conversation_id)
-      .eq('deleted_for_everyone', false)
-      .order('created_at', { ascending: true });
-
-    res.json(messages || []);
-  } catch (err) {
-    res.json([]);
-  }
-});
-
 // =========================================================
-// 4. SEND MESSAGE (TEXT, MEDIA, VOICE NOTES, DOCUMENTS)
+// 4. SEND MESSAGE (TEXT, MEDIA, VOICE NOTES, ATTACHMENTS)
 // =========================================================
 router.post('/api/chats/message', authenticateToken, async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
@@ -480,47 +699,144 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
     let targetConvId = conversationId;
     let targetRecipientId = recipientId || recipient;
 
-    // Resolve target profile if recipient specified
     let targetProfile = null;
     if (targetRecipientId) {
       targetProfile = await resolveProfile(targetRecipientId);
       if (targetProfile) targetRecipientId = targetProfile.id;
     }
 
-    // Auto-create/resolve conversation if conversationId is missing
+    // Auto-create/resolve conversation if conversationId missing
     if (!targetConvId && targetRecipientId) {
-      const { data: myMems } = await supabase.from('conversation_members').select('conversation_id').eq('user_id', currentUserId);
-      const myIds = (myMems || []).map(m => m.conversation_id);
-      const { data: shared } = await supabase.from('conversation_members').select('conversation_id').eq('user_id', targetRecipientId).in('conversation_id', myIds).maybeSingle();
+      const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(currentUserId, targetRecipientId);
+      const { data: existingConv } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('type', 'direct')
+        .eq('direct_user1_id', direct_user1_id)
+        .eq('direct_user2_id', direct_user2_id)
+        .maybeSingle();
 
-      if (shared) {
-        targetConvId = shared.conversation_id;
+      if (existingConv) {
+        targetConvId = existingConv.id;
       } else {
-        const { data: newConv } = await supabase.from('conversations').insert([{ type: 'direct', created_by: currentUserId, last_message_at: new Date().toISOString() }]).select().single();
+        const { data: newConv } = await supabase
+          .from('conversations')
+          .insert([{
+            type: 'direct',
+            created_by: currentUserId,
+            direct_user1_id,
+            direct_user2_id,
+            last_message_at: new Date().toISOString()
+          }])
+          .select()
+          .single();
+
         await supabase.from('conversation_members').insert([
           { conversation_id: newConv.id, user_id: currentUserId, role: 'member' },
           { conversation_id: newConv.id, user_id: targetRecipientId, role: 'member' }
         ]);
+
         targetConvId = newConv.id;
       }
     }
 
     if (!targetConvId) return res.status(400).json({ error: 'Conversation or Recipient ID is required.' });
 
+    // Strict BOLA check: Ensure sender is a participant of targetConvId
+    const isMember = await isUserConversationMember(targetConvId, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not authorized to send messages to this conversation.' });
+    }
+
     const nowIso = new Date().toISOString();
 
-    // Insert Message
+    // If mediaUrl is a base64 data URL, upload to Supabase Storage 'chat-media' bucket
+    let finalMediaUrl = mediaUrl || null;
+    let finalMediaType = mediaType || 'text';
+    let finalMimeType = 'image/jpeg';
+    let calculatedSize = typeof mediaSize === 'number' ? mediaSize : 0;
+
+    // If content contains legacy embedded HTML tags, extract mediaUrl and mediaType
+    let cleanContent = content || '';
+    if (!finalMediaUrl && typeof cleanContent === 'string') {
+      const imgMatch = cleanContent.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+      const videoMatch = cleanContent.match(/<video[^>]+src=["']([^"']+)["'][^>]*>/i);
+      if (imgMatch) {
+        finalMediaUrl = imgMatch[1];
+        finalMediaType = 'image';
+        cleanContent = '';
+      } else if (videoMatch) {
+        finalMediaUrl = videoMatch[1];
+        finalMediaType = 'video';
+        cleanContent = '';
+      }
+    }
+
+    if (typeof finalMediaUrl === 'string' && finalMediaUrl.startsWith('data:')) {
+      try {
+        const commaIdx = finalMediaUrl.indexOf(',');
+        if (commaIdx > 0) {
+          const metaPart = finalMediaUrl.substring(0, commaIdx);
+          const base64Data = finalMediaUrl.substring(commaIdx + 1);
+          const mimeMatch = metaPart.match(/^data:([^;,]+)/i);
+          const rawMime = mimeMatch ? mimeMatch[1].trim() : (req.body.mimeType || 'image/jpeg');
+          finalMimeType = rawMime;
+          const cleanMime = rawMime.split(';')[0].trim().toLowerCase();
+
+          const buffer = Buffer.from(base64Data, 'base64');
+          calculatedSize = buffer.length;
+
+          const isVideo = cleanMime.startsWith('video/') || finalMediaType === 'video' || (mediaType === 'video');
+          const isAudio = cleanMime.startsWith('audio/') || finalMediaType === 'voice' || finalMediaType === 'audio';
+
+          let ext = 'jpg';
+          if (isVideo) {
+            ext = cleanMime.includes('mp4') ? 'mp4' : 'webm';
+          } else if (isAudio) {
+            ext = cleanMime.includes('mp3') ? 'mp3' : (cleanMime.includes('ogg') ? 'ogg' : 'webm');
+          } else {
+            ext = cleanMime.split('/')[1]?.split('+')[0] || 'jpg';
+          }
+
+          const filename = `${targetConvId}/${currentUserId}/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+
+          const { error: uploadErr } = await supabase.storage
+            .from('chat-media')
+            .upload(filename, buffer, { contentType: cleanMime, upsert: true });
+
+          if (uploadErr) {
+            console.warn('Supabase Storage chat-media upload fallback to data URL:', uploadErr.message);
+            finalMediaType = isAudio ? 'audio' : (isVideo ? 'video' : (cleanMime.startsWith('image/') ? 'image' : (finalMediaType || 'file')));
+          } else {
+            const { data: publicUrlData } = supabase.storage.from('chat-media').getPublicUrl(filename);
+            if (publicUrlData?.publicUrl) {
+              finalMediaUrl = publicUrlData.publicUrl;
+              finalMediaType = isAudio ? 'audio' : (isVideo ? 'video' : (cleanMime.startsWith('image/') ? 'image' : (finalMediaType || 'file')));
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Error during media upload processing:', err);
+      }
+    }
+
+    const isVideoMsg = finalMediaType === 'video' || finalMimeType.startsWith('video/');
+    const isAudioMsg = finalMediaType === 'audio' || finalMediaType === 'voice' || finalMimeType.startsWith('audio/');
+    const defaultMediaName = isAudioMsg ? 'voice_message.webm' : (isVideoMsg ? 'video.mp4' : (finalMediaType === 'image' ? 'image.png' : 'file'));
+    const messageMediaType = isAudioMsg ? 'audio' : finalMediaType;
+
+    // Insert Message using verified columns
     const { data: newMsg, error: msgErr } = await supabase
       .from('messages')
       .insert([{
         conversation_id: targetConvId,
         sender_id: currentUserId,
         recipient_id: targetRecipientId,
-        content: content || '',
-        media_url: mediaUrl || null,
-        media_type: mediaType || 'text',
-        media_name: mediaName || null,
-        media_size: mediaSize || null,
+        content: cleanContent || '',
+        media_url: finalMediaUrl,
+        media_type: messageMediaType,
+        media_name: mediaName || defaultMediaName,
+        media_size: calculatedSize || null,
         reply_to_id: replyToId || null,
         status: 'sent',
         created_at: nowIso,
@@ -529,28 +845,50 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
       .select()
       .single();
 
-    if (msgErr) throw msgErr;
+    if (msgErr) {
+      console.error('Message insert error:', msgErr);
+      return res.status(500).json({ error: 'Message could not be sent.' });
+    }
 
-    // Insert Voice Note entry if voice note
-    let voiceNoteObj = null;
-    if (mediaType === 'voice_note' && mediaUrl) {
-      const { data: vn } = await supabase.from('voice_notes').insert([{
-        message_id: newMsg.id,
-        user_id: currentUserId,
-        duration: duration || 0,
-        waveform: waveform || [],
-        audio_url: mediaUrl
-      }]).select().single();
-      voiceNoteObj = vn;
+    // Insert Attachment Record if image/video/audio/media present
+    if (finalMediaUrl && finalMediaType && finalMediaType !== 'text') {
+      try {
+        const fileTypeEnum = isAudioMsg ? 'audio' : (isVideoMsg ? 'video' : (finalMediaType === 'image' || finalMimeType.startsWith('image/') ? 'image' : 'document'));
+
+        await supabase.from('message_attachments').insert([{
+          message_id: newMsg.id,
+          conversation_id: targetConvId,
+          sender_id: currentUserId,
+          storage_path: finalMediaUrl,
+          file_name: mediaName || defaultMediaName,
+          mime_type: finalMimeType,
+          file_size: calculatedSize,
+          duration_seconds: req.body.durationSeconds ? parseInt(req.body.durationSeconds) : (req.body.duration ? parseInt(req.body.duration) : null),
+          file_type: fileTypeEnum,
+          created_at: nowIso
+        }]);
+      } catch (attErr) {
+        console.error('Attachment record insert error:', attErr);
+      }
     }
 
     // Update conversation last_message_at
-    await supabase.from('conversations').update({ last_message_at: nowIso, updated_at: nowIso }).eq('id', targetConvId);
+    await supabase.from('conversations')
+      .update({ last_message_at: nowIso, updated_at: nowIso })
+      .eq('id', targetConvId);
 
     // Increment unread count for other members
-    const { data: otherMembers } = await supabase.from('conversation_members').select('user_id, unread_count').eq('conversation_id', targetConvId).neq('user_id', currentUserId);
+    const { data: otherMembers } = await supabase
+      .from('conversation_members')
+      .select('user_id, unread_count')
+      .eq('conversation_id', targetConvId)
+      .neq('user_id', currentUserId);
+
     for (const mem of (otherMembers || [])) {
-      await supabase.from('conversation_members').update({ unread_count: (mem.unread_count || 0) + 1 }).eq('conversation_id', targetConvId).eq('user_id', mem.user_id);
+      await supabase.from('conversation_members')
+        .update({ unread_count: (mem.unread_count || 0) + 1 })
+        .eq('conversation_id', targetConvId)
+        .eq('user_id', mem.user_id);
     }
 
     // Notification for offline recipient
@@ -585,9 +923,9 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
       mediaType: newMsg.media_type,
       mediaName: newMsg.media_name,
       mediaSize: newMsg.media_size,
+      durationSeconds: req.body.durationSeconds ? parseInt(req.body.durationSeconds) : null,
       replyToId: newMsg.reply_to_id,
       status: newMsg.status,
-      voiceNote: voiceNoteObj,
       createdAt: newMsg.created_at
     });
   } catch (err) {
@@ -606,6 +944,12 @@ router.post('/api/chats/typing', authenticateToken, async (req, res) => {
   if (!conversationId) return res.status(400).json({ error: 'Conversation ID required.' });
 
   try {
+    // Strict BOLA check
+    const isMember = await isUserConversationMember(conversationId, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this conversation.' });
+    }
+
     await supabase.from('typing_status').upsert({
       conversation_id: conversationId,
       user_id: currentUserId,
@@ -630,8 +974,21 @@ router.post('/api/chats/read', authenticateToken, async (req, res) => {
   if (!conversationId) return res.status(400).json({ error: 'Conversation ID required.' });
 
   try {
-    await supabase.from('messages').update({ status: 'read', is_read: true }).eq('conversation_id', conversationId).neq('sender_id', currentUserId);
-    await supabase.from('conversation_members').update({ unread_count: 0, last_read_at: new Date().toISOString() }).eq('conversation_id', conversationId).eq('user_id', currentUserId);
+    // Strict BOLA check
+    const isMember = await isUserConversationMember(conversationId, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this conversation.' });
+    }
+
+    await supabase.from('messages')
+      .update({ status: 'read', is_read: true })
+      .eq('conversation_id', conversationId)
+      .neq('sender_id', currentUserId);
+
+    await supabase.from('conversation_members')
+      .update({ unread_count: 0, last_read_at: new Date().toISOString() })
+      .eq('conversation_id', conversationId)
+      .eq('user_id', currentUserId);
 
     res.json({ success: true });
   } catch (err) {
@@ -639,17 +996,60 @@ router.post('/api/chats/read', authenticateToken, async (req, res) => {
   }
 });
 
-router.post('/api/chats/:userId/read', authenticateToken, async (req, res) => {
+router.post('/api/chats/:targetUserId/read', authenticateToken, async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
   const currentUserId = req.user.id;
-  const targetParam = req.params.userId;
+  const targetUserId = req.params.targetUserId;
+
   try {
-    const targetProfile = await resolveProfile(targetParam);
-    if (targetProfile) {
-      await supabase.from('messages').update({ status: 'read', is_read: true }).eq('sender_id', targetProfile.id).eq('recipient_id', currentUserId);
+    const targetProfile = await resolveProfile(targetUserId);
+    const resolvedTargetId = targetProfile ? targetProfile.id : targetUserId;
+
+    // Find all direct conversation IDs between current user and target user
+    const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(currentUserId, resolvedTargetId);
+
+    const { data: convs } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('type', 'direct')
+      .or(`and(direct_user1_id.eq.${direct_user1_id},direct_user2_id.eq.${direct_user2_id}),and(direct_user1_id.eq.${direct_user2_id},direct_user2_id.eq.${direct_user1_id})`);
+
+    const { data: memA } = await supabase
+      .from('conversation_members')
+      .select('conversation_id')
+      .eq('user_id', currentUserId);
+
+    const convIdsA = (memA || []).map(m => m.conversation_id);
+    let sharedConvIds = [];
+    if (convIdsA.length > 0) {
+      const { data: memB } = await supabase
+        .from('conversation_members')
+        .select('conversation_id')
+        .eq('user_id', resolvedTargetId)
+        .in('conversation_id', convIdsA);
+      sharedConvIds = (memB || []).map(m => m.conversation_id);
     }
+
+    const allConvIds = Array.from(new Set([
+      ...(convs || []).map(c => c.id),
+      ...sharedConvIds
+    ]));
+
+    if (allConvIds.length > 0) {
+      await supabase.from('messages')
+        .update({ status: 'read', is_read: true })
+        .in('conversation_id', allConvIds)
+        .neq('sender_id', currentUserId);
+
+      await supabase.from('conversation_members')
+        .update({ unread_count: 0, last_read_at: new Date().toISOString() })
+        .in('conversation_id', allConvIds)
+        .eq('user_id', currentUserId);
+    }
+
     res.json({ success: true });
   } catch (err) {
-    res.json({ success: true });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -665,13 +1065,34 @@ router.post('/api/chats/messages/:msgId/reaction', authenticateToken, async (req
   if (!emoji) return res.status(400).json({ error: 'Emoji is required.' });
 
   try {
-    const { data: existing } = await supabase.from('message_reactions').select('id').eq('message_id', msgId).eq('user_id', currentUserId).eq('emoji', emoji).maybeSingle();
+    const { data: msg } = await supabase.from('messages').select('id, conversation_id').eq('id', msgId).maybeSingle();
+    if (!msg) return res.status(404).json({ error: 'Message not found.' });
+
+    // Strict BOLA check
+    const isMember = await isUserConversationMember(msg.conversation_id, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this conversation.' });
+    }
+
+    const { data: existing } = await supabase
+      .from('message_reactions')
+      .select('id')
+      .eq('message_id', msgId)
+      .eq('user_id', currentUserId)
+      .eq('emoji', emoji)
+      .maybeSingle();
+
     if (existing) {
       await supabase.from('message_reactions').delete().eq('id', existing.id);
       return res.json({ success: true, action: 'removed', emoji });
     }
 
-    const { data: rx } = await supabase.from('message_reactions').insert([{ message_id: msgId, user_id: currentUserId, emoji }]).select().single();
+    const { data: rx } = await supabase
+      .from('message_reactions')
+      .insert([{ message_id: msgId, user_id: currentUserId, emoji }])
+      .select()
+      .single();
+
     res.json({ success: true, action: 'added', reaction: rx });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -679,7 +1100,7 @@ router.post('/api/chats/messages/:msgId/reaction', authenticateToken, async (req
 });
 
 // =========================================================
-// 8. DELETE MESSAGE (FOR ME / FOR EVERYONE)
+// 8. DELETE MESSAGE
 // =========================================================
 router.delete('/api/chats/messages/:msgId', authenticateToken, async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
@@ -688,30 +1109,23 @@ router.delete('/api/chats/messages/:msgId', authenticateToken, async (req, res) 
   const forEveryone = req.query.forEveryone === 'true';
 
   try {
-    const { data: msg } = await supabase.from('messages').select('*').eq('id', msgId).maybeSingle();
+    const { data: msg } = await supabase.from('messages').select('id, sender_id, conversation_id').eq('id', msgId).maybeSingle();
     if (!msg) return res.status(404).json({ error: 'Message not found.' });
+
+    // Strict BOLA check
+    const isMember = await isUserConversationMember(msg.conversation_id, currentUserId);
+    if (!isMember) {
+      return res.status(403).json({ error: 'Forbidden: You are not a participant in this conversation.' });
+    }
 
     if (forEveryone) {
       if (msg.sender_id !== currentUserId) return res.status(403).json({ error: 'You can only delete your own messages for everyone.' });
-      await supabase.from('messages').update({ deleted_for_everyone: true, content: 'This message was deleted' }).eq('id', msgId);
+      await supabase.from('messages').update({ deleted_for_everyone: true, is_deleted: true, content: 'This message was deleted' }).eq('id', msgId);
       return res.json({ success: true, mode: 'everyone' });
     } else {
-      const updatedDeletedForMe = [...(msg.deleted_for_me || []), currentUserId];
-      await supabase.from('messages').update({ deleted_for_me: updatedDeletedForMe }).eq('id', msgId);
+      await supabase.from('messages').update({ is_deleted: true }).eq('id', msgId).eq('sender_id', currentUserId);
       return res.json({ success: true, mode: 'me' });
     }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Backward compatible delete route
-router.delete('/api/chats/message/:msgId', authenticateToken, async (req, res) => {
-  const msgId = req.params.msgId;
-  const currentUserId = req.user.id;
-  try {
-    await supabase.from('messages').update({ deleted_for_everyone: true }).eq('id', msgId).eq('sender_id', currentUserId);
-    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -734,8 +1148,10 @@ router.post('/api/chats/groups', authenticateToken, async (req, res) => {
       .insert([{
         type: 'group',
         name,
+        title: name,
         description: description || null,
         group_image_url: groupImageUrl || null,
+        group_avatar: groupImageUrl || null,
         created_by: currentUserId,
         last_message_at: nowIso
       }])

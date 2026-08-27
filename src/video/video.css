@@ -1,0 +1,29 @@
+/* Video Call-specific premium styles */
+.remote-video-frame {
+  box-shadow: inset 0 0 100px rgba(0, 0, 0, 0.9);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.local-preview-frame {
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  border-radius: 12px;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.local-preview-frame:hover {
+  border-color: var(--primary-color);
+  transform: translateY(-2px);
+}
+
+.control-btn.end-call-btn {
+  background: var(--danger-color, #ff4d4d) !important;
+  color: white !important;
+}
+
+.control-btn.end-call-btn:hover {
+  background: #ff3333 !important;
+  box-shadow: 0 0 15px rgba(255, 77, 77, 0.5) !important;
+}

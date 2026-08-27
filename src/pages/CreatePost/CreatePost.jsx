@@ -59,6 +59,52 @@ const PostDraftsDB = {
   }
 };
 
+const getLaterTodayTimeHelper = () => {
+  const now = new Date();
+  const defaultTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 20, 0, 0);
+  if (defaultTime <= now) {
+    const nextHour = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() + 1, 0, 0);
+    if (nextHour.getDate() !== now.getDate()) {
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 0);
+    }
+    return nextHour;
+  }
+  return defaultTime;
+};
+
+const getTomorrowTimeHelper = () => {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0, 0);
+};
+
+const getInitialHourStr = () => {
+  const lt = getLaterTodayTimeHelper();
+  let hrs = lt.getHours();
+  hrs = hrs % 12;
+  hrs = hrs ? hrs : 12;
+  return String(hrs).padStart(2, '0');
+};
+
+const getInitialMinuteStr = () => {
+  const lt = getLaterTodayTimeHelper();
+  return String(lt.getMinutes()).padStart(2, '0');
+};
+
+const getInitialPeriodStr = () => {
+  const lt = getLaterTodayTimeHelper();
+  return lt.getHours() >= 12 ? 'PM' : 'AM';
+};
+
+const getInitialScheduleTimeStr = () => {
+  const lt = getLaterTodayTimeHelper();
+  let hrs = lt.getHours();
+  const mins = String(lt.getMinutes()).padStart(2, '0');
+  const ampm = hrs >= 12 ? 'PM' : 'AM';
+  hrs = hrs % 12;
+  hrs = hrs ? hrs : 12;
+  return `Later Today, ${String(hrs).padStart(2, '0')}:${mins} ${ampm}`;
+};
+
 const CreatePost = ({ onNavigateBack }) => {
   // --- CORE STATE ---
   const [profile, setProfile] = useState({
@@ -158,12 +204,271 @@ const CreatePost = ({ onNavigateBack }) => {
 
   // Scheduling State
   const [isScheduled, setIsScheduled] = useState(false);
-  const [scheduleTime, setScheduleTime] = useState('Later Today, 8:00 PM');
-  const [scheduleDate, setScheduleDate] = useState(19);
-  const [scheduleHour, setScheduleHour] = useState('08');
-  const [scheduleMinute, setScheduleMinute] = useState('00');
-  const [schedulePeriod, setSchedulePeriod] = useState('PM');
+  const [isPublishing, setIsPublishing] = useState(false);
+  const [isSchedulingEnabled, setIsSchedulingEnabled] = useState(false);
+  const [scheduleTime, setScheduleTime] = useState(getInitialScheduleTimeStr());
+  
+  const todayDate = new Date();
+  const [scheduleOption, setScheduleOption] = useState('now'); // 'now' | 'later_today' | 'tomorrow' | 'custom'
+  const [selectedYear, setSelectedYear] = useState(todayDate.getFullYear());
+  const [selectedMonth, setSelectedMonth] = useState(todayDate.getMonth());
+  const [selectedDay, setSelectedDay] = useState(todayDate.getDate());
+  
+  const [calendarMonth, setCalendarMonth] = useState(todayDate.getMonth());
+  const [calendarYear, setCalendarYear] = useState(todayDate.getFullYear());
+  
+  const [scheduleHour, setScheduleHour] = useState(getInitialHourStr());
+  const [scheduleMinute, setScheduleMinute] = useState(getInitialMinuteStr());
+  const [schedulePeriod, setSchedulePeriod] = useState(getInitialPeriodStr());
+  const [openTimeDropdown, setOpenTimeDropdown] = useState(null);
   const [scheduleTimezone, setScheduleTimezone] = useState('GMT+5:30 (India Standard Time)');
+
+  // Helper date logic
+  const getDaysInMonth = (month, year) => {
+    return new Date(year, month + 1, 0).getDate();
+  };
+
+  const getFirstDayOfMonth = (month, year) => {
+    return new Date(year, month, 1).getDay();
+  };
+
+  const isDateInPast = (y, m, d) => {
+    const today = new Date();
+    const cellDate = new Date(y, m, d);
+    const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    return cellDate < todayMidnight;
+  };
+
+  const validateFutureTime = (y, m, d, hrStr, minStr, ampmStr) => {
+    let hrs = parseInt(hrStr, 10);
+    const mins = parseInt(minStr, 10);
+    if (ampmStr === 'PM' && hrs < 12) hrs += 12;
+    if (ampmStr === 'AM' && hrs === 12) hrs = 0;
+    const selectedDateTime = new Date(y, m, d, hrs, mins, 0, 0);
+    return selectedDateTime > new Date();
+  };
+
+  const getLaterTodayTime = () => {
+    const now = new Date();
+    const defaultTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 20, 0, 0);
+    if (defaultTime <= now) {
+      const nextHour = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() + 1, 0, 0);
+      if (nextHour.getDate() !== now.getDate()) {
+        return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 0);
+      }
+      return nextHour;
+    }
+    return defaultTime;
+  };
+
+  const getTomorrowTime = () => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0, 0);
+  };
+
+  const formatTime12h = (date) => {
+    let hrs = date.getHours();
+    const mins = String(date.getMinutes()).padStart(2, '0');
+    const ampm = hrs >= 12 ? 'PM' : 'AM';
+    hrs = hrs % 12;
+    hrs = hrs ? hrs : 12;
+    return `${String(hrs).padStart(2, '0')}:${mins} ${ampm}`;
+  };
+
+  const getMonthNameShort = (monthIdx) => {
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return months[monthIdx];
+  };
+
+  const getMonthNameFull = (monthIdx) => {
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    return months[monthIdx];
+  };
+
+  useEffect(() => {
+    if (workspaceMode !== 'schedule') return;
+    if (!isScheduled) {
+      setScheduleOption('now');
+      return;
+    }
+
+    const tLower = scheduleTime.toLowerCase();
+    if (tLower.includes('later today') || tLower.includes('today,')) {
+      setScheduleOption('later_today');
+      const lt = getLaterTodayTime();
+      setSelectedYear(lt.getFullYear());
+      setSelectedMonth(lt.getMonth());
+      setSelectedDay(lt.getDate());
+      setCalendarMonth(lt.getMonth());
+      setCalendarYear(lt.getFullYear());
+      let hrs = lt.getHours();
+      const ampm = hrs >= 12 ? 'PM' : 'AM';
+      hrs = hrs % 12;
+      hrs = hrs ? hrs : 12;
+      setScheduleHour(String(hrs).padStart(2, '0'));
+      setScheduleMinute(String(lt.getMinutes()).padStart(2, '0'));
+      setSchedulePeriod(ampm);
+    } else if (tLower.includes('tomorrow')) {
+      setScheduleOption('tomorrow');
+      const tom = getTomorrowTime();
+      setSelectedYear(tom.getFullYear());
+      setSelectedMonth(tom.getMonth());
+      setSelectedDay(tom.getDate());
+      setCalendarMonth(tom.getMonth());
+      setCalendarYear(tom.getFullYear());
+      setScheduleHour('09');
+      setScheduleMinute('00');
+      setSchedulePeriod('AM');
+    } else {
+      setScheduleOption('custom');
+      try {
+        const parts = scheduleTime.split(',');
+        if (parts.length >= 2) {
+          const datePart = parts[0].trim();
+          const timePart = parts[1].trim();
+          
+          const nowYear = new Date().getFullYear();
+          const parsedDate = new Date(`${datePart} ${nowYear}`);
+          if (!isNaN(parsedDate.getTime())) {
+            setSelectedYear(parsedDate.getFullYear());
+            setSelectedMonth(parsedDate.getMonth());
+            setSelectedDay(parsedDate.getDate());
+            setCalendarMonth(parsedDate.getMonth());
+            setCalendarYear(parsedDate.getFullYear());
+          }
+          
+          const timeMatch = timePart.match(/(\d+):(\d+)\s*(AM|PM)/i);
+          if (timeMatch) {
+            setScheduleHour(timeMatch[1].padStart(2, '0'));
+            setScheduleMinute(timeMatch[2].padStart(2, '0'));
+            setSchedulePeriod(timeMatch[3].toUpperCase());
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to parse initial scheduleTime:', e);
+      }
+    }
+  }, [workspaceMode, isScheduled, scheduleTime]);
+
+  const handlePrevMonth = () => {
+    if (calendarMonth === 0) {
+      setCalendarMonth(11);
+      setCalendarYear(prev => prev - 1);
+    } else {
+      setCalendarMonth(prev => prev - 1);
+    }
+  };
+
+  const handleNextMonth = () => {
+    if (calendarMonth === 11) {
+      setCalendarMonth(0);
+      setCalendarYear(prev => prev + 1);
+    } else {
+      setCalendarMonth(prev => prev + 1);
+    }
+  };
+
+  const handleDateClick = (dayNum) => {
+    setSelectedDay(dayNum);
+    setSelectedMonth(calendarMonth);
+    setSelectedYear(calendarYear);
+    setScheduleOption('custom');
+    setIsScheduled(true);
+    const monthStr = getMonthNameShort(calendarMonth);
+    setScheduleTime(`${monthStr} ${dayNum}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`);
+  };
+
+  const handleHourChange = (newVal) => {
+    setScheduleHour(newVal);
+    setScheduleOption('custom');
+    setIsScheduled(true);
+    const monthStr = getMonthNameShort(selectedMonth);
+    setScheduleTime(`${monthStr} ${selectedDay}, ${newVal}:${scheduleMinute} ${schedulePeriod}`);
+  };
+
+  const handleMinuteChange = (newVal) => {
+    setScheduleMinute(newVal);
+    setScheduleOption('custom');
+    setIsScheduled(true);
+    const monthStr = getMonthNameShort(selectedMonth);
+    setScheduleTime(`${monthStr} ${selectedDay}, ${scheduleHour}:${newVal} ${schedulePeriod}`);
+  };
+
+  const handlePeriodChange = (newVal) => {
+    setSchedulePeriod(newVal);
+    setScheduleOption('custom');
+    setIsScheduled(true);
+    const monthStr = getMonthNameShort(selectedMonth);
+    setScheduleTime(`${monthStr} ${selectedDay}, ${scheduleHour}:${scheduleMinute} ${newVal}`);
+  };
+
+  const handlePresetSelect = (opt) => {
+    setScheduleOption(opt);
+    if (opt === 'now') {
+      setIsScheduled(false);
+      setScheduleTime('Post Now');
+    } else if (opt === 'later_today') {
+      setIsScheduled(true);
+      const lt = getLaterTodayTime();
+      setSelectedYear(lt.getFullYear());
+      setSelectedMonth(lt.getMonth());
+      setSelectedDay(lt.getDate());
+      setCalendarMonth(lt.getMonth());
+      setCalendarYear(lt.getFullYear());
+      let hrs = lt.getHours();
+      const ampm = hrs >= 12 ? 'PM' : 'AM';
+      hrs = hrs % 12;
+      hrs = hrs ? hrs : 12;
+      setScheduleHour(String(hrs).padStart(2, '0'));
+      setScheduleMinute(String(lt.getMinutes()).padStart(2, '0'));
+      setSchedulePeriod(ampm);
+      setScheduleTime(`Later Today, ${formatTime12h(lt)}`);
+    } else if (opt === 'tomorrow') {
+      setIsScheduled(true);
+      const tom = getTomorrowTime();
+      setSelectedYear(tom.getFullYear());
+      setSelectedMonth(tom.getMonth());
+      setSelectedDay(tom.getDate());
+      setCalendarMonth(tom.getMonth());
+      setCalendarYear(tom.getFullYear());
+      setScheduleHour('09');
+      setScheduleMinute('00');
+      setSchedulePeriod('AM');
+      setScheduleTime('Tomorrow, 9:00 AM');
+    } else if (opt === 'custom') {
+      setIsScheduled(true);
+      const monthStr = getMonthNameShort(selectedMonth);
+      setScheduleTime(`${monthStr} ${selectedDay}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`);
+    }
+  };
+
+  const handleDoneClick = async () => {
+    if (!isSchedulingEnabled) {
+      setIsScheduled(false);
+      setWorkspaceMode('editor');
+      return;
+    }
+    // Custom date/time is now the only scheduling option
+    const isValid = validateFutureTime(
+      selectedYear,
+      selectedMonth,
+      selectedDay,
+      scheduleHour,
+      scheduleMinute,
+      schedulePeriod
+    );
+    if (!isValid) {
+      showToastNotification('Scheduled time must be in the future.');
+      return;
+    }
+    const monthStr = getMonthNameShort(selectedMonth);
+    const finalScheduleTime = `${monthStr} ${selectedDay}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`;
+
+    setIsScheduled(true);
+    setScheduleTime(finalScheduleTime);
+    setScheduleOption('custom');
+    await handlePostSubmit(true, finalScheduleTime);
+  };
 
   // Preview Workspace Mode
   const [previewDevice, setPreviewDevice] = useState('Mobile');
@@ -617,9 +922,14 @@ const CreatePost = ({ onNavigateBack }) => {
     });
   };
 
-  const handlePostSubmit = async () => {
+  const handlePostSubmit = async (overrideIsScheduled, overrideScheduleTime) => {
+    if (isPublishing) return;
+    setIsPublishing(true);
     setIsLoading(true);
     try {
+      const finalIsScheduled = overrideIsScheduled !== undefined ? overrideIsScheduled : (isSchedulingEnabled ? isScheduled : false);
+      const finalScheduleTime = overrideScheduleTime !== undefined ? overrideScheduleTime : scheduleTime;
+
       const musicWidgetHtml = selectedTrack ? `
 <div class="feed-post-music-attachment" data-music-url="${selectedTrack.previewUrl}" data-music-title="${selectedTrack.title}" data-music-artist="${selectedTrack.artist}" style="display: flex; align-items: center; gap: 10px; background: rgba(108, 59, 255, 0.12); border: 1px solid rgba(108, 59, 255, 0.25); border-radius: 12px; padding: 8px 12px; margin-top: 10px; cursor: pointer; width: fit-content; user-select: none;">
   <div style="position: relative; width: 28px; height: 28px; border-radius: 50%; overflow: hidden; background: #000; flex-shrink: 0;">
@@ -651,11 +961,11 @@ const CreatePost = ({ onNavigateBack }) => {
         topics,
         audience,
         taggedPeople,
-        isScheduled,
-        scheduleTime
+        isScheduled: finalIsScheduled,
+        scheduleTime: finalScheduleTime
       };
 
-      if (isScheduled) {
+      if (finalIsScheduled) {
         await api.schedulePost(postData);
         showToastNotification('Hub scheduled successfully! 📅');
       } else {
@@ -663,11 +973,12 @@ const CreatePost = ({ onNavigateBack }) => {
         showToastNotification('Hub published successfully! 🎉');
       }
 
-      setTimeout(() => onNavigateBack(), 1200);
+      setTimeout(() => onNavigateBack(true), 1200);
     } catch (err) {
       showToastNotification(`Error: ${err.message || 'Failed to submit post'}`);
     } finally {
       setIsLoading(false);
+      setIsPublishing(false);
     }
   };
 
@@ -709,6 +1020,16 @@ const CreatePost = ({ onNavigateBack }) => {
   const updateActiveMedia = (key, value, skipHistory = false) => {
     setMediaFiles(prev => {
       const nextList = prev.map((m, idx) => idx === activeMediaIndex ? { ...m, [key]: value } : m);
+      if (!skipHistory) {
+        pushEditorHistory(nextList[activeMediaIndex]);
+      }
+      return nextList;
+    });
+  };
+
+  const batchUpdateActiveMedia = (updates, skipHistory = false) => {
+    setMediaFiles(prev => {
+      const nextList = prev.map((m, idx) => idx === activeMediaIndex ? { ...m, ...updates } : m);
       if (!skipHistory) {
         pushEditorHistory(nextList[activeMediaIndex]);
       }
@@ -1288,10 +1609,7 @@ const CreatePost = ({ onNavigateBack }) => {
             <ImageIcon size={14} color="#a855f7" style={{ opacity: workspaceMode === 'mediastudio' ? 1 : 0.8 }} />
             <span style={{ fontSize: '9px', fontWeight: '600' }}>Media Studio</span>
           </button>
-          <button type="button" onClick={() => setWorkspaceMode('audience')} style={{ background: workspaceMode === 'audience' ? 'rgba(236, 72, 153, 0.25)' : 'rgba(236, 72, 153, 0.1)', border: workspaceMode === 'audience' ? '1px solid #ec4899' : '1px solid rgba(236, 72, 153, 0.15)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
-            <Users size={14} color="#ec4899" style={{ opacity: workspaceMode === 'audience' ? 1 : 0.8 }} />
-            <span style={{ fontSize: '9px', fontWeight: '600' }}>Audience</span>
-          </button>
+
           <button type="button" onClick={() => setWorkspaceMode('schedule')} style={{ background: workspaceMode === 'schedule' ? 'rgba(249, 115, 22, 0.25)' : 'rgba(249, 115, 22, 0.1)', border: workspaceMode === 'schedule' ? '1px solid #f97316' : '1px solid rgba(249, 115, 22, 0.15)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
             <Calendar size={14} color="#f97316" style={{ opacity: workspaceMode === 'schedule' ? 1 : 0.8 }} />
             <span style={{ fontSize: '9px', fontWeight: '600' }}>Schedule</span>
@@ -1386,20 +1704,22 @@ const CreatePost = ({ onNavigateBack }) => {
               </div>
               <div className="hubble-header-center" style={{ flex: 1, display: 'flex', justifyContent: 'center', gap: '12px' }}>
                 <button onClick={() => {
-                  updateActiveMedia('brightness', 100);
-                  updateActiveMedia('contrast', 100);
-                  updateActiveMedia('saturation', 100);
-                  updateActiveMedia('exposure', 100);
-                  updateActiveMedia('filter', 'Original');
-                  updateActiveMedia('cropRatio', 'original');
-                  updateActiveMedia('cropX', 0);
-                  updateActiveMedia('cropY', 0);
-                  updateActiveMedia('cropZoom', 1);
-                  updateActiveMedia('effect', 'None');
-                  updateActiveMedia('frame', 'None');
-                  updateActiveMedia('stickers', []);
-                  updateActiveMedia('texts', []);
-                }} style={{ background: 'transparent', border: '1px solid rgba(255,255,255,0.2)', color: '#fff', fontSize: '12px', cursor: 'pointer', padding: '4px 12px', borderRadius: '12px' }}>Reset</button>
+                  batchUpdateActiveMedia({
+                    brightness: 100,
+                    contrast: 100,
+                    saturation: 100,
+                    exposure: 100,
+                    filter: 'Original',
+                    cropRatio: 'original',
+                    cropX: 0,
+                    cropY: 0,
+                    cropZoom: 1,
+                    effect: 'None',
+                    frame: 'None',
+                    stickers: [],
+                    texts: []
+                  });
+                }} className="hubble-btn-secondary-sm" style={{ borderRadius: '12px' }}>Reset</button>
                 <button onClick={handleUndo} disabled={editorHistoryIndex <= 0} className="hubble-circle-btn-sm"><Undo2 size={11} /></button>
                 <button onClick={handleRedo} disabled={editorHistoryIndex >= editorHistory.length - 1} className="hubble-circle-btn-sm"><Redo2 size={11} /></button>
               </div>
@@ -1811,6 +2131,13 @@ const CreatePost = ({ onNavigateBack }) => {
         );
 
       case 'schedule':
+        const hoursOptions = [...Array(12)].map((_, i) => String(i + 1).padStart(2, '0'));
+        const minutesOptions = [...Array(60)].map((_, i) => String(i).padStart(2, '0'));
+        const daysInMonth = getDaysInMonth(calendarMonth, calendarYear);
+        const firstDayIndex = getFirstDayOfMonth(calendarMonth, calendarYear);
+        const emptySlots = [...Array(firstDayIndex)];
+        const daySlots = [...Array(daysInMonth)].map((_, idx) => idx + 1);
+
         return (
           <div className="hubble-sub-workspace">
             <div className="hubble-sub-header">
@@ -1824,12 +2151,7 @@ const CreatePost = ({ onNavigateBack }) => {
               </div>
               <div className="hubble-header-actions" style={{ flex: 1, justifyContent: 'flex-end', display: 'flex' }}>
                 <button 
-                  onClick={() => {
-                    if (isScheduled && !scheduleTime.includes('Today') && !scheduleTime.includes('Tomorrow')) {
-                      setScheduleTime(`Aug ${scheduleDate}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`);
-                    }
-                    setWorkspaceMode('editor');
-                  }} 
+                  onClick={handleDoneClick} 
                   className="hubble-btn-primary" 
                   style={{ background: 'linear-gradient(135deg, #7C3BFF 0%, #5b2cd3 100%)', boxShadow: '0 4px 15px rgba(108, 59, 255, 0.4)', borderRadius: '24px', padding: '8px 24px', fontSize: '12px', fontWeight: '700', border: 'none', cursor: 'pointer' }}
                 >
@@ -1838,91 +2160,125 @@ const CreatePost = ({ onNavigateBack }) => {
               </div>
             </div>
 
-            <div className="hubble-schedule-layout">
-              {/* Options on Left */}
-              <div className="hubble-schedule-presets">
-                <button onClick={() => { setIsScheduled(false); setWorkspaceMode('editor'); }} className={`hubble-option-row ${!isScheduled ? 'active' : ''}`}>
-                  <div>
-                    <strong>Post Now</strong>
-                    <p>Share now</p>
-                  </div>
-                </button>
-                <button onClick={() => { setIsScheduled(true); setScheduleTime('Later Today, 8:00 PM'); }} className={`hubble-option-row ${isScheduled && scheduleTime.includes('Later Today') ? 'active' : ''}`}>
-                  <div>
-                    <strong>Later Today</strong>
-                    <p>Today, 8:00 PM</p>
-                  </div>
-                </button>
-                <button onClick={() => { setIsScheduled(true); setScheduleTime('Tomorrow, 9:00 AM'); }} className={`hubble-option-row ${isScheduled && scheduleTime.includes('Tomorrow') ? 'active' : ''}`}>
-                  <div>
-                    <strong>Tomorrow</strong>
-                    <p>Tomorrow, 9:00 AM</p>
-                  </div>
-                </button>
-                <button onClick={() => { setIsScheduled(true); setScheduleTime(`Aug ${scheduleDate}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`); }} className={`hubble-option-row ${isScheduled && !scheduleTime.includes('Later Today') && !scheduleTime.includes('Tomorrow') ? 'active' : ''}`}>
-                  <div>
-                    <strong>Custom Date & Time</strong>
-                    <p>Pick a date and time</p>
-                  </div>
-                </button>
+            {/* Scheduling Toggle */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '16px 32px', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+              <span style={{ color: '#fff', fontSize: '14px', fontWeight: '700' }}>Scheduling</span>
+              <div 
+                onClick={() => setIsSchedulingEnabled(!isSchedulingEnabled)}
+                style={{
+                  width: '44px', height: '24px', borderRadius: '12px',
+                  background: isSchedulingEnabled ? '#6C3BFF' : 'rgba(255,255,255,0.2)',
+                  position: 'relative', cursor: 'pointer', transition: '0.3s',
+                  flexShrink: 0
+                }}
+              >
+                <div style={{
+                  width: '20px', height: '20px', borderRadius: '50%',
+                  background: '#fff', position: 'absolute', top: '2px',
+                  left: isSchedulingEnabled ? '22px' : '2px', transition: '0.3s'
+                }} />
               </div>
+            </div>
 
-              {/* Calendar on Right */}
-              <div className="hubble-schedule-calendar-col">
-                <div className="hubble-calendar-mock" style={{ width: '100%', maxWidth: '300px', display: 'flex', flexDirection: 'column', gap: '12px', background: 'rgba(255,255,255,0.05)', borderRadius: '16px', padding: '20px' }}>
+            <div className="hubble-schedule-layout" style={{ display: 'flex', justifyContent: 'center', width: '100%', opacity: isSchedulingEnabled ? 1 : 0.3, pointerEvents: isSchedulingEnabled ? 'auto' : 'none', transition: '0.3s' }}>
+              {/* Calendar + Time on Right (Unified Panel) */}
+              <div className="hubble-schedule-calendar-col" style={{ margin: '0 auto', display: 'flex', justifyContent: 'center', width: '100%' }}>
+                {openTimeDropdown && (
+                  <div 
+                    style={{ position: 'fixed', inset: 0, zIndex: 99 }} 
+                    onClick={() => setOpenTimeDropdown(null)} 
+                  />
+                )}
+                <div className="hubble-calendar-mock" style={{ width: '100%', maxWidth: '320px', display: 'flex', flexDirection: 'column', gap: '16px', background: 'rgba(255,255,255,0.05)', borderRadius: '16px', padding: '20px', border: '1px solid rgba(255,255,255,0.08)' }}>
                   <div className="hubble-cal-header" style={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
-                    <span style={{ cursor: 'pointer' }}>◀</span>
-                    <strong style={{ fontSize: '14px' }}>August 2026</strong>
-                    <span style={{ cursor: 'pointer' }}>▶</span>
+                    <span onClick={handlePrevMonth} style={{ cursor: 'pointer', padding: '0 8px', color: '#fff', fontSize: '14px', userSelect: 'none' }}>◀</span>
+                    <strong style={{ fontSize: '14px', color: '#fff' }}>{getMonthNameFull(calendarMonth)} {calendarYear}</strong>
+                    <span onClick={handleNextMonth} style={{ cursor: 'pointer', padding: '0 8px', color: '#fff', fontSize: '14px', userSelect: 'none' }}>▶</span>
                   </div>
                   <div className="hubble-cal-days">
                     {['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].map(d => <span key={d} className="cal-label">{d}</span>)}
-                    {[...Array(6)].map((_, i) => <span key={`empty-${i}`} />)}
-                    {[...Array(31)].map((_, i) => {
-                      const dayNum = i + 1;
+                    {emptySlots.map((_, i) => <span key={`empty-${i}`} />)}
+                    {daySlots.map(dayNum => {
+                      const isSelected = isScheduled && (selectedDay === dayNum && selectedMonth === calendarMonth && selectedYear === calendarYear && scheduleOption !== 'now');
+                      const isTodayCell = (todayDate.getDate() === dayNum && todayDate.getMonth() === calendarMonth && todayDate.getFullYear() === calendarYear);
+                      const isPast = isDateInPast(calendarYear, calendarMonth, dayNum);
                       return (
                         <button 
-                          key={i} 
-                          onClick={() => { 
-                            setIsScheduled(true); 
-                            setScheduleDate(dayNum); 
-                            setScheduleTime(`Aug ${dayNum}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`); 
-                          }}
-                          className={`cal-day-cell ${scheduleDate === dayNum && isScheduled && !scheduleTime.includes('Today') && !scheduleTime.includes('Tomorrow') ? 'active' : ''}`}
+                          key={dayNum} 
+                          disabled={isPast}
+                          onClick={() => handleDateClick(dayNum)}
+                          className={`cal-day-cell ${isSelected ? 'active' : ''} ${isTodayCell ? 'today-cell' : ''} ${isPast ? 'past-cell' : ''}`}
                         >
                           {dayNum}
                         </button>
                       );
                     })}
                   </div>
-                </div>
 
-                <div className="hubble-time-picker" style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '24px' }}>
-                  <select value={scheduleHour} onChange={e => {
-                    setScheduleHour(e.target.value);
-                    if (isScheduled && !scheduleTime.includes('Today') && !scheduleTime.includes('Tomorrow')) {
-                      setScheduleTime(`Aug ${scheduleDate}, ${e.target.value}:${scheduleMinute} ${schedulePeriod}`);
-                    }
-                  }} className="hubble-time-select" style={{ background: '#1e1b30', color: '#fff', border: 'none', padding: '8px', borderRadius: '8px' }}>
-                    {['01','02','03','04','05','06','07','08','09','10','11','12'].map(h => <option key={h} value={h}>{h}</option>)}
-                  </select>
-                  <span style={{ alignSelf: 'center', fontWeight: 'bold' }}>:</span>
-                  <select value={scheduleMinute} onChange={e => {
-                    setScheduleMinute(e.target.value);
-                    if (isScheduled && !scheduleTime.includes('Today') && !scheduleTime.includes('Tomorrow')) {
-                      setScheduleTime(`Aug ${scheduleDate}, ${scheduleHour}:${e.target.value} ${schedulePeriod}`);
-                    }
-                  }} className="hubble-time-select" style={{ background: '#1e1b30', color: '#fff', border: 'none', padding: '8px', borderRadius: '8px' }}>
-                    {['00','15','30','45'].map(m => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                  <select value={schedulePeriod} onChange={e => {
-                    setSchedulePeriod(e.target.value);
-                    if (isScheduled && !scheduleTime.includes('Today') && !scheduleTime.includes('Tomorrow')) {
-                      setScheduleTime(`Aug ${scheduleDate}, ${scheduleHour}:${scheduleMinute} ${e.target.value}`);
-                    }
-                  }} className="hubble-time-select" style={{ background: '#1e1b30', color: '#fff', border: 'none', padding: '8px', borderRadius: '8px' }}>
-                    {['AM','PM'].map(p => <option key={p} value={p}>{p}</option>)}
-                  </select>
+                  {/* Horizontal Divider */}
+                  <div style={{ height: '1px', background: 'rgba(255,255,255,0.08)', margin: '4px 0' }} />
+
+                  {/* Time Selector Row */}
+                  <div className="hubble-time-picker" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px', position: 'relative', zIndex: 100 }}>
+                    <div style={{ position: 'relative' }}>
+                      <button 
+                        onClick={() => setOpenTimeDropdown(openTimeDropdown === 'hour' ? null : 'hour')}
+                        className="hubble-time-select" 
+                        style={{ background: 'rgba(255,255,255,0.08)', color: '#fff', border: '1px solid rgba(255,255,255,0.15)', padding: '6px 12px', borderRadius: '8px', outline: 'none', cursor: 'pointer', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', minWidth: '55px', justifyContent: 'space-between' }}
+                      >
+                        {scheduleHour} <span style={{ fontSize: '9px', opacity: 0.7 }}>▼</span>
+                      </button>
+                      {openTimeDropdown === 'hour' && (
+                        <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '4px', background: '#1e1b30', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', maxHeight: '130px', overflowY: 'auto', zIndex: 101, width: '100%', boxShadow: '0 4px 12px rgba(0,0,0,0.5)' }}>
+                          {hoursOptions.map(h => (
+                            <div key={h} onClick={() => { handleHourChange(h); setOpenTimeDropdown(null); }} style={{ padding: '6px 12px', color: '#fff', fontSize: '12px', cursor: 'pointer', background: scheduleHour === h ? 'rgba(124, 59, 255, 0.2)' : 'transparent' }} onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'} onMouseLeave={e => e.currentTarget.style.background = scheduleHour === h ? 'rgba(124, 59, 255, 0.2)' : 'transparent'}>
+                              {h}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    
+                    <span style={{ color: '#fff', fontWeight: 'bold' }}>:</span>
+                    
+                    <div style={{ position: 'relative' }}>
+                      <button 
+                        onClick={() => setOpenTimeDropdown(openTimeDropdown === 'minute' ? null : 'minute')}
+                        className="hubble-time-select" 
+                        style={{ background: 'rgba(255,255,255,0.08)', color: '#fff', border: '1px solid rgba(255,255,255,0.15)', padding: '6px 12px', borderRadius: '8px', outline: 'none', cursor: 'pointer', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', minWidth: '55px', justifyContent: 'space-between' }}
+                      >
+                        {scheduleMinute} <span style={{ fontSize: '9px', opacity: 0.7 }}>▼</span>
+                      </button>
+                      {openTimeDropdown === 'minute' && (
+                        <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '4px', background: '#1e1b30', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', maxHeight: '130px', overflowY: 'auto', zIndex: 101, width: '100%', boxShadow: '0 4px 12px rgba(0,0,0,0.5)' }}>
+                          {minutesOptions.map(m => (
+                            <div key={m} onClick={() => { handleMinuteChange(m); setOpenTimeDropdown(null); }} style={{ padding: '6px 12px', color: '#fff', fontSize: '12px', cursor: 'pointer', background: scheduleMinute === m ? 'rgba(124, 59, 255, 0.2)' : 'transparent' }} onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'} onMouseLeave={e => e.currentTarget.style.background = scheduleMinute === m ? 'rgba(124, 59, 255, 0.2)' : 'transparent'}>
+                              {m}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    
+                    <div style={{ position: 'relative' }}>
+                      <button 
+                        onClick={() => setOpenTimeDropdown(openTimeDropdown === 'period' ? null : 'period')}
+                        className="hubble-time-select" 
+                        style={{ background: 'rgba(255,255,255,0.08)', color: '#fff', border: '1px solid rgba(255,255,255,0.15)', padding: '6px 12px', borderRadius: '8px', outline: 'none', cursor: 'pointer', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', minWidth: '55px', justifyContent: 'space-between' }}
+                      >
+                        {schedulePeriod} <span style={{ fontSize: '9px', opacity: 0.7 }}>▼</span>
+                      </button>
+                      {openTimeDropdown === 'period' && (
+                        <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '4px', background: '#1e1b30', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', maxHeight: '130px', overflowY: 'auto', zIndex: 101, width: '100%', boxShadow: '0 4px 12px rgba(0,0,0,0.5)' }}>
+                          {['AM','PM'].map(p => (
+                            <div key={p} onClick={() => { handlePeriodChange(p); setOpenTimeDropdown(null); }} style={{ padding: '6px 12px', color: '#fff', fontSize: '12px', cursor: 'pointer', background: schedulePeriod === p ? 'rgba(124, 59, 255, 0.2)' : 'transparent' }} onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'} onMouseLeave={e => e.currentTarget.style.background = schedulePeriod === p ? 'rgba(124, 59, 255, 0.2)' : 'transparent'}>
+                              {p}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2407,7 +2763,7 @@ const CreatePost = ({ onNavigateBack }) => {
                 <h4>Post Summary</h4>
                 <div className="hubble-summary-rows">
                   <div className="hubble-sum-row"><span>Media</span><strong>{mediaFiles.length} items</strong></div>
-                  <div className="hubble-sum-row"><span>Audience</span><strong>{audience}</strong></div>
+
                   <div className="hubble-sum-row"><span>Schedule</span><strong>{isScheduled ? 'Scheduled' : 'Post Now'}</strong></div>
                   <div className="hubble-sum-row"><span>Location</span><strong>{location}</strong></div>
                 </div>
@@ -2593,8 +2949,20 @@ const CreatePost = ({ onNavigateBack }) => {
                 >
                   Save Draft
                 </button>
-                <button onClick={handlePostSubmit} className="hubble-publish-btn" style={{ background: '#6C3BFF', border: 'none', borderRadius: '12px', fontSize: '11px', fontWeight: '700', padding: '6px 16px' }}>
-                  Post
+                <button 
+                  onClick={() => handlePostSubmit()} 
+                  disabled={isPublishing}
+                  className="hubble-publish-btn" 
+                  style={{ background: '#6C3BFF', border: 'none', borderRadius: '12px', fontSize: '11px', fontWeight: '700', padding: '6px 16px', display: 'flex', alignItems: 'center', gap: '6px', opacity: isPublishing ? 0.7 : 1, cursor: isPublishing ? 'not-allowed' : 'pointer' }}
+                >
+                  {isPublishing ? (
+                    <>
+                      <RefreshCw size={12} className="hubble-spin" />
+                      Posting...
+                    </>
+                  ) : (
+                    'Post'
+                  )}
                 </button>
               </div>
             </div>
@@ -2920,7 +3288,7 @@ const CreatePost = ({ onNavigateBack }) => {
                 style={{ 
                   position: 'absolute', 
                   inset: 0, 
-                  background: 'rgba(10, 8, 20, 0.95)', 
+                  background: 'var(--card-bg)', 
                   backdropFilter: 'blur(20px)', 
                   zIndex: 200, 
                   borderRadius: '20px', 
@@ -2930,14 +3298,14 @@ const CreatePost = ({ onNavigateBack }) => {
                   animation: 'fadeIn 0.2s ease-out'
                 }}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '10px', marginBottom: '12px' }}>
-                  <h4 style={{ fontSize: '14px', fontWeight: '700', margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(128,128,128,0.15)', paddingBottom: '10px', marginBottom: '12px' }}>
+                  <h4 style={{ fontSize: '14px', fontWeight: '700', margin: 0, display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-main)' }}>
                     🎵 Add Music to Vibe
                   </h4>
                   <button 
                     type="button" 
                     onClick={closeMusicModal} 
-                    style={{ background: 'rgba(255,255,255,0.06)', border: 'none', color: '#fff', width: '22px', height: '22px', borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '10px' }}
+                    style={{ background: 'rgba(128,128,128,0.15)', border: 'none', color: 'var(--text-main)', width: '22px', height: '22px', borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '10px' }}
                   >
                     ×
                   </button>
@@ -2975,12 +3343,12 @@ const CreatePost = ({ onNavigateBack }) => {
                         searchMusic(genre);
                       }}
                       style={{ 
-                        background: 'rgba(255,255,255,0.05)', 
-                        border: '1px solid rgba(255,255,255,0.1)', 
+                        background: 'rgba(128,128,128,0.08)', 
+                        border: '1px solid rgba(128,128,128,0.15)', 
                         borderRadius: '20px', 
                         padding: '3px 8px', 
                         fontSize: '9px', 
-                        color: 'rgba(255,255,255,0.7)', 
+                        color: 'var(--text-muted)', 
                         cursor: 'pointer' 
                       }}
                     >
@@ -2993,8 +3361,8 @@ const CreatePost = ({ onNavigateBack }) => {
                 <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', paddingRight: '4px' }}>
                   {searchLoading ? (
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: '8px' }}>
-                      <div className="hubble-spinner" style={{ width: '20px', height: '20px', border: '2px solid rgba(255,255,255,0.1)', borderTopColor: '#a855f7', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-                      <span style={{ fontSize: '9px', color: 'rgba(255,255,255,0.5)' }}>Searching iTunes library...</span>
+                      <div className="hubble-spinner" style={{ width: '20px', height: '20px', border: '2px solid rgba(128,128,128,0.1)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+                      <span style={{ fontSize: '9px', color: 'var(--text-muted)' }}>Searching iTunes library...</span>
                     </div>
                   ) : musicSearchResults.length > 0 ? (
                     musicSearchResults.map(track => {
@@ -3006,8 +3374,8 @@ const CreatePost = ({ onNavigateBack }) => {
                             display: 'flex', 
                             alignItems: 'center', 
                             gap: '10px', 
-                            background: 'rgba(255,255,255,0.03)', 
-                            border: '1px solid rgba(255,255,255,0.05)', 
+                            background: 'rgba(128,128,128,0.05)', 
+                            border: '1px solid rgba(128,128,128,0.08)', 
                             borderRadius: '12px', 
                             padding: '6px 10px',
                             transition: 'background 0.2s'
@@ -3015,8 +3383,8 @@ const CreatePost = ({ onNavigateBack }) => {
                         >
                           <img src={track.artwork} style={{ width: '32px', height: '32px', borderRadius: '8px', objectFit: 'cover' }} alt="Artwork" />
                           <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: '10px', fontWeight: '700', color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>{track.title}</div>
-                            <div style={{ fontSize: '8px', color: 'rgba(255,255,255,0.5)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', marginTop: '1px' }}>{track.artist}</div>
+                            <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--text-main)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>{track.title}</div>
+                            <div style={{ fontSize: '8px', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', marginTop: '1px' }}>{track.artist}</div>
                           </div>
                           
                           <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
@@ -3024,9 +3392,9 @@ const CreatePost = ({ onNavigateBack }) => {
                               type="button"
                               onClick={() => togglePlayPreview(track)}
                               style={{ 
-                                background: isPlaying ? 'rgba(168,85,247,0.2)' : 'rgba(255,255,255,0.06)', 
+                                background: isPlaying ? 'rgba(108,59,255,0.2)' : 'rgba(128,128,128,0.1)', 
                                 border: 'none', 
-                                color: isPlaying ? '#a855f7' : '#fff', 
+                                color: isPlaying ? 'var(--primary)' : 'var(--text-main)', 
                                 width: '24px', 
                                 height: '24px', 
                                 borderRadius: '50%', 
@@ -3058,7 +3426,7 @@ const CreatePost = ({ onNavigateBack }) => {
                       );
                     })
                   ) : (
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'rgba(255,255,255,0.4)', fontSize: '10px', textAlign: 'center' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)', fontSize: '10px', textAlign: 'center' }}>
                       Search for your favorite tracks or select a tag preset above.
                     </div>
                   )}
@@ -3125,11 +3493,7 @@ const CreatePost = ({ onNavigateBack }) => {
 
               {/* Right Side Char Count & Publish */}
               <div className="hubble-composer-actions">
-                <button onClick={() => setWorkspaceMode('audience')} className="hubble-audience-badge">
-                  <Globe size={10} />
-                  <span>{audience}</span>
-                  <span className="down-arrow">▼</span>
-                </button>
+
               </div>
             </div>
           </div>
@@ -4160,8 +4524,9 @@ const CreatePost = ({ onNavigateBack }) => {
         }
 
         .hubble-option-row.active {
-          background: rgba(108, 59, 255, 0.1) !important;
-          border-color: rgba(108, 59, 255, 0.35) !important;
+          background: rgba(108, 59, 255, 0.18) !important;
+          border-color: #7C3BFF !important;
+          box-shadow: 0 0 10px rgba(108, 59, 255, 0.25) !important;
         }
 
         .hubble-radio-dot {
@@ -4296,6 +4661,17 @@ const CreatePost = ({ onNavigateBack }) => {
         .cal-day-cell.active {
           background: #6C3BFF !important;
           color: #fff !important;
+        }
+
+        .cal-day-cell.today-cell {
+          border: 1px solid #7C3BFF !important;
+          color: #7C3BFF !important;
+        }
+
+        .cal-day-cell.past-cell {
+          opacity: 0.25 !important;
+          cursor: not-allowed !important;
+          pointer-events: none !important;
         }
 
         .time-select {
@@ -5013,6 +5389,22 @@ const CreatePost = ({ onNavigateBack }) => {
           color: #ffffff !important;
         }
 
+        body.light-theme .hubble-circle-btn-sm {
+          background: rgba(108, 59, 255, 0.08) !important;
+          border: 1px solid rgba(108, 59, 255, 0.15) !important;
+          color: #6C3BFF !important;
+        }
+
+        body.light-theme .hubble-circle-btn-sm:hover:not(:disabled) {
+          background: #6C3BFF !important;
+          color: #ffffff !important;
+        }
+
+        body.light-theme .hubble-header-center {
+          background: rgba(108, 59, 255, 0.06) !important;
+          border: 1px solid rgba(108, 59, 255, 0.12) !important;
+        }
+
         body.light-theme .hubble-btn-secondary-sm {
           background: rgba(108, 59, 255, 0.05) !important;
           border: 1px solid rgba(108, 59, 255, 0.2) !important;
@@ -5197,17 +5589,58 @@ const CreatePost = ({ onNavigateBack }) => {
           color: #1a153b !important;
         }
 
-        body.light-theme .hubble-cal-days span {
+        body.light-theme .hubble-cal-header strong,
+        body.light-theme .hubble-cal-header span {
           color: #1a153b !important;
         }
 
-        body.light-theme .hubble-cal-days span.muted {
-          color: rgba(0, 0, 0, 0.25) !important;
+        body.light-theme .hubble-cal-days .cal-label {
+          color: #6b7280 !important;
         }
 
-        body.light-theme .hubble-cal-days span.active {
+        body.light-theme .cal-day-cell {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .cal-day-cell:hover {
+          background: rgba(108, 59, 255, 0.08) !important;
+        }
+
+        body.light-theme .cal-day-cell.active {
           background: #6C3BFF !important;
           color: #ffffff !important;
+        }
+
+        body.light-theme .cal-day-cell.today-cell {
+          border-color: #6C3BFF !important;
+          color: #6C3BFF !important;
+        }
+
+        body.light-theme .cal-day-cell.past-cell {
+          color: rgba(26, 21, 59, 0.25) !important;
+        }
+
+        body.light-theme .hubble-time-picker span {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-time-select {
+          background: rgba(108, 59, 255, 0.04) !important;
+          color: #1a153b !important;
+          border-color: rgba(108, 59, 255, 0.15) !important;
+        }
+
+        body.light-theme .hubble-time-select option {
+          background: #ffffff !important;
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-option-row.active strong {
+          color: #ffffff !important;
+        }
+
+        body.light-theme .hubble-option-row.active p {
+          color: rgba(255, 255, 255, 0.7) !important;
         }
 
         body.light-theme .hubble-mediastudio-tools-left,
@@ -5278,6 +5711,22 @@ const CreatePost = ({ onNavigateBack }) => {
         body.light-theme .hubble-preview-summary-card {
           background: rgba(108, 59, 255, 0.02) !important;
           border: 1px solid rgba(108, 59, 255, 0.08) !important;
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.04) !important;
+        }
+
+        body.light-theme .hubble-device-selector-tabs {
+          background: rgba(108, 59, 255, 0.06) !important;
+          border: 1px solid rgba(108, 59, 255, 0.1) !important;
+        }
+
+        body.light-theme .hubble-device-tab {
+          color: #6C3BFF !important;
+        }
+
+        body.light-theme .hubble-device-tab.active {
+          background: #6C3BFF !important;
+          color: #ffffff !important;
+          box-shadow: 0 2px 8px rgba(108, 59, 255, 0.15) !important;
         }
 
         body.light-theme .hubble-preview-summary-card h4 {
@@ -5300,7 +5749,7 @@ const CreatePost = ({ onNavigateBack }) => {
         body.light-theme .hubble-sim-phone {
           background: #ffffff !important;
           border: 12px solid #1a153b !important;
-          box-shadow: 0 25px 60px rgba(0, 0, 0, 0.15) !important;
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.06) !important;
         }
 
         body.light-theme .hubble-sim-header {
@@ -5333,16 +5782,20 @@ const CreatePost = ({ onNavigateBack }) => {
           background: rgba(108, 59, 255, 0.08) !important;
         }
 
-        body.light-theme .hubble-composer-footer .hubble-quick-btn {
-          color: #6b7280 !important;
-          background: rgba(108, 59, 255, 0.03) !important;
-          border: 1px solid rgba(108, 59, 255, 0.08) !important;
+        body.light-theme .hubble-quick-toolbar {
+          background: rgba(108, 59, 255, 0.05) !important;
+          border: 1px solid rgba(108, 59, 255, 0.1) !important;
         }
 
-        body.light-theme .hubble-composer-footer .hubble-quick-btn:hover {
+        body.light-theme .hubble-quick-btn {
+          color: #4f46e5 !important;
+          background: transparent !important;
+          border: none !important;
+        }
+
+        body.light-theme .hubble-quick-btn:hover {
           color: #6C3BFF !important;
           background: rgba(108, 59, 255, 0.08) !important;
-          border-color: rgba(108, 59, 255, 0.2) !important;
         }
 
         body.light-theme .hubble-drafts-empty {
@@ -5432,20 +5885,6 @@ const CreatePost = ({ onNavigateBack }) => {
             </button>
 
             <button 
-              onClick={() => setWorkspaceMode(workspaceMode === 'audience' ? 'editor' : 'audience')}
-              className={`hubble-tool-row-btn ${workspaceMode === 'audience' ? 'active' : ''}`}
-            >
-              <div className="hubble-tool-content-group">
-                <div className="hubble-tool-icon-box pink"><Users size={12} /></div>
-                <div className="hubble-tool-text">
-                  <strong>Audience</strong>
-                  <p>Choose who can see this</p>
-                </div>
-              </div>
-              <ChevronRight size={12} className="chevron" />
-            </button>
-
-            <button 
               onClick={() => setWorkspaceMode(workspaceMode === 'schedule' ? 'editor' : 'schedule')}
               className={`hubble-tool-row-btn ${workspaceMode === 'schedule' ? 'active' : ''}`}
             >
@@ -5453,7 +5892,7 @@ const CreatePost = ({ onNavigateBack }) => {
                 <div className="hubble-tool-icon-box orange"><Calendar size={12} /></div>
                 <div className="hubble-tool-text">
                   <strong>Schedule</strong>
-                  <p>Pick date & time to post</p>
+                  <p>{isScheduled ? `Scheduled: ${scheduleTime}` : 'Pick date & time to post'}</p>
                 </div>
               </div>
               <ChevronRight size={12} className="chevron" />

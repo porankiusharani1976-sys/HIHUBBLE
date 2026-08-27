@@ -1,6 +1,8 @@
 // Hi-Hubble Video Editor Controller (Phase 1)
 // Implements client-side Canvas video rendering, trimming, splitting, rotation, speed, background music mixing, and exporting.
 
+import { Output, WebMOutputFormat, BufferTarget, EncodedVideoPacketSource, EncodedAudioPacketSource, EncodedPacket, Input, BlobSource, ALL_FORMATS, VideoSampleSink } from 'mediabunny';
+
 export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   // --- SAFE TOAST HELPER ---
   const safeShowToast = (msg) => {
@@ -173,6 +175,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
   let hashtags = [];
   let mentions = [];
+  let selectedMentionIds = [];
+  let selectedLocationData = null;
+  let currentDraftId = null;
 
   // Interactive Cropping State
   let isCropMode = false;
@@ -194,6 +199,90 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   // Web Audio Context for mixing
   let audioCtx = null;
   let audioDest = null;
+  let destNode = null;
+
+  function ensureAudioContextRunning() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(e => console.warn('[REEL AUDIO DEBUG] audioCtx resume notice:', e));
+    }
+    return audioCtx;
+  }
+
+  function getMediaSourceNode(el) {
+    ensureAudioContextRunning();
+    if (!el._sourceNode) {
+      try {
+        el._sourceNode = audioCtx.createMediaElementSource(el);
+      } catch (err) {
+        console.warn('[REEL AUDIO DEBUG] MediaSourceNode creation notice:', err.message);
+      }
+    }
+    if (el._sourceNode && !el._gainNode) {
+      el._gainNode = audioCtx.createGain();
+      el._sourceNode.connect(el._gainNode);
+    }
+    return el._sourceNode;
+  }
+
+  function routeMediaAudio(isExporting) {
+    ensureAudioContextRunning();
+
+    if (isExporting && !destNode) {
+      destNode = audioCtx.createMediaStreamDestination();
+    }
+
+    clips.forEach(c => {
+      if (c.type === 'video' && c.element) {
+        try {
+          getMediaSourceNode(c.element);
+          if (c.element._gainNode) {
+            c.element._gainNode.gain.value = videoVolume;
+            c.element._gainNode.disconnect();
+            c.element._gainNode.connect(audioCtx.destination);
+            if (isExporting && destNode) {
+              c.element._gainNode.connect(destNode);
+            }
+          }
+        } catch (err) {
+          console.warn('[REEL AUDIO DEBUG] Error routing clip video audio:', err.message);
+        }
+      }
+      if (c.voiceOverElement) {
+        try {
+          getMediaSourceNode(c.voiceOverElement);
+          if (c.voiceOverElement._gainNode) {
+            c.voiceOverElement._gainNode.gain.value = 1.0;
+            c.voiceOverElement._gainNode.disconnect();
+            c.voiceOverElement._gainNode.connect(audioCtx.destination);
+            if (isExporting && destNode) {
+              c.voiceOverElement._gainNode.connect(destNode);
+            }
+          }
+        } catch (err) {
+          console.warn('[REEL AUDIO DEBUG] Error routing voiceover audio:', err.message);
+        }
+      }
+    });
+
+    if (bgAudio && bgAudio.element) {
+      try {
+        getMediaSourceNode(bgAudio.element);
+        if (bgAudio.element._gainNode) {
+          bgAudio.element._gainNode.gain.value = musicVolume;
+          bgAudio.element._gainNode.disconnect();
+          bgAudio.element._gainNode.connect(audioCtx.destination);
+          if (isExporting && destNode) {
+            bgAudio.element._gainNode.connect(destNode);
+          }
+        }
+      } catch (err) {
+        console.warn('[REEL AUDIO DEBUG] Error routing bg music audio:', err.message);
+      }
+    }
+  }
 
   // --- Setup Canvas Size ---
   function updateCanvasDimensions() {
@@ -361,6 +450,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       clips.forEach(clip => {
         if (clip.element && clip.type === 'video') {
           clip.element.volume = videoVolume;
+          if (clip.element._gainNode) {
+            clip.element._gainNode.gain.value = videoVolume;
+          }
         }
       });
     });
@@ -374,6 +466,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       }
       if (bgAudio && bgAudio.element) {
         bgAudio.element.volume = musicVolume;
+        if (bgAudio.element._gainNode) {
+          bgAudio.element._gainNode.gain.value = musicVolume;
+        }
       }
       updateTimelineUI(); // Update volume labels dynamically on track representation
     });
@@ -654,7 +749,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       const audioText = document.createElement('span');
       audioText.className = 'bgm-text';
       audioText.style.cssText = `white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; pointer-events: none;`;
-      audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${bgAudio.file.name.substring(0, 20)} (${(bgAudio.startTime || 0).toFixed(1)}s - ${((bgAudio.startTime || 0) + audioDuration).toFixed(1)}s)`;
+      
+      const audioName = bgAudio.file ? bgAudio.file.name : (bgAudio.name || 'Background Music');
+      audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${audioName.substring(0, 20)} (${(bgAudio.startTime || 0).toFixed(1)}s - ${((bgAudio.startTime || 0) + audioDuration).toFixed(1)}s)`;
       audioTrack.appendChild(audioText);
 
       const volLabel = document.createElement('span');
@@ -680,7 +777,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           bgAudio.startTime = newStartTime;
           audioTrack.style.left = `${newStartTime * pxPerSec}px`;
 
-          audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${bgAudio.file.name.substring(0, 20)} (${newStartTime.toFixed(1)}s - ${(newStartTime + audioDuration).toFixed(1)}s)`;
+          const currentAudioName = bgAudio.file ? bgAudio.file.name : (bgAudio.name || 'Background Music');
+          audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${currentAudioName.substring(0, 20)} (${newStartTime.toFixed(1)}s - ${(newStartTime + audioDuration).toFixed(1)}s)`;
         };
 
         const onMouseUp = () => {
@@ -816,7 +914,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   function syncBGMusicPlayback() {
     if (!bgAudio || !bgAudio.element) return;
     const audio = bgAudio.element;
-    const audioDur = audio.duration || 0;
+    const audioDur = Number.isFinite(audio.duration) ? audio.duration : 9999;
     const start = bgAudio.startTime || 0;
 
     if (isPlaying) {
@@ -825,7 +923,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
         if (audio.paused) {
           audio.play().catch(e => console.warn(e));
         }
-        if (Math.abs(audio.currentTime - localTime) > 0.3) {
+        if (Math.abs(audio.currentTime - localTime) > 0.1) {
           audio.currentTime = localTime;
         }
       } else {
@@ -955,10 +1053,18 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     updatePostButtonsState();
   }
 
-  function recalculateTotalDuration() {
-    totalDuration = clips.reduce((sum, clip) => {
-      return sum + ((clip.endTrim - clip.startTrim) / clip.speed);
+  function getCanonicalDuration(clipList = clips) {
+    if (!Array.isArray(clipList) || clipList.length === 0) return 0;
+    return clipList.reduce((sum, clip) => {
+      const speed = (typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1;
+      const start = typeof clip.startTrim === 'number' ? clip.startTrim : 0;
+      const end = typeof clip.endTrim === 'number' ? clip.endTrim : (clip.duration || 3);
+      return sum + Math.max(0, (end - start) / speed);
     }, 0);
+  }
+
+  function recalculateTotalDuration() {
+    totalDuration = getCanonicalDuration(clips);
     updateTimeDisplay();
   }
 
@@ -1051,6 +1157,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       let clonedElement = null;
       if (clip.type === 'video') {
         clonedElement = document.createElement('video');
+        if (clip.element && clip.element.crossOrigin) {
+          clonedElement.crossOrigin = clip.element.crossOrigin;
+        }
         clonedElement.src = clip.url;
         clonedElement.muted = false;
         clonedElement.playsInline = true;
@@ -1656,7 +1765,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           const progress = (time - transStart) / transitionDuration;
 
           const localOffsetA = (time - cumulative) * clip.speed;
-          const localOffsetB = (time - transEnd) * nextClip.speed;
+          const localOffsetB = (time - transStart) * nextClip.speed;
 
           return {
             isTransitioning: true,
@@ -1693,8 +1802,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     return { clip: state.clip, index: state.activeClipIndex, localOffset: state.localOffset - state.clip.startTrim };
   }
 
-  function drawClipFrame(clip, localOffset, ctxTarget, canvasTarget, opacity = 1.0, offsetX = 0, offsetY = 0, scaleFactor = 1.0) {
-    const media = clip.element;
+  function drawClipFrame(clip, localOffset, ctxTarget, canvasTarget, opacity = 1.0, offsetX = 0, offsetY = 0, scaleFactor = 1.0, overrideMediaSource = null) {
+    const media = overrideMediaSource || clip.element;
     if (!media) return;
 
     ctxTarget.save();
@@ -1707,7 +1816,10 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
     // Calculate source dimensions
     let sw, sh;
-    if (clip.type === 'video') {
+    if (overrideMediaSource) {
+      sw = overrideMediaSource.displayWidth || overrideMediaSource.codedWidth || overrideMediaSource.videoWidth || 640;
+      sh = overrideMediaSource.displayHeight || overrideMediaSource.codedHeight || overrideMediaSource.videoHeight || 360;
+    } else if (clip.type === 'video') {
       sw = media.videoWidth || 640;
       sh = media.videoHeight || 360;
     } else {
@@ -2149,6 +2261,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
   function startPlayback() {
     if (clips.length === 0) return;
+    ensureAudioContextRunning();
+    routeMediaAudio(false);
     isPlaying = true;
     playPauseBtn.innerHTML = '<i data-lucide="pause" style="width: 14px; height: 14px;"></i>';
     if (window.debouncedCreateIcons) window.debouncedCreateIcons();
@@ -2185,28 +2299,34 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
         if (clip.type === 'video' && clip.element) {
           const video = clip.element;
-          const targetTime = clip.startTrim + localOffset;
+          const targetTime = localOffset; // Exact calculated source video position
+
+          video.playbackRate = clip.speed || 1.0;
 
           if (video.paused) {
-            video.playbackRate = clip.speed;
+            video.currentTime = Math.max(clip.startTrim, Math.min(clip.endTrim, targetTime));
             video.play().catch(() => { });
-          }
-
-          // Force synchrony if timeline drift detected
-          if (Math.abs(video.currentTime - targetTime) > 0.3) {
-            video.currentTime = targetTime;
+          } else {
+            const absoluteDrift = Math.abs(video.currentTime - targetTime);
+            if (absoluteDrift > 0.35) {
+              console.log('[REEL AV DEBUG] Preview drift corrected:', absoluteDrift.toFixed(3), 's');
+              video.currentTime = targetTime;
+            }
           }
         }
 
         // Voiceover sync
         if (clip.voiceOverElement) {
           const voiceover = clip.voiceOverElement;
-          const targetVoiceTime = localOffset / clip.speed;
+          const targetVoiceTime = (localOffset - clip.startTrim) / clip.speed;
           if (voiceover.paused) {
+            voiceover.currentTime = Math.max(0, targetVoiceTime);
             voiceover.play().catch(() => { });
-          }
-          if (Math.abs(voiceover.currentTime - targetVoiceTime) > 0.3) {
-            voiceover.currentTime = targetVoiceTime;
+          } else {
+            const absoluteVoiceDrift = Math.abs(voiceover.currentTime - targetVoiceTime);
+            if (absoluteVoiceDrift > 0.35) {
+              voiceover.currentTime = targetVoiceTime;
+            }
           }
         }
       }
@@ -2321,6 +2441,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       chip.innerHTML = `@${mention} <button data-idx="${idx}">×</button>`;
       chip.querySelector('button').addEventListener('click', () => {
         mentions.splice(idx, 1);
+        if (selectedMentionIds && selectedMentionIds.length > idx) {
+          selectedMentionIds.splice(idx, 1);
+        }
         renderMentions();
       });
       mentionsList.appendChild(chip);
@@ -2328,15 +2451,178 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   }
 
   if (mentionsInput) {
-    mentionsInput.addEventListener('keydown', (e) => {
+    mentionsInput.addEventListener('keydown', async (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
         const value = mentionsInput.value.trim().replace('@', '');
-        if (value && !mentions.includes(value)) {
-          mentions.push(value);
-          renderMentions();
+        if (value) {
+          if (!mentions.includes(value)) {
+            try {
+              const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+              const res = await fetch(`/api/users/mention-suggestions?q=${encodeURIComponent(value)}`, {
+                headers: { 'Authorization': `Bearer ${token}` }
+              });
+              const users = await res.json();
+              const exactMatch = Array.isArray(users) && users.find(u => u.username.toLowerCase() === value.toLowerCase());
+              if (exactMatch) {
+                mentions.push(exactMatch.username);
+                selectedMentionIds.push(exactMatch.id);
+              } else {
+                mentions.push(value);
+              }
+              renderMentions();
+            } catch (err) {
+              mentions.push(value);
+              renderMentions();
+            }
+          }
         }
         mentionsInput.value = '';
+        const mentionsSuggestions = document.getElementById('editor-mentions-suggestions');
+        if (mentionsSuggestions) {
+          mentionsSuggestions.style.display = 'none';
+          mentionsSuggestions.innerHTML = '';
+        }
+      }
+    });
+  }
+
+  // Mentions real-time dynamic search typing '@'
+  const mentionsSuggestions = document.getElementById('editor-mentions-suggestions');
+  let mentionsTimeout = null;
+
+  if (mentionsInput && mentionsSuggestions) {
+    mentionsInput.addEventListener('input', () => {
+      clearTimeout(mentionsTimeout);
+      const val = mentionsInput.value.trim();
+      const q = val.replace('@', '');
+
+      if (!q) {
+        mentionsSuggestions.style.display = 'none';
+        mentionsSuggestions.innerHTML = '';
+        return;
+      }
+
+      mentionsTimeout = setTimeout(async () => {
+        try {
+          const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+          const res = await fetch(`/api/users/mention-suggestions?q=${encodeURIComponent(q)}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          const users = await res.json();
+
+          if (Array.isArray(users) && users.length > 0) {
+            mentionsSuggestions.innerHTML = '';
+            users.forEach(u => {
+              const item = document.createElement('div');
+              item.className = 'suggestion-item';
+              item.innerHTML = `
+                <img src="${u.profileImage || '/assets/avatar-placeholder.png'}" class="avatar" onerror="this.src='/assets/avatar-placeholder.png'">
+                <div>
+                  <div style="font-weight: 600; font-size: 13px; color: white;">${u.fullName}</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">@${u.username}</div>
+                </div>
+              `;
+              item.addEventListener('click', () => {
+                if (!mentions.includes(u.username)) {
+                  mentions.push(u.username);
+                  selectedMentionIds.push(u.id);
+                  renderMentions();
+                }
+                mentionsInput.value = '';
+                mentionsSuggestions.style.display = 'none';
+                mentionsSuggestions.innerHTML = '';
+              });
+              mentionsSuggestions.appendChild(item);
+            });
+            mentionsSuggestions.style.display = 'block';
+          } else {
+            mentionsSuggestions.style.display = 'none';
+            mentionsSuggestions.innerHTML = '';
+          }
+        } catch (err) {
+          console.error("Mentions suggestions fetch error:", err);
+        }
+      }, 300);
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!mentionsInput.contains(e.target) && !mentionsSuggestions.contains(e.target)) {
+        mentionsSuggestions.style.display = 'none';
+      }
+    });
+  }
+
+  // Location real-time dynamic search geocoding using existing window.HubbleLocationService
+  const locationSuggestions = document.getElementById('editor-location-suggestions');
+  let locationTimeout = null;
+
+  if (locationInput && locationSuggestions) {
+    locationInput.addEventListener('input', () => {
+      clearTimeout(locationTimeout);
+      const val = locationInput.value.trim();
+
+      if (!val) {
+        locationSuggestions.style.display = 'none';
+        locationSuggestions.innerHTML = '';
+        selectedLocationData = null;
+        return;
+      }
+
+      locationTimeout = setTimeout(async () => {
+        try {
+          if (window.HubbleLocationService && typeof window.HubbleLocationService.search === 'function') {
+            const results = await window.HubbleLocationService.search(val);
+            if (Array.isArray(results) && results.length > 0) {
+              locationSuggestions.innerHTML = '';
+              results.forEach(loc => {
+                const item = document.createElement('div');
+                item.className = 'suggestion-item';
+                item.style.padding = '8px 12px';
+                
+                const parts = [
+                  loc.name,
+                  loc.locality || loc.city,
+                  loc.region || loc.state,
+                  loc.country
+                ].filter(Boolean);
+                const desc = parts.join(', ');
+
+                item.innerHTML = `
+                  <div style="font-size: 13px; color: white; font-weight: 500;">${loc.name || desc}</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">${desc}</div>
+                `;
+                item.addEventListener('click', () => {
+                  locationInput.value = loc.name || desc;
+                  selectedLocationData = {
+                    name: loc.name || desc,
+                    city: loc.locality || loc.city || '',
+                    state: loc.region || loc.state || '',
+                    country: loc.country || '',
+                    lat: loc.lat,
+                    lon: loc.lon,
+                    place_id: loc.place_id || null
+                  };
+                  locationSuggestions.style.display = 'none';
+                  locationSuggestions.innerHTML = '';
+                });
+                locationSuggestions.appendChild(item);
+              });
+              locationSuggestions.style.display = 'block';
+            } else {
+              locationSuggestions.style.display = 'none';
+              locationSuggestions.innerHTML = '';
+            }
+          }
+        } catch (err) {
+          console.error("Location search suggestions fetch error:", err);
+        }
+      }, 400);
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!locationInput.contains(e.target) && !locationSuggestions.contains(e.target)) {
+        locationSuggestions.style.display = 'none';
       }
     });
   }
@@ -2349,7 +2635,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
       // Update Summary Fields
       reviewCaption.innerText = captionInput.value.trim() || 'No caption written.';
-      reviewAudio.innerText = bgAudio ? bgAudio.file.name : 'Original Audio';
+      reviewAudio.innerText = bgAudio ? (bgAudio.file ? bgAudio.file.name : (bgAudio.name || 'Background Music')) : 'Original Audio';
       reviewLocation.innerText = locationInput.value.trim() || 'None';
       reviewResolution.innerText = resolutionSelect.value === '720p' ? '720p (HD)' : '1080p (Full HD)';
       reviewDuration.innerText = totalDuration.toFixed(1) + 's';
@@ -2369,208 +2655,669 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   }
 
   // --- Real-time Video Compiler Engine (Canvas recorder) ---
-  async function renderFinalExportPreview() {
-    console.log('[REEL AUDIO DEBUG] Beginning renderFinalExportPreview export compilation');
-    // Generate a temporary compilation blob for the user review screen
+  // --- Independent Probe & Media Validation ---
+  async function validateExportedMedia(blob, expectedDuration) {
+    return new Promise((resolve, reject) => {
+      if (!blob || !(blob instanceof Blob) || blob.size < 1024) {
+        return reject(new Error(`Media validation failed: blob invalid or size too small (${blob ? blob.size : 0} bytes)`));
+      }
+      const url = URL.createObjectURL(blob);
+      const probe = document.createElement('video');
+      probe.preload = 'metadata';
+
+      const cleanup = () => {
+        try { URL.revokeObjectURL(url); } catch(e) {}
+        probe.removeAttribute('src');
+        try { probe.load(); } catch(e) {}
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Media validation timed out while probing exported file'));
+      }, 10000);
+
+      probe.onloadedmetadata = () => {
+        clearTimeout(timer);
+        const errors = [];
+
+        if (!probe.videoWidth || probe.videoWidth <= 0) {
+          errors.push('No video track detected or zero width');
+        }
+        if (!probe.videoHeight || probe.videoHeight <= 0) {
+          errors.push('Invalid video dimensions');
+        }
+        if (!Number.isFinite(probe.duration) || probe.duration <= 0) {
+          errors.push('Invalid or infinite video duration');
+        }
+        if (Math.abs(probe.duration - expectedDuration) > 2.0) {
+          errors.push(`Duration mismatch: canonical=${expectedDuration.toFixed(2)}s, probed=${probe.duration.toFixed(2)}s`);
+        }
+
+        let dropped = 0;
+        if (typeof probe.getVideoPlaybackQuality === 'function') {
+          try {
+            const quality = probe.getVideoPlaybackQuality();
+            if (quality) dropped = quality.droppedVideoFrames || 0;
+          } catch (e) {}
+        }
+
+        cleanup();
+
+        if (errors.length > 0) {
+          reject(new Error('Media validation failed: ' + errors.join('; ')));
+        } else {
+          console.log(`[REEL VALIDATION SUCCESS] Probed duration: ${probe.duration.toFixed(2)}s, Dimensions: ${probe.videoWidth}x${probe.videoHeight}, Blob size: ${blob.size} bytes, Dropped frames: ${dropped}`);
+          resolve(true);
+        }
+      };
+
+      probe.onerror = () => {
+        clearTimeout(timer);
+        cleanup();
+        reject(new Error('Exported media file failed to load in HTML5 video player probe'));
+      };
+
+      probe.src = url;
+    });
+  }
+
+  // --- OfflineAudioContext Audio Pipeline Composition ---
+  async function composeAudioTrackOffline(clipsList, bgmObj, targetSampleRate = 48000) {
+    const totalDur = getCanonicalDuration(clipsList);
+    if (totalDur <= 0) return null;
+
+    const totalSamples = Math.ceil(totalDur * targetSampleRate);
+    console.log(`[REEL AUDIO] Initializing OfflineAudioContext for totalDuration: ${totalDur.toFixed(3)}s (${totalSamples} samples @ ${targetSampleRate}Hz)`);
+
+    let offlineCtx;
+    try {
+      offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(2, Math.max(1, totalSamples), targetSampleRate);
+    } catch (e) {
+      console.error('[REEL AUDIO] Failed to create OfflineAudioContext:', e);
+      return null;
+    }
+
+    let timelineStart = 0;
+    for (let idx = 0; idx < clipsList.length; idx++) {
+      const clip = clipsList[idx];
+      const clipSpeed = (typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1.0;
+      const trimStart = typeof clip.startTrim === 'number' ? clip.startTrim : 0;
+      const trimEnd = typeof clip.endTrim === 'number' ? clip.endTrim : (clip.duration || 3);
+      const effectiveDur = Math.max(0, (trimEnd - trimStart) / clipSpeed);
+      const timelineEnd = timelineStart + effectiveDur;
+
+      if (clip.type === 'video' && clip.file) {
+        try {
+          const arrayBuf = await clip.file.arrayBuffer();
+          const tempAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const decodedBuffer = await tempAudioCtx.decodeAudioData(arrayBuf.slice(0));
+          try { tempAudioCtx.close(); } catch (e) {}
+
+          if (decodedBuffer) {
+            const sourceNode = offlineCtx.createBufferSource();
+            sourceNode.buffer = decodedBuffer;
+            sourceNode.playbackRate.value = clipSpeed;
+
+            const gainNode = offlineCtx.createGain();
+            gainNode.gain.value = (typeof videoVolume === 'number') ? videoVolume : 1.0;
+
+            sourceNode.connect(gainNode);
+            gainNode.connect(offlineCtx.destination);
+
+            sourceNode.start(timelineStart, trimStart, trimEnd - trimStart);
+
+            console.log(`[REEL AUDIO] Clip #${idx} (${clip.name}): sourceDuration=${decodedBuffer.duration.toFixed(3)}s, trimStart=${trimStart.toFixed(3)}s, trimEnd=${trimEnd.toFixed(3)}s, playbackRate=${clipSpeed}, gain=${gainNode.gain.value}, timelineStart=${timelineStart.toFixed(3)}s, timelineEnd=${timelineEnd.toFixed(3)}s`);
+          }
+        } catch (audioErr) {
+          console.warn(`[REEL AUDIO] Clip #${idx} (${clip.name}) has no decoded audio track or audio decoding failed:`, audioErr.message);
+        }
+      }
+
+      // Voiceover for this clip if present
+      if (clip.voiceOverBlob || clip.voiceOverUrl) {
+        try {
+          let voArrayBuf = null;
+          if (clip.voiceOverBlob) {
+            voArrayBuf = await clip.voiceOverBlob.arrayBuffer();
+          } else if (clip.voiceOverUrl) {
+            const resp = await fetch(clip.voiceOverUrl);
+            voArrayBuf = await resp.arrayBuffer();
+          }
+          if (voArrayBuf) {
+            const tempAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const voBuffer = await tempAudioCtx.decodeAudioData(voArrayBuf.slice(0));
+            try { tempAudioCtx.close(); } catch (e) {}
+
+            if (voBuffer) {
+              const voSource = offlineCtx.createBufferSource();
+              voSource.buffer = voBuffer;
+
+              const voGain = offlineCtx.createGain();
+              voGain.gain.value = 1.0;
+
+              voSource.connect(voGain);
+              voGain.connect(offlineCtx.destination);
+
+              voSource.start(timelineStart, 0, Math.min(voBuffer.duration, effectiveDur));
+              console.log(`[REEL AUDIO] Clip #${idx} Voiceover: sourceDuration=${voBuffer.duration.toFixed(3)}s, timelineStart=${timelineStart.toFixed(3)}s`);
+            }
+          }
+        } catch (voErr) {
+          console.warn(`[REEL AUDIO] Clip #${idx} Voiceover decoding failed:`, voErr.message);
+        }
+      }
+
+      timelineStart = timelineEnd;
+    }
+
+    // BGM
+    if (bgmObj && bgmObj.file) {
+      try {
+        const bgmArrayBuf = await bgmObj.file.arrayBuffer();
+        const tempAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const bgmBuffer = await tempAudioCtx.decodeAudioData(bgmArrayBuf.slice(0));
+        try { tempAudioCtx.close(); } catch (e) {}
+
+        if (bgmBuffer) {
+          const bgmSource = offlineCtx.createBufferSource();
+          bgmSource.buffer = bgmBuffer;
+
+          const bgmGain = offlineCtx.createGain();
+          bgmGain.gain.value = (typeof musicVolume === 'number') ? musicVolume : 1.0;
+
+          bgmSource.connect(bgmGain);
+          bgmGain.connect(offlineCtx.destination);
+
+          const bgmStart = bgmObj.startTime || 0;
+          bgmSource.start(bgmStart, 0, totalDur - bgmStart);
+          console.log(`[REEL AUDIO] BGM (${bgmObj.file.name}): sourceDuration=${bgmBuffer.duration.toFixed(3)}s, gain=${bgmGain.gain.value}, timelineStart=${bgmStart.toFixed(3)}s`);
+        }
+      } catch (bgmErr) {
+        console.warn(`[REEL AUDIO] BGM decoding failed:`, bgmErr.message);
+      }
+    }
+
+    try {
+      const renderedAudioBuffer = await offlineCtx.startRendering();
+      console.log(`[REEL AUDIO] OfflineAudioContext rendering complete. Rendered audio duration: ${renderedAudioBuffer.duration.toFixed(3)}s, channels: ${renderedAudioBuffer.numberOfChannels}, samples: ${renderedAudioBuffer.length}`);
+      return renderedAudioBuffer;
+    } catch (renderErr) {
+      console.error('[REEL AUDIO] OfflineAudioContext rendering failed:', renderErr);
+      return null;
+    }
+  }
+
+  // --- Deterministic WebCodecs + Mediabunny Reel Export Pipeline ---
+  let exportCancelRequested = false;
+
+  async function renderFinalExportDeterministic() {
+    exportCancelRequested = false;
+    const startTimeMs = performance.now();
+    console.log('[REEL EXPORT] Starting deterministic WebCodecs export pipeline...');
+
+    if (typeof VideoEncoder === 'undefined' || typeof AudioEncoder === 'undefined' || typeof VideoFrame === 'undefined' || typeof AudioData === 'undefined') {
+      throw new Error('Your browser does not support WebCodecs (VideoEncoder/AudioEncoder). Please use Chrome, Edge, Firefox 130+, or Safari 26+.');
+    }
+
     renderingOverlay.style.display = 'flex';
-    renderPercentage.innerText = 'Processing Video: Preparing...';
+    renderPercentage.innerText = 'Preparing Audio Pipeline... (0%)';
+
+    const canonicalDur = getCanonicalDuration(clips);
+    if (canonicalDur <= 0 || clips.length === 0) {
+      renderingOverlay.style.display = 'none';
+      throw new Error('No valid media clips to export.');
+    }
+
+    const FPS = 30;
+    const totalFrames = Math.ceil(canonicalDur * FPS);
+
+    console.log(`[REEL EXPORT] timelineDuration: ${canonicalDur.toFixed(3)}s, fps: ${FPS}, totalFrames: ${totalFrames}`);
 
     const renderCanvas = document.createElement('canvas');
-    const isPortrait = ratioSelect.value === '9:16';
-    const isSquare = ratioSelect.value === '1:1';
+    const isPortrait = ratioSelect ? ratioSelect.value === '9:16' : true;
+    const isSquare = ratioSelect ? ratioSelect.value === '1:1' : false;
 
-    // Choose size based on selected resolution
-    const isFullHD = resolutionSelect.value === '1080p';
+    // Optimized 720p HD export resolution (720x1280 for 9:16, 720x720 for 1:1, 1280x720 for 16:9)
+    // Provides crisp HD visual quality while cutting decode/encode load by over 55% for 100% smooth 30 FPS playback
     if (isPortrait) {
-      renderCanvas.width = isFullHD ? 1080 : 720;
-      renderCanvas.height = isFullHD ? 1920 : 1280;
+      renderCanvas.width = 720;
+      renderCanvas.height = 1280;
     } else if (isSquare) {
-      renderCanvas.width = isFullHD ? 1080 : 720;
-      renderCanvas.height = isFullHD ? 1080 : 720;
+      renderCanvas.width = 720;
+      renderCanvas.height = 720;
     } else {
-      renderCanvas.width = isFullHD ? 1920 : 1280;
-      renderCanvas.height = isFullHD ? 1080 : 720;
+      renderCanvas.width = 1280;
+      renderCanvas.height = 720;
     }
-
     const rctx = renderCanvas.getContext('2d');
-    const stream = renderCanvas.captureStream(30); // 30 FPS export
 
-    // Audio node capture setup with WebAudio PCM Buffer Decoding
-    let destNode = null;
+    const EXPORT_BITRATE = 2_500_000; // 2.5 Mbps target bitrate for 720p HD
 
-    try {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      } else if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-      }
-      console.log('[REEL AUDIO DEBUG] AudioContext initialized. State:', audioCtx.state);
-      destNode = audioCtx.createMediaStreamDestination();
-
-      // 1. Decode & schedule Background Audio track
-      if (bgAudio && bgAudio.file) {
-        try {
-          const bgArrayBuffer = await bgAudio.file.arrayBuffer();
-          const decodedBgBuffer = await audioCtx.decodeAudioData(bgArrayBuffer);
-          console.log('[REEL AUDIO DEBUG] Decoded background audio PCM buffer. Duration:', decodedBgBuffer.duration, 'Channels:', decodedBgBuffer.numberOfChannels);
-
-          const bgSource = audioCtx.createBufferSource();
-          bgSource.buffer = decodedBgBuffer;
-
-          const bgGain = audioCtx.createGain();
-          bgGain.gain.value = musicVolume; // Apply editor music volume mix
-
-          bgSource.connect(bgGain);
-          bgGain.connect(destNode);
-          bgGain.connect(audioCtx.destination);
-
-          bgSource.start(audioCtx.currentTime + 0.05, bgAudio.startTime || 0, totalDuration);
-          console.log('[REEL AUDIO DEBUG] Scheduled background audio source node with gain:', musicVolume);
-        } catch (bgErr) {
-          console.warn('[REEL AUDIO DEBUG] Background audio PCM decode fallback warning:', bgErr.message);
-        }
-      }
-
-      // 2. Decode & schedule Timeline Video Audio tracks
-      let timelineTimeOffset = 0;
-      for (const c of clips) {
-        const clipDur = (c.endTrim - c.startTrim) / c.speed;
-        if (c.type === 'video' && c.file) {
-          try {
-            const clipArrayBuffer = await c.file.arrayBuffer();
-            const decodedClipBuffer = await audioCtx.decodeAudioData(clipArrayBuffer);
-            console.log(`[REEL AUDIO DEBUG] Decoded clip ${c.id} audio PCM buffer. Duration:`, decodedClipBuffer.duration);
-
-            const clipSource = audioCtx.createBufferSource();
-            clipSource.buffer = decodedClipBuffer;
-            clipSource.playbackRate.value = c.speed;
-
-            const clipGain = audioCtx.createGain();
-            clipGain.gain.value = videoVolume; // Apply editor video volume mix
-
-            clipSource.connect(clipGain);
-            clipGain.connect(destNode);
-            clipGain.connect(audioCtx.destination);
-
-            clipSource.start(
-              audioCtx.currentTime + 0.05 + timelineTimeOffset,
-              c.startTrim,
-              c.endTrim - c.startTrim
-            );
-            console.log(`[REEL AUDIO DEBUG] Scheduled video audio for clip ${c.id} at timeline offset ${timelineTimeOffset}s with gain:`, videoVolume);
-          } catch (clipAudioErr) {
-            console.warn(`[REEL AUDIO DEBUG] Clip ${c.id} PCM audio decode notice:`, clipAudioErr.message);
-          }
-        }
-        timelineTimeOffset += clipDur;
-      }
-
-      const audioTracks = destNode.stream.getAudioTracks();
-      if (audioTracks.length > 0) {
-        stream.addTrack(audioTracks[0]);
-        console.log('[REEL AUDIO DEBUG] Successfully attached combined audio track to canvas stream:', audioTracks[0].label || 'audio-track');
+    let videoCodec = 'vp8';
+    const vp8Config = { codec: 'vp8', width: renderCanvas.width, height: renderCanvas.height, bitrate: EXPORT_BITRATE, framerate: FPS };
+    const vp8Support = await VideoEncoder.isConfigSupported(vp8Config);
+    if (!vp8Support.supported) {
+      const vp9Config = { codec: 'vp09.00.10.08', width: renderCanvas.width, height: renderCanvas.height, bitrate: EXPORT_BITRATE, framerate: FPS };
+      const vp9Support = await VideoEncoder.isConfigSupported(vp9Config);
+      if (vp9Support.supported) {
+        videoCodec = 'vp09.00.10.08';
       } else {
-        console.warn('[REEL AUDIO DEBUG] DestNode stream contains no audio tracks!');
-      }
-    } catch (ae) {
-      console.warn("[REEL AUDIO DEBUG] Web Audio Routing notice:", ae.message);
-    }
-
-    // Media Recorder initialization
-    const mimeTypes = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'];
-    let selectedMime = '';
-    for (const mime of mimeTypes) {
-      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(mime)) {
-        selectedMime = mime;
-        break;
+        renderingOverlay.style.display = 'none';
+        throw new Error('Neither VP8 nor VP9 video encoding is supported by your browser.');
       }
     }
-    console.log('[REEL AUDIO DEBUG] MediaRecorder selected MIME type:', selectedMime || 'default');
 
-    let recorder;
-    try {
-      recorder = selectedMime ? new MediaRecorder(stream, { mimeType: selectedMime }) : new MediaRecorder(stream);
-    } catch (e) {
-      recorder = new MediaRecorder(stream);
-    }
+    const target = new BufferTarget();
+    const output = new Output({
+      format: new WebMOutputFormat(),
+      target: target
+    });
 
-    const chunks = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
+    const videoSource = new EncodedVideoPacketSource(videoCodec === 'vp8' ? 'vp8' : 'vp9');
+    output.addVideoTrack(videoSource, { frameRate: FPS });
 
-    recorder.onstop = () => {
-      const finalBlob = new Blob(chunks, { type: recorder.mimeType || selectedMime || 'video/webm' });
-      console.log('[REEL AUDIO DEBUG] MediaRecorder export completed. Final Blob size:', finalBlob.size, 'bytes, MIME:', finalBlob.type);
-      const finalUrl = URL.createObjectURL(finalBlob);
-      finalVideo.src = finalUrl;
-      renderingOverlay.style.display = 'none';
-    };
+    const audioSource = new EncodedAudioPacketSource('opus');
+    output.addAudioTrack(audioSource);
 
-    recorder.start();
+    await output.start();
 
-    // Play through the timeline frame-by-frame on offscreen canvas for visual capture
-    let exportPlayhead = 0;
-    const interval = 1000 / 30; // 30 frames per second loop
+    let encodedVideoPacketsCount = 0;
+    let firstVideoPacketMeta = null;
 
-    return new Promise((resolve) => {
-      const intervalId = setInterval(() => {
-        if (exportPlayhead >= totalDuration) {
-          clearInterval(intervalId);
-          recorder.stop();
-          clips.forEach(c => {
-            if (c.type === 'video' && c.element) c.element.pause();
-          });
-          resolve();
-          return;
+    const videoEncoder = new VideoEncoder({
+      output: async (chunk, meta) => {
+        try {
+          const packet = EncodedPacket.fromEncodedChunk(chunk);
+          encodedVideoPacketsCount++;
+          if (encodedVideoPacketsCount === 1 && meta) firstVideoPacketMeta = meta;
+          await videoSource.add(packet, meta || firstVideoPacketMeta);
+        } catch (err) {
+          console.error('[REEL ENCODE] Video packet muxing error:', err);
+        }
+      },
+      error: (e) => console.error('[REEL ENCODE] VideoEncoder error:', e)
+    });
+
+    videoEncoder.configure({
+      codec: videoCodec,
+      width: renderCanvas.width,
+      height: renderCanvas.height,
+      bitrate: EXPORT_BITRATE,
+      framerate: FPS
+    });
+
+    let encodedAudioPacketsCount = 0;
+    let firstAudioPacketMeta = null;
+
+    const audioEncoder = new AudioEncoder({
+      output: async (chunk, meta) => {
+        try {
+          const packet = EncodedPacket.fromEncodedChunk(chunk);
+          encodedAudioPacketsCount++;
+          if (encodedAudioPacketsCount === 1 && meta) firstAudioPacketMeta = meta;
+          await audioSource.add(packet, meta || firstAudioPacketMeta);
+        } catch (err) {
+          console.error('[REEL ENCODE] Audio packet muxing error:', err);
+        }
+      },
+      error: (e) => console.error('[REEL ENCODE] AudioEncoder error:', e)
+    });
+
+    audioEncoder.configure({
+      codec: 'opus',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      bitrate: 128_000
+    });
+
+    // --- AUDIO STAGE ---
+    renderPercentage.innerText = 'Rendering Audio Track... (5%)';
+    const renderedAudioBuffer = await composeAudioTrackOffline(clips, bgAudio, 48000);
+
+    if (renderedAudioBuffer) {
+      renderPercentage.innerText = 'Encoding Audio Track... (10%)';
+      const OPUS_FRAME_SAMPLES = 960;
+      const channels = renderedAudioBuffer.numberOfChannels;
+      const totalAudioSamples = renderedAudioBuffer.length;
+
+      for (let offset = 0; offset < totalAudioSamples; offset += OPUS_FRAME_SAMPLES) {
+        if (exportCancelRequested) break;
+        const frameSize = Math.min(OPUS_FRAME_SAMPLES, totalAudioSamples - offset);
+        const timestampUs = Math.round((offset / 48000) * 1_000_000);
+
+        const planarData = new Float32Array(frameSize * channels);
+        for (let ch = 0; ch < channels; ch++) {
+          const chData = renderedAudioBuffer.getChannelData(ch);
+          planarData.set(chData.subarray(offset, offset + frameSize), ch * frameSize);
         }
 
-        const rstate = getPlaybackRenderState(exportPlayhead);
-        if (rstate) {
-          if (rstate.isTransitioning) {
-            const { clipA, clipB, localOffsetA, localOffsetB, progress, transitionType } = rstate;
+        const audioData = new AudioData({
+          format: 'f32-planar',
+          sampleRate: 48000,
+          numberOfFrames: frameSize,
+          numberOfChannels: channels,
+          timestamp: timestampUs,
+          data: planarData
+        });
 
-            if (clipA.type === 'video' && clipA.element) {
-              clipA.element.currentTime = localOffsetA;
-            }
-            if (clipB.type === 'video' && clipB.element) {
-              clipB.element.currentTime = localOffsetB;
-            }
+        audioEncoder.encode(audioData);
+        audioData.close();
+      }
+      await audioEncoder.flush();
+      console.log(`[REEL ENCODE] Audio encoding completed. Total audio packets: ${encodedAudioPacketsCount}`);
+    }
 
-            if (transitionType === 'fade') {
-              drawClipFrame(clipA, localOffsetA, rctx, renderCanvas, 1 - progress);
-              drawClipFrame(clipB, localOffsetB, rctx, renderCanvas, progress);
-            } else if (transitionType === 'slide') {
-              drawClipFrame(clipA, localOffsetA, rctx, renderCanvas, 1.0, -progress * renderCanvas.width, 0);
-              drawClipFrame(clipB, localOffsetB, rctx, renderCanvas, 1.0, (1 - progress) * renderCanvas.width, 0);
-            } else if (transitionType === 'zoom') {
-              drawClipFrame(clipA, localOffsetA, rctx, renderCanvas, 1 - progress, 0, 0, 1.0 + progress * 0.5);
-              drawClipFrame(clipB, localOffsetB, rctx, renderCanvas, progress, 0, 0, 0.5 + progress * 0.5);
-            }
+    if (exportCancelRequested) {
+      try { videoEncoder.close(); } catch(e){}
+      try { audioEncoder.close(); } catch(e){}
+      renderingOverlay.style.display = 'none';
+      throw new Error('Export was cancelled by user.');
+    }
 
-            drawOverlays(clipA, localOffsetA - clipA.startTrim, rctx, renderCanvas);
+    // --- VIDEO STAGE ---
+    console.log('[REEL EXPORT] Beginning frame-by-frame video rendering stage...');
+
+    // Lightweight 16-point canvas pixel visual fingerprinting
+    function getFrameFingerprint(ctxTarget, width, height) {
+      try {
+        const sampleWidth = Math.min(64, width);
+        const sampleHeight = Math.min(64, height);
+        const imgData = ctxTarget.getImageData(0, 0, sampleWidth, sampleHeight).data;
+        let hash = 0;
+        for (let i = 0; i < imgData.length; i += 16) {
+          hash = ((hash << 5) - hash) + imgData[i];
+          hash |= 0;
+        }
+        return hash.toString(16);
+      } catch (e) {
+        return 'nohash';
+      }
+    }
+
+    let duplicateSourceFrameCount = 0;
+    let duplicateVisualFrameCount = 0;
+    let prevVisualHash = null;
+    const uniqueSourceMediaTimes = new Set();
+    const uniqueVisualFingerprints = new Set();
+    const prevSourceTimeMap = new Map();
+    const frameDeltas = [];
+    let prevFrameTimestampUs = null;
+    let videoEncodeQueuePeak = 0;
+
+    // Pre-initialize Mediabunny VideoSampleSink decoders for video clips if possible
+    const clipDecoders = new Map();
+    for (const clip of clips) {
+      if (clip.type === 'video' && clip.file && !clipDecoders.has(clip.id)) {
+        try {
+          const input = new Input({
+            source: new BlobSource(clip.file),
+            formats: ALL_FORMATS
+          });
+          const vTrack = await input.getPrimaryVideoTrack();
+          if (vTrack) {
+            const sink = new VideoSampleSink(vTrack);
+            clipDecoders.set(clip.id, { input, vTrack, sink });
+            console.log(`[REEL DECODER] Initialized Mediabunny VideoSampleSink for clip: ${clip.name}`);
+          }
+        } catch (e) {
+          console.warn(`[REEL DECODER] Could not initialize Mediabunny decoder for ${clip.name}, using video element fallback:`, e.message);
+        }
+      }
+    }
+
+    const seekVideoToTime = async (videoEl, targetTime) => {
+      if (!videoEl) return { actualMediaTime: 0 };
+      const currentT = videoEl.currentTime;
+      const diff = Math.abs(currentT - targetTime);
+
+      // Strict 1ms threshold. If diff < 0.001s, we are already at the target frame.
+      if (diff < 0.001 && !videoEl.seeking) {
+        return { actualMediaTime: currentT };
+      }
+
+      return new Promise((resolve) => {
+        let resolved = false;
+
+        const finish = (mediaTime) => {
+          if (!resolved) {
+            resolved = true;
+            videoEl.removeEventListener('seeked', onSeeked);
+            resolve({ actualMediaTime: (typeof mediaTime === 'number' && !isNaN(mediaTime)) ? mediaTime : videoEl.currentTime });
+          }
+        };
+
+        const onSeeked = () => {
+          if ('requestVideoFrameCallback' in videoEl) {
+            try {
+              videoEl.requestVideoFrameCallback((now, metadata) => {
+                finish(metadata ? metadata.mediaTime : videoEl.currentTime);
+              });
+            } catch (e) {
+              finish(videoEl.currentTime);
+            }
           } else {
-            const { clip, localOffset } = rstate;
-            if (clip.type === 'video' && clip.element) {
-              clip.element.currentTime = localOffset;
-            }
+            finish(videoEl.currentTime);
+          }
+        };
 
-            drawClipFrame(clip, localOffset, rctx, renderCanvas, 1.0, 0, 0, 1.0);
-            drawOverlays(clip, localOffset - clip.startTrim, rctx, renderCanvas);
+        videoEl.addEventListener('seeked', onSeeked);
+        videoEl.currentTime = targetTime;
+
+        // Timeout fallback per frame seek (max 150ms)
+        setTimeout(() => {
+          finish(videoEl.currentTime);
+        }, 150);
+      });
+    };
+
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+      if (exportCancelRequested) {
+        try { videoEncoder.close(); } catch(e){}
+        try { audioEncoder.close(); } catch(e){}
+        renderingOverlay.style.display = 'none';
+        throw new Error('Export was cancelled by user.');
+      }
+
+      // VideoEncoder backpressure management
+      if (videoEncoder.encodeQueueSize > videoEncodeQueuePeak) {
+        videoEncodeQueuePeak = videoEncoder.encodeQueueSize;
+      }
+      if (videoEncoder.encodeQueueSize > 5) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+
+      const canonicalTime = frameIndex / FPS;
+      const timestampUs = Math.round((frameIndex * 1_000_000) / FPS);
+
+      if (prevFrameTimestampUs !== null) {
+        frameDeltas.push((timestampUs - prevFrameTimestampUs) / 1000);
+      }
+      prevFrameTimestampUs = timestampUs;
+
+      const rstate = getPlaybackRenderState(canonicalTime);
+      if (rstate) {
+        if (rstate.isTransitioning) {
+          const { clipA, clipB, localOffsetA, localOffsetB, progress, transitionType } = rstate;
+          let sampleA = null;
+          let sampleB = null;
+
+          const decA = clipDecoders.get(clipA.id);
+          if (decA && decA.sink) {
+            try {
+              const sA = await decA.sink.getSample(localOffsetA);
+              if (sA) sampleA = sA.videoFrame || sA;
+            } catch (e) {}
+          }
+          if (!sampleA && clipA.type === 'video' && clipA.element) {
+            await seekVideoToTime(clipA.element, localOffsetA);
+          }
+
+          const decB = clipDecoders.get(clipB.id);
+          if (decB && decB.sink) {
+            try {
+              const sB = await decB.sink.getSample(localOffsetB);
+              if (sB) sampleB = sB.videoFrame || sB;
+            } catch (e) {}
+          }
+          if (!sampleB && clipB.type === 'video' && clipB.element) {
+            await seekVideoToTime(clipB.element, localOffsetB);
+          }
+
+          rctx.fillStyle = '#000000';
+          rctx.fillRect(0, 0, renderCanvas.width, renderCanvas.height);
+
+          if (transitionType === 'fade') {
+            drawClipFrame(clipA, localOffsetA, rctx, renderCanvas, 1 - progress, 0, 0, 1.0, sampleA);
+            drawClipFrame(clipB, localOffsetB, rctx, renderCanvas, progress, 0, 0, 1.0, sampleB);
+          } else if (transitionType === 'slide') {
+            drawClipFrame(clipA, localOffsetA, rctx, renderCanvas, 1.0, -progress * renderCanvas.width, 0, 1.0, sampleA);
+            drawClipFrame(clipB, localOffsetB, rctx, renderCanvas, 1.0, (1 - progress) * renderCanvas.width, 0, 1.0, sampleB);
+          } else if (transitionType === 'zoom') {
+            drawClipFrame(clipA, localOffsetA, rctx, renderCanvas, 1 - progress, 0, 0, 1.0 + progress * 0.5, sampleA);
+            drawClipFrame(clipB, localOffsetB, rctx, renderCanvas, progress, 0, 0, 0.5 + progress * 0.5, sampleB);
+          }
+          drawOverlays(clipA, localOffsetA - clipA.startTrim, rctx, renderCanvas);
+
+          if (sampleA && typeof sampleA.close === 'function') { try { sampleA.close(); } catch(e){} }
+          if (sampleB && typeof sampleB.close === 'function') { try { sampleB.close(); } catch(e){} }
+
+        } else {
+          const { clip, localOffset } = rstate;
+          let actualSourceTime = localOffset;
+          let sampleFrame = null;
+
+          const dec = clipDecoders.get(clip.id);
+          if (dec && dec.sink) {
+            try {
+              const s = await dec.sink.getSample(localOffset);
+              if (s) {
+                sampleFrame = s.videoFrame || s;
+                actualSourceTime = s.timestamp || localOffset;
+              }
+            } catch (e) {}
+          }
+
+          if (!sampleFrame && clip.type === 'video' && clip.element) {
+            const res = await seekVideoToTime(clip.element, localOffset);
+            actualSourceTime = res.actualMediaTime;
+          }
+
+          if (clip.type === 'video') {
+            const clipKey = clip.id || clip.name || 'clip';
+            const prevTime = prevSourceTimeMap.get(clipKey);
+            if (prevTime !== undefined && Math.abs(prevTime - actualSourceTime) < 0.001) {
+              duplicateSourceFrameCount++;
+            }
+            prevSourceTimeMap.set(clipKey, actualSourceTime);
+            uniqueSourceMediaTimes.add(`${clipKey}_${actualSourceTime.toFixed(3)}`);
+          }
+
+          rctx.fillStyle = '#000000';
+          rctx.fillRect(0, 0, renderCanvas.width, renderCanvas.height);
+
+          drawClipFrame(clip, localOffset, rctx, renderCanvas, 1.0, 0, 0, 1.0, sampleFrame);
+          drawOverlays(clip, localOffset - clip.startTrim, rctx, renderCanvas);
+
+          // Pixel visual fingerprinting hash check
+          const visualHash = getFrameFingerprint(rctx, renderCanvas.width, renderCanvas.height);
+          if (prevVisualHash !== null && prevVisualHash === visualHash) {
+            duplicateVisualFrameCount++;
+          }
+          prevVisualHash = visualHash;
+          uniqueVisualFingerprints.add(visualHash);
+
+          if (sampleFrame && typeof sampleFrame.close === 'function') {
+            try { sampleFrame.close(); } catch(e){}
+          }
+
+          if (frameIndex % 30 === 0 || frameIndex === totalFrames - 1) {
+            console.log(`[REEL FRAME DEBUG] frameIndex=${frameIndex}/${totalFrames}, targetTimelineTime=${canonicalTime.toFixed(3)}s, targetSourceTime=${localOffset.toFixed(3)}s, actualVideoCurrentTime=${actualSourceTime.toFixed(3)}s, visualHash=${visualHash}, timestampUs=${timestampUs}`);
           }
         }
+      }
 
-        exportPlayhead += (interval / 1000);
-        const percent = Math.min(Math.floor((exportPlayhead / totalDuration) * 100), 100);
-        renderPercentage.innerText = `Processing Video: ${percent}%`;
-      }, interval);
-    });
+      const vFrame = new VideoFrame(renderCanvas, { timestamp: timestampUs });
+      const isKey = (frameIndex % 30 === 0);
+      videoEncoder.encode(vFrame, { keyFrame: isKey });
+      vFrame.close();
+
+      if (frameIndex % 5 === 0 || frameIndex === totalFrames - 1) {
+        const pct = 15 + Math.floor((frameIndex / totalFrames) * 75);
+        renderPercentage.innerText = `Processing Video: ${pct}% (${frameIndex}/${totalFrames} frames)`;
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+
+    // Dispose Mediabunny input decoders
+    for (const [id, dec] of clipDecoders.entries()) {
+      try { if (dec.input && typeof dec.input.dispose === 'function') dec.input.dispose(); } catch(e){}
+    }
+
+    renderPercentage.innerText = 'Finalizing Media Stream... (92%)';
+    console.log('[REEL ENCODE] Flushing VideoEncoder...');
+    await videoEncoder.flush();
+    videoEncoder.close();
+    audioEncoder.close();
+
+    videoSource.close();
+    audioSource.close();
+
+    renderPercentage.innerText = 'Muxing WebM Container... (96%)';
+    console.log('[REEL MUX] Finalizing Mediabunny output...');
+    await output.finalize();
+
+    const finalArrayBuffer = target.buffer;
+    if (!finalArrayBuffer || finalArrayBuffer.byteLength === 0) {
+      renderingOverlay.style.display = 'none';
+      throw new Error('[REEL MUX ERROR] Muxer generated empty ArrayBuffer.');
+    }
+
+    const finalBlob = new Blob([finalArrayBuffer], { type: 'video/webm' });
+    const exportDurationMs = performance.now() - startTimeMs;
+
+    const avgDelta = frameDeltas.length > 0 ? (frameDeltas.reduce((a,b)=>a+b,0) / frameDeltas.length) : 0;
+    const minDelta = frameDeltas.length > 0 ? Math.min(...frameDeltas) : 0;
+    const maxDelta = frameDeltas.length > 0 ? Math.max(...frameDeltas) : 0;
+
+    console.log(`[REEL FRAME DIAGNOSTIC REPORT]
+  totalFrames: ${totalFrames}
+  uniqueSourceMediaTimes: ${uniqueSourceMediaTimes.size}
+  uniqueVisualFingerprints: ${uniqueVisualFingerprints.size}
+  duplicateSourceFrameCount: ${duplicateSourceFrameCount}
+  duplicateVisualFrameCount: ${duplicateVisualFrameCount}
+  averageFrameDelta: ${avgDelta.toFixed(2)}ms
+  minFrameDelta: ${minDelta.toFixed(2)}ms
+  maxFrameDelta: ${maxDelta.toFixed(2)}ms
+  videoEncodeQueuePeak: ${videoEncodeQueuePeak}
+  finalVideoDuration: ${canonicalDur.toFixed(3)}s
+  finalAudioDuration: ${renderedAudioBuffer ? renderedAudioBuffer.duration.toFixed(3) : '0.000'}s
+  exportDuration: ${(exportDurationMs / 1000).toFixed(2)}s
+  blobSize: ${finalBlob.size} bytes
+`);
+
+    renderPercentage.innerText = 'Validating Media File... (98%)';
+    await validateExportedMedia(finalBlob, canonicalDur);
+
+    const finalUrl = URL.createObjectURL(finalBlob);
+    finalVideo.src = finalUrl;
+    renderingOverlay.style.display = 'none';
+
+    return finalBlob;
+  }
+
+  async function renderFinalExportPreview() {
+    return await renderFinalExportDeterministic();
   }
 
   // --- Update Post Buttons State Helper ---
   function updatePostButtonsState() {
     const hasClips = clips.length > 0;
     if (toScreen2Btn) toScreen2Btn.disabled = !hasClips;
+    const saveDraftBtn = document.getElementById('editor-save-draft-btn');
+    if (saveDraftBtn) {
+      saveDraftBtn.disabled = !hasClips;
+      saveDraftBtn.style.opacity = hasClips ? '1' : '0.5';
+    }
     document.querySelectorAll('.editor-post-action-btn').forEach(btn => {
       btn.disabled = !hasClips;
       btn.style.opacity = hasClips ? '1' : '0.5';
@@ -2578,37 +3325,26 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   }
 
   async function getExportBase64Data() {
-    // If compiled preview video is not ready yet, execute renderFinalExportPreview()
-    if (!finalVideo || !finalVideo.src || !finalVideo.src.startsWith('blob:')) {
-      console.log('[REEL AUDIO DEBUG] Export blob missing. Compiling final video with audio track...');
-      await renderFinalExportPreview();
+    console.log('[REEL EXPORT] Initiating deterministic fresh final video compilation...');
+    const finalBlob = await renderFinalExportDeterministic();
+
+    if (!finalBlob || finalBlob.size === 0) {
+      throw new Error('Export compilation failed: final media blob is empty.');
     }
 
-    if (finalVideo && finalVideo.src && finalVideo.src.startsWith('blob:')) {
-      try {
-        const res = await fetch(finalVideo.src);
-        const blob = await res.blob();
-        console.log('[REEL AUDIO DEBUG] Reading export blob for upload. Size:', blob.size, 'Type:', blob.type);
-        return await new Promise((resolve) => {
-          const r = new FileReader();
-          r.onloadend = () => resolve(r.result);
-          r.readAsDataURL(blob);
-        });
-      } catch (e) {
-        console.error('[REEL AUDIO DEBUG] Failed to fetch export blob:', e);
-      }
-    }
-
-    if (clips.length > 0 && clips[0].file) {
-      console.log('[REEL AUDIO DEBUG] Falling back to raw clip file base64 data');
-      return await new Promise((resolve) => {
-        const r = new FileReader();
-        r.onloadend = () => resolve(r.result);
-        r.readAsDataURL(clips[0].file);
-      });
-    }
-
-    return null;
+    console.log('[REEL EXPORT] Reading export blob for upload. Size:', finalBlob.size, 'Type:', finalBlob.type);
+    return await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onloadend = () => {
+        if (r.result) {
+          resolve(r.result);
+        } else {
+          reject(new Error('FileReader failed to read exported video blob.'));
+        }
+      };
+      r.onerror = (e) => reject(new Error('FileReader error reading exported video blob: ' + e));
+      r.readAsDataURL(finalBlob);
+    });
   }
 
   // --- Quick Post Action (Screen 1 & Header buttons) ---
@@ -2685,7 +3421,10 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
             videoUrl: base64Data,
             audioTrackName: bgAudio ? (bgAudio.file?.name || 'Background Music') : '',
             durationSeconds: finalDurationSeconds,
-            duration_seconds: finalDurationSeconds
+            duration_seconds: finalDurationSeconds,
+            location: locationInput.value.trim(),
+            locationData: selectedLocationData,
+            mentions: selectedMentionIds
           })
         });
 
@@ -2693,6 +3432,18 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
         if (apiRes.ok) {
           safeShowToast('New Reel posted successfully! 🎥✨');
+          if (currentDraftId) {
+            try {
+              const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+              await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${token}` }
+              });
+            } catch (err) {
+              console.error("Cleanup delete draft error:", err.message);
+            }
+            currentDraftId = null;
+          }
           if (typeof window.loadFeedReels === 'function') window.loadFeedReels();
           if (typeof window.loadFeedPosts === 'function') window.loadFeedPosts();
 
@@ -2792,7 +3543,10 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
             videoUrl: base64Data,
             audioTrackName: bgAudio ? (bgAudio.file?.name || 'Background Music') : '',
             durationSeconds: finalDurationSeconds,
-            duration_seconds: finalDurationSeconds
+            duration_seconds: finalDurationSeconds,
+            location: locationInput.value.trim(),
+            locationData: selectedLocationData,
+            mentions: selectedMentionIds
           })
         });
 
@@ -2801,6 +3555,18 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
         if (apiRes.ok) {
           if (renderOverlay) renderOverlay.style.display = 'none';
           safeShowToast('New Reel posted successfully! 🎥✨');
+          if (currentDraftId) {
+            try {
+              const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+              await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${token}` }
+              });
+            } catch (err) {
+              console.error("Cleanup delete draft error:", err.message);
+            }
+            currentDraftId = null;
+          }
           if (typeof window.loadFeedReels === 'function') window.loadFeedReels();
           if (typeof window.loadFeedPosts === 'function') window.loadFeedPosts();
 
@@ -2857,6 +3623,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
     hashtags = [];
     mentions = [];
+    selectedMentionIds = [];
+    selectedLocationData = null;
+    currentDraftId = null;
     captionInput.value = '';
     hashtagsInput.value = '';
     mentionsInput.value = '';
@@ -2880,6 +3649,55 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     screen3.style.display = 'none';
     screen1.style.display = 'flex';
     switchEditorTab('basic');
+  }
+
+  function stopBackgroundMedia() {
+    // Pause all video elements outside the editor modal
+    document.querySelectorAll('video').forEach(video => {
+      if (!video.closest('#explore-create-modal')) {
+        try {
+          video.pause();
+        } catch (e) {
+          console.warn('[REEL AUDIO DEBUG] Video pause error:', e);
+        }
+      }
+    });
+
+    // Pause all audio elements outside the editor modal
+    document.querySelectorAll('audio').forEach(audio => {
+      if (!audio.closest('#explore-create-modal')) {
+        try {
+          audio.pause();
+        } catch (e) {
+          console.warn('[REEL AUDIO DEBUG] Audio pause error:', e);
+        }
+      }
+    });
+
+    // Pause any post background music via the global helper
+    if (typeof window.stopAllPostMusic === 'function') {
+      try {
+        window.stopAllPostMusic();
+      } catch (e) {
+        console.warn('[REEL AUDIO DEBUG] Stop post music error:', e);
+      }
+    }
+  }
+
+  // Watch explore-create-modal visibility to stop background media
+  if (exploreCreateModal) {
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (mutation.attributeName === 'class') {
+          const isActive = exploreCreateModal.classList.contains('active');
+          if (isActive) {
+            console.log('[REEL AUDIO DEBUG] Modal opened, pausing all background media');
+            stopBackgroundMedia();
+          }
+        }
+      });
+    });
+    observer.observe(exploreCreateModal, { attributes: true, attributeFilter: ['class'] });
   }
 
   // Global triggers and close actions
@@ -3692,6 +4510,411 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
   // Default to Basic tab initially
   switchEditorTab('basic');
+
+  // Helper: Upload a local clip/audio file to secure backend streaming endpoint
+  async function uploadDraftFile(file, type) {
+    if (!file) return null;
+    const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+    const response = await fetch(`${API_URL}/api/reels/drafts/upload?name=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': file.type || 'application/octet-stream',
+        'Authorization': `Bearer ${token}`
+      },
+      body: file // Sends the raw binary Blob/File object
+    });
+    const resData = await response.json();
+    if (!response.ok) {
+      throw new Error(resData.error || 'Upload failed');
+    }
+    return resData.url;
+  }
+
+  const viewDraftsBtn = document.getElementById('editor-view-drafts-btn');
+  const saveDraftBtn = document.getElementById('editor-save-draft-btn');
+  const draftsModal = document.getElementById('editor-drafts-modal');
+  const draftsCloseBtn = document.getElementById('editor-drafts-close-btn');
+  const draftsList = document.getElementById('editor-drafts-list');
+
+  if (saveDraftBtn) {
+    saveDraftBtn.addEventListener('click', async () => {
+      if (clips.length === 0) return;
+
+      const originalBtnText = saveDraftBtn.innerHTML;
+      saveDraftBtn.disabled = true;
+      saveDraftBtn.innerHTML = '<i data-lucide="loader" class="animate-spin" style="width:14px; height:14px;"></i> Saving...';
+      if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+
+      try {
+        const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+        const userStr = localStorage.getItem('invibeUser');
+        let userId = 'anon';
+        try { if (userStr) userId = JSON.parse(userStr).id || userId; } catch (e) { }
+
+        // 1. Upload any local clip files first (directly to Supabase Storage)
+        for (let i = 0; i < clips.length; i++) {
+          const clip = clips[i];
+          if (clip.file && clip.url.startsWith('blob:')) {
+            showToast(`Uploading clip ${i + 1} of ${clips.length}... ⏳`);
+            const publicUrl = await uploadDraftFile(clip.file, clip.type);
+            if (publicUrl) {
+              clip.url = publicUrl;
+              clip.file = null;
+            }
+          }
+        }
+
+        // 2. Upload background music file if local
+        if (bgAudio && bgAudio.file && bgAudio.url.startsWith('blob:')) {
+          showToast(`Uploading background music... ⏳`);
+          const publicUrl = await uploadDraftFile(bgAudio.file, 'video');
+          if (publicUrl) {
+            bgAudio.url = publicUrl;
+            bgAudio.file = null;
+            bgAudio.base64 = null;
+          }
+        }
+
+        // 3. Serialize editor state
+        const serializedClips = clips.map(c => ({
+          id: c.id,
+          type: c.type,
+          url: c.url,
+          name: c.name,
+          duration: c.duration,
+          startTrim: c.startTrim,
+          endTrim: c.endTrim,
+          speed: c.speed,
+          rotation: c.rotation,
+          fitMode: c.fitMode,
+          cropLeft: c.cropLeft,
+          cropRight: c.cropRight,
+          cropTop: c.cropTop,
+          cropBottom: c.cropBottom,
+          brightness: c.brightness,
+          contrast: c.contrast,
+          saturation: c.saturation,
+          exposure: c.exposure,
+          filterType: c.filterType,
+          transitionType: c.transitionType,
+          transitionDuration: c.transitionDuration,
+          textOverlays: c.textOverlays || [],
+          stickerOverlays: c.stickerOverlays || [],
+          pipOverlays: c.pipOverlays || []
+        }));
+
+        const serializedBgAudio = bgAudio ? {
+          url: bgAudio.url,
+          name: bgAudio.name || 'Background Music',
+          startTime: bgAudio.startTime || 0
+        } : null;
+
+        const mentionsMeta = mentions.map((m, idx) => {
+          const mId = selectedMentionIds[idx] || null;
+          return { id: mId, username: m };
+        });
+
+        const payload = {
+          caption: captionInput.value.trim(),
+          hashtags: hashtags,
+          mentions: mentionsMeta,
+          location: locationInput.value.trim(),
+          locationData: selectedLocationData,
+          editorState: {
+            clips: serializedClips,
+            bgAudio: serializedBgAudio,
+            videoVolume: videoVolume,
+            musicVolume: musicVolume,
+            aspectRatio: resolutionSelect?.value || '1080p'
+          }
+        };
+
+        let response;
+        if (currentDraftId) {
+          response = await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify(payload)
+          });
+        } else {
+          response = await fetch(`${API_URL}/api/reels/drafts`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify(payload)
+          });
+        }
+
+        const resData = await response.json();
+        if (response.ok) {
+          currentDraftId = resData.id;
+          showToast('Draft saved successfully! 💾');
+        } else {
+          throw new Error(resData.error || 'Failed to save draft details.');
+        }
+
+      } catch (err) {
+        console.error("Save draft error:", err);
+        showToast('Saving failed: ' + err.message);
+      } finally {
+        saveDraftBtn.disabled = false;
+        saveDraftBtn.innerHTML = originalBtnText;
+        if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+      }
+    });
+  }
+
+  async function loadDraftsList() {
+    if (!draftsList) return;
+    draftsList.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-muted); font-size: 13px;"><i data-lucide="loader" class="animate-spin" style="width:20px; height:20px; margin-bottom: 8px;"></i><br>Loading drafts...</div>';
+    if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+
+    try {
+      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+      const res = await fetch(`${API_URL}/api/reels/drafts`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const drafts = await res.json();
+
+      draftsList.innerHTML = '';
+      if (!Array.isArray(drafts) || drafts.length === 0) {
+        draftsList.innerHTML = `
+          <div class="drafts-empty-state" style="text-align: center; padding: 40px; color: var(--text-muted); display: flex; flex-direction: column; align-items: center; gap: 12px;">
+            <i data-lucide="folder-open" style="width: 48px; height: 48px; opacity: 0.5;"></i>
+            <p style="font-size: 13.5px; margin: 0;">No saved drafts found.</p>
+          </div>
+        `;
+        if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+        return;
+      }
+
+      drafts.forEach(d => {
+        const dateStr = new Date(d.updatedAt || d.createdAt).toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+
+        const card = document.createElement('div');
+        card.className = 'draft-card';
+        card.innerHTML = `
+          <div class="draft-card-thumb">
+            ${d.thumbnailUrl ? `<video src="${d.thumbnailUrl}" muted playsinline></video>` : '<i data-lucide="video" style="width: 24px; height: 24px; color: rgba(255,255,255,0.4);"></i>'}
+          </div>
+          <div class="draft-card-info">
+            <h4 class="draft-card-title">${d.caption || 'Untitled Draft'}</h4>
+            <div class="draft-card-meta">
+              <span><i data-lucide="calendar" style="width: 11px; height: 11px; vertical-align: middle; margin-right: 2px;"></i> ${dateStr}</span>
+              ${d.location ? `<span><i data-lucide="map-pin" style="width: 11px; height: 11px; vertical-align: middle; margin-right: 2px;"></i> ${d.location}</span>` : ''}
+            </div>
+          </div>
+          <div class="draft-card-actions">
+            <button class="welcome-btn btn-resume-draft" data-id="${d.id}" style="height: 30px; font-size: 11px; padding: 0 12px; border-radius: 6px; cursor: pointer; background: var(--primary, #a855f7); color: white; border: none; font-weight: 600;">Resume</button>
+            <button class="welcome-btn btn-delete-draft" data-id="${d.id}" style="height: 30px; width: 30px; border-radius: 6px; cursor: pointer; background: rgba(255,77,79,0.1); border: 1px solid rgba(255,77,79,0.2); color: #ff4d4f; display: flex; align-items: center; justify-content: center;"><i data-lucide="trash-2" style="width: 14px; height: 14px;"></i></button>
+          </div>
+        `;
+
+        card.querySelector('.btn-resume-draft').addEventListener('click', () => {
+          if (draftsModal) draftsModal.classList.remove('active');
+          resumeDraft(d.id);
+        });
+
+        card.querySelector('.btn-delete-draft').addEventListener('click', async (e) => {
+          e.stopPropagation();
+          if (!confirm('Are you sure you want to delete this draft?')) return;
+          try {
+            const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+            const delRes = await fetch(`${API_URL}/api/reels/drafts/${d.id}`, {
+              method: 'DELETE',
+              headers: { 'Authorization': `Bearer ${token}` }
+            });
+            if (delRes.ok) {
+              showToast('Draft deleted.');
+              loadDraftsList();
+            } else {
+              showToast('Failed to delete draft.');
+            }
+          } catch (delErr) {
+            console.error("Delete draft error:", delErr);
+          }
+        });
+
+        draftsList.appendChild(card);
+      });
+      if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+
+    } catch (err) {
+      console.error("Load drafts error:", err);
+      draftsList.innerHTML = '<div style="text-align: center; padding: 20px; color: #ff4d4f; font-size: 13px;">Failed to load drafts list.</div>';
+    }
+  }
+
+  if (viewDraftsBtn) {
+    viewDraftsBtn.addEventListener('click', () => {
+      if (draftsModal) {
+        draftsModal.classList.add('active');
+        loadDraftsList();
+      }
+    });
+  }
+
+  if (draftsCloseBtn && draftsModal) {
+    draftsCloseBtn.addEventListener('click', () => {
+      draftsModal.classList.remove('active');
+    });
+  }
+
+  async function resumeDraft(draftId) {
+    showToast('Loading draft... ⏳');
+    try {
+      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+      const res = await fetch(`${API_URL}/api/reels/drafts/${draftId}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const draft = await res.json();
+
+      if (!res.ok) throw new Error(draft.error || 'Failed to fetch draft.');
+
+      resetFullEditor();
+
+      currentDraftId = draft.id;
+
+      captionInput.value = draft.caption || '';
+      hashtags = draft.hashtags || [];
+      locationInput.value = draft.location || '';
+      selectedLocationData = draft.locationData || null;
+
+      const savedMentions = draft.mentions || [];
+      mentions = savedMentions.map(m => m.username);
+      selectedMentionIds = savedMentions.map(m => m.id);
+
+      renderMentions();
+
+      hashtagsList.innerHTML = '';
+      hashtags.forEach((tag, idx) => {
+        const chip = document.createElement('span');
+        chip.className = 'hashtag-chip';
+        chip.innerHTML = `#${tag} <button data-idx="${idx}">×</button>`;
+        chip.querySelector('button').addEventListener('click', () => {
+          hashtags.splice(idx, 1);
+          chip.remove();
+        });
+        hashtagsList.appendChild(chip);
+      });
+
+      if (resolutionSelect && draft.editorState.aspectRatio) {
+        resolutionSelect.value = draft.editorState.aspectRatio;
+      }
+
+      videoVolume = draft.editorState.videoVolume !== undefined ? draft.editorState.videoVolume : 1.0;
+      musicVolume = draft.editorState.musicVolume !== undefined ? draft.editorState.musicVolume : 0.5;
+      if (editorVideoVolume) {
+        editorVideoVolume.value = Math.round(videoVolume * 100);
+        if (editorVideoVolumeVal) editorVideoVolumeVal.innerText = `${editorVideoVolume.value}%`;
+      }
+      if (editorMusicVolume) {
+        editorMusicVolume.value = Math.round(musicVolume * 100);
+        if (editorMusicVolumeVal) editorMusicVolumeVal.innerText = `${editorMusicVolume.value}%`;
+      }
+
+      const draftClips = draft.editorState.clips || [];
+      for (const dc of draftClips) {
+        const isVideo = dc.type === 'video';
+        const clip = {
+          id: dc.id,
+          file: null,
+          type: dc.type,
+          url: dc.url,
+          name: dc.name,
+          duration: dc.duration,
+          startTrim: dc.startTrim,
+          endTrim: dc.endTrim,
+          speed: dc.speed || 1.0,
+          rotation: dc.rotation || 0,
+          fitMode: dc.fitMode || 'cover',
+          cropLeft: dc.cropLeft || 0,
+          cropRight: dc.cropRight || 0,
+          cropTop: dc.cropTop || 0,
+          cropBottom: dc.cropBottom || 0,
+          brightness: dc.brightness !== undefined ? dc.brightness : 100,
+          contrast: dc.contrast !== undefined ? dc.contrast : 100,
+          saturation: dc.saturation !== undefined ? dc.saturation : 100,
+          exposure: dc.exposure !== undefined ? dc.exposure : 100,
+          filterType: dc.filterType || 'none',
+          transitionType: dc.transitionType || 'none',
+          transitionDuration: dc.transitionDuration !== undefined ? dc.transitionDuration : 0.5,
+          textOverlays: dc.textOverlays || [],
+          stickerOverlays: dc.stickerOverlays || [],
+          pipOverlays: dc.pipOverlays || [],
+          element: null
+        };
+
+        if (isVideo) {
+          const videoElement = document.createElement('video');
+          videoElement.crossOrigin = 'anonymous';
+          videoElement.src = dc.url;
+          videoElement.muted = false;
+          videoElement.volume = videoVolume;
+          videoElement.playsInline = true;
+          clip.element = videoElement;
+        } else {
+          const imgElement = new Image();
+          imgElement.src = dc.url;
+          clip.element = imgElement;
+        }
+
+        clips.push(clip);
+      }
+
+      if (draft.editorState.bgAudio) {
+        const da = draft.editorState.bgAudio;
+        const audioEl = new Audio(da.url);
+        audioEl.crossOrigin = 'anonymous';
+        audioEl.loop = false;
+        audioEl.volume = musicVolume;
+        
+        bgAudio = {
+          file: null,
+          url: da.url,
+          element: audioEl,
+          startTime: da.startTime || 0,
+          name: da.name || 'Background Music'
+        };
+
+        // Listen for metadata load event to update timeline BGM track width once length is resolved
+        audioEl.addEventListener('loadedmetadata', () => {
+          updateTimelineUI();
+        });
+
+        // Graceful error handling for missing/failed audio sources
+        audioEl.addEventListener('error', (err) => {
+          console.warn('[REEL AUDIO DEBUG] Restored draft background music source failed to load:', da.url);
+          showToast('Audio track failed to load. Please re-select a track.');
+        });
+
+        audioStatus.style.display = 'flex';
+        audioNameSpan.innerText = bgAudio.name;
+      }
+
+      if (clips.length > 0) {
+        selectClip(0);
+      }
+      updateTimelineUI();
+      recalculateTotalDuration();
+      updatePostButtonsState();
+      showToast('Draft restored! 🎥✨');
+
+    } catch (e) {
+      console.error("Restore draft error:", e);
+      showToast('Restore failed: ' + e.message);
+    }
+  }
 
   // Seek preview to 0 on initial loading
   updateCanvasDimensions();

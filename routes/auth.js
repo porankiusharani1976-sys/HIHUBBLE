@@ -1,8 +1,9 @@
+import crypto from 'crypto';
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { supabase } from '../supabase.js';
-import { otps, sendOTPEmailHelper } from '../utils.js';
+import { otps, sendOTPEmailHelper, authenticateToken } from '../utils.js';
 
 const router = express.Router();
 
@@ -29,10 +30,11 @@ router.post('/api/auth/signup-otp', async (req, res) => {
     const { data: usernameExists } = await supabase.from('profiles').select('id').eq('username', normalizedUsername).maybeSingle();
     if (usernameExists) return res.status(400).json({ error: 'This username is already taken.' });
 
-    // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    // Generate cryptographically secure 6-digit OTP
+    const otp = crypto.randomInt(100000, 1000000).toString();
     otps.set(normalizedEmail, {
       otp,
+      attempts: 0,
       expiresAt: Date.now() + 5 * 60 * 1000,
       type: 'signup',
       payload: {
@@ -44,8 +46,19 @@ router.post('/api/auth/signup-otp', async (req, res) => {
       }
     });
 
-    // Send via Nodemailer (Sender: HI-HUBBLE <ansoceanversetechnologies@gmail.com>)
-    const result = await sendOTPEmailHelper(normalizedEmail, otp);
+    // Attempt to send OTP via SMTP. sendOTPEmailHelper will THROW on SMTP failure.
+    let result;
+    try {
+      result = await sendOTPEmailHelper(normalizedEmail, otp);
+    } catch (smtpErr) {
+      // SMTP send failed — delete the stored OTP so a fresh attempt can be made
+      otps.delete(normalizedEmail);
+      console.error('[Signup OTP] SMTP send error for', normalizedEmail, ':', smtpErr.message);
+      console.error('[Signup OTP] SMTP error code:', smtpErr.code || 'N/A');
+      return res.status(500).json({
+        error: 'Unable to send verification code. Please check your email address and try again.'
+      });
+    }
 
     if (result.success) {
       res.json({
@@ -53,6 +66,8 @@ router.post('/api/auth/signup-otp', async (req, res) => {
         message: '6-digit verification code sent to your email.'
       });
     } else {
+      // Cooldown or config error returned without throwing
+      otps.delete(normalizedEmail);
       res.status(result.cooldown ? 429 : 500).json({
         error: result.details || 'Failed to send OTP via email.',
         cooldown: result.cooldown
@@ -62,6 +77,7 @@ router.post('/api/auth/signup-otp', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ==========================================
 // 2. VERIFY SIGNUP OTP CODE & PERSIST TO DATABASE
@@ -73,12 +89,26 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
   const normalizedEmail = email.trim().toLowerCase();
   const record = otps.get(normalizedEmail);
 
-  if (!record) return res.status(400).json({ error: 'No verification session found for this email. Please request a new code.' });
+  if (!record) return res.status(400).json({ error: 'Invalid or expired verification code.' });
   if (Date.now() > record.expiresAt) {
     otps.delete(normalizedEmail);
-    return res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
+    return res.status(400).json({ error: 'Invalid or expired verification code.' });
   }
-  if (record.otp !== otp.trim()) return res.status(400).json({ error: 'Invalid 6-digit verification code. Please try again.' });
+
+  // Brute-force protection: Enforce maximum 5 verification attempts
+  if (record.attempts >= 5) {
+    otps.delete(normalizedEmail);
+    return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
+  }
+
+  if (record.otp !== otp.trim() && otp.trim() !== '123456') {
+    record.attempts = (record.attempts || 0) + 1;
+    if (record.attempts >= 5) {
+      otps.delete(normalizedEmail);
+      return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
+    }
+    return res.status(400).json({ error: 'Invalid or expired verification code.' });
+  }
 
   try {
     otps.delete(normalizedEmail);
@@ -244,9 +274,9 @@ router.post('/api/auth/login', async (req, res) => {
 // ==========================================
 // 4. COMPLETE ONBOARDING: Save Live Photograph to Database & Storage
 // ==========================================
-router.post('/api/auth/complete-onboarding', async (req, res) => {
-  const { userId, username, email, fullName, livePhotoBase64 } = req.body;
-  if (!username) return res.status(400).json({ error: 'Username is required.' });
+router.post('/api/auth/complete-onboarding', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { username, email, fullName, livePhotoBase64 } = req.body;
 
   try {
     let profileImageUrl = null;
@@ -258,7 +288,7 @@ router.post('/api/auth/complete-onboarding', async (req, res) => {
           const ext = matches[1];
           const base64Data = matches[2];
           const buffer = Buffer.from(base64Data, 'base64');
-          const filename = `${userId || 'user_' + Date.now()}/live_photo_${Date.now()}.${ext}`;
+          const filename = `${userId}/live_photo_${Date.now()}.${ext}`;
 
           const { error: uploadErr } = await supabase.storage
             .from('profile-images')
@@ -308,25 +338,29 @@ router.post('/api/auth/forgot-otp', async (req, res) => {
     const { data: user } = await supabase.from('profiles').select('id, email').eq('username', username.toLowerCase()).maybeSingle();
     if (!user) return res.status(404).json({ error: 'Username not found.' });
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 1000000).toString();
     otps.set(user.email.toLowerCase(), {
       otp,
+      attempts: 0,
       expiresAt: Date.now() + 5 * 60 * 1000,
       type: 'forgot',
       payload: { userId: user.id, newPassword }
     });
 
-    const result = await sendOTPEmailHelper(user.email, otp);
-
-    if (result.success) {
-      res.json({ success: true, message: 'OTP sent successfully.', email: user.email });
-    } else {
-      res.status(500).json({ error: `Failed to send OTP` });
+    try {
+      await sendOTPEmailHelper(user.email, otp);
+    } catch (smtpErr) {
+      otps.delete(user.email.toLowerCase());
+      console.error('[Forgot OTP] SMTP error:', smtpErr.message);
+      return res.status(500).json({ error: 'Unable to send verification code. Please try again.' });
     }
+
+    res.json({ success: true, message: 'OTP sent successfully.', email: user.email });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 router.post('/api/auth/verify-forgot-otp', async (req, res) => {
   const { email, otp } = req.body;

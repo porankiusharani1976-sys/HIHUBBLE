@@ -10,10 +10,7 @@ router.get('/api/notifications', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const { data: notificationsData, error } = await supabase
       .from('notifications')
-      .select(`
-        *,
-        sender_profile:profiles!sender_id(id, full_name, username, profile_image_url)
-      `)
+      .select('*')
       .or(`recipient_id.eq.${userId},user_id.eq.${userId}`)
       .order('created_at', { ascending: false });
 
@@ -22,16 +19,49 @@ router.get('/api/notifications', authenticateToken, async (req, res) => {
       return res.json([]);
     }
 
-    res.json(mapNotifications(notificationsData || []));
+    const items = notificationsData || [];
+    const senderIds = [...new Set(items.map(n => n.sender_id).filter(Boolean))];
+    const profilesMap = {};
+    if (senderIds.length > 0) {
+      const { data: profs, error: pErr } = await supabase
+        .from('profiles')
+        .select('id, full_name, username, profile_image_url')
+        .in('id', senderIds);
+      if (!pErr && profs) {
+        profs.forEach(p => {
+          profilesMap[p.id] = p;
+        });
+      }
+    }
+
+    // Fetch mention status for reel_mention notifications
+    const reelNotifs = items.filter(n => n.type === 'reel_mention');
+    const reelMentionStatuses = {};
+    if (reelNotifs.length > 0) {
+      const reelIds = reelNotifs.map(n => n.reel_id).filter(Boolean);
+      const { data: mentionsData, error: mErr } = await supabase
+        .from('mentions')
+        .select('reel_id, user_id, status')
+        .in('reel_id', reelIds)
+        .eq('user_id', userId);
+      if (!mErr && mentionsData) {
+        mentionsData.forEach(m => {
+          reelMentionStatuses[m.reel_id] = m.status;
+        });
+      }
+    }
+
+    res.json(mapNotifications(items, profilesMap, reelMentionStatuses));
   } catch (err) {
     console.error("Notifications error:", err);
     res.json([]);
   }
 });
 
-function mapNotifications(items) {
+function mapNotifications(items, profilesMap = {}, reelMentionStatuses = {}) {
   return items.map(item => {
-    const sender = item.sender_profile || {};
+    const senderId = item.sender_id;
+    const sender = (senderId && profilesMap[senderId]) || item.sender_profile || {};
     const username = sender.username || 'user';
     const fullName = sender.full_name || username;
     const profileImage = sender.profile_image_url || '';
@@ -42,10 +72,10 @@ function mapNotifications(items) {
         text = `${fullName} (@${username}) started following you.`;
         break;
       case 'follow_request':
-        text = `${fullName} (@${username}) requested to follow you.`;
+        text = `${fullName} (@${username}) sent you a Hubbies request.`;
         break;
       case 'accept_follow_request':
-        text = `${fullName} (@${username}) accepted your follow request.`;
+        text = `${fullName} (@${username}) accepted your Hubbies request.`;
         break;
       case 'like':
         text = `${fullName} (@${username}) liked your post.`;
@@ -62,16 +92,24 @@ function mapNotifications(items) {
       case 'mention':
         text = `${fullName} (@${username}) mentioned you in a comment.`;
         break;
+      case 'reel_mention':
+        text = `${fullName} (@${username}) tagged you in a Reel.`;
+        break;
     }
 
     return {
       _id: item.id,
+      id: item.id,
       type: item.type,
       text,
       createdAt: item.created_at || item.createdAt,
       isRead: item.is_read || item.read || false,
+      senderId: senderId || sender.id || null,
+      reelId: item.reel_id || null,
+      mentionStatus: item.type === 'reel_mention' ? (reelMentionStatuses[item.reel_id] || 'pending') : null,
       sender: {
-        _id: sender.id || 'usr_unknown',
+        _id: sender.id || senderId || 'usr_unknown',
+        id: sender.id || senderId || 'usr_unknown',
         fullName,
         username,
         profileImage
@@ -87,7 +125,30 @@ router.post('/api/notifications/read', authenticateToken, async (req, res) => {
       await supabase.from('notifications').update({ is_read: true }).eq('recipient_id', req.user.id);
     } catch (_) {}
     try {
+      await supabase.from('notifications').update({ is_read: true }).eq('user_id', req.user.id);
+    } catch (_) {}
+    try {
       await supabase.from('notifications').update({ read: true }).eq('recipient', req.user.id);
+    } catch (_) {}
+      
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  if (!req.user) return res.json({ success: false });
+  try {
+    const notifId = req.params.id;
+    try {
+      await supabase.from('notifications').update({ is_read: true }).eq('id', notifId).eq('recipient_id', req.user.id);
+    } catch (_) {}
+    try {
+      await supabase.from('notifications').update({ is_read: true }).eq('id', notifId).eq('user_id', req.user.id);
+    } catch (_) {}
+    try {
+      await supabase.from('notifications').update({ read: true }).eq('id', notifId).eq('recipient', req.user.id);
     } catch (_) {}
       
     res.json({ success: true });
