@@ -1,14 +1,19 @@
-const API_URL = (
-  window.location.hostname === 'localhost' ||
-  window.location.hostname === '127.0.0.1' ||
-  window.location.hostname === '[::1]' ||
-  window.location.hostname === '::1' ||
-  window.location.hostname.startsWith('192.168.') ||
-  window.location.hostname.startsWith('10.') ||
-  window.location.hostname.startsWith('172.') ||
-  window.location.hostname.endsWith('.local')
-) ? `${window.location.protocol}//${window.location.hostname}:3000`
-  : window.location.origin;
+const isCapacitor = !!window.Capacitor;
+const API_URL = isCapacitor
+  ? 'https://hi-hubble-z1qx.vercel.app'
+  : (
+      window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1' ||
+      window.location.hostname === '[::1]' ||
+      window.location.hostname === '::1' ||
+      window.location.hostname.startsWith('192.168.') ||
+      window.location.hostname.startsWith('10.') ||
+      window.location.hostname.startsWith('172.') ||
+      window.location.hostname.endsWith('.local')
+    ) ? `${window.location.protocol}//${window.location.hostname}:3000`
+      : window.location.origin;
+
+window.API_URL = API_URL;
 
 export const createPost = async (postData) => {
   const token = localStorage.getItem('invibe_jwt_token');

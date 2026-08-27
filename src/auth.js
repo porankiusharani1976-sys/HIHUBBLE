@@ -344,7 +344,7 @@ export async function initAuth() {
       }
 
       // Dispatch 6-digit verification code OTP via HI-HUBBLE backend SMTP endpoint
-      const res = await fetch('/api/auth/signup-otp', {
+      const res = await fetch((window.API_URL || '') + '/api/auth/signup-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -433,7 +433,7 @@ export async function initAuth() {
         logAuthDiagnostic('btnVerifyOtpStep Click', { targetEmail });
 
         // Verify 6-digit OTP code via HI-HUBBLE backend endpoint
-        const res = await fetch('/api/auth/verify-action-otp', {
+        const res = await fetch((window.API_URL || '') + '/api/auth/verify-action-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -493,7 +493,7 @@ export async function initAuth() {
       if (!targetEmail) return;
 
       try {
-        const res = await fetch('/api/auth/signup-otp', {
+        const res = await fetch((window.API_URL || '') + '/api/auth/signup-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -770,9 +770,9 @@ export function handleLogout() {
     try {
       if (navigator.sendBeacon) {
         const blob = new Blob([JSON.stringify({})], { type: 'application/json' });
-        navigator.sendBeacon(`/api/users/logout-presence?token=${encodeURIComponent(token)}`, blob);
+        navigator.sendBeacon(`${window.API_URL || ''}/api/users/logout-presence?token=${encodeURIComponent(token)}`, blob);
       }
-      fetch('/api/users/logout-presence', {
+      fetch((window.API_URL || '') + '/api/users/logout-presence', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
         keepalive: true

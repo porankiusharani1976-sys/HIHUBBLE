@@ -2459,7 +2459,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           if (!mentions.includes(value)) {
             try {
               const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
-              const res = await fetch(`/api/users/mention-suggestions?q=${encodeURIComponent(value)}`, {
+              const baseUrl = window.API_URL || '';
+              const res = await fetch(`${baseUrl}/api/users/mention-suggestions?q=${encodeURIComponent(value)}`, {
                 headers: { 'Authorization': `Bearer ${token}` }
               });
               const users = await res.json();
@@ -2506,7 +2507,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       mentionsTimeout = setTimeout(async () => {
         try {
           const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
-          const res = await fetch(`/api/users/mention-suggestions?q=${encodeURIComponent(q)}`, {
+          const baseUrl = window.API_URL || '';
+          const res = await fetch(`${baseUrl}/api/users/mention-suggestions?q=${encodeURIComponent(q)}`, {
             headers: { 'Authorization': `Bearer ${token}` }
           });
           const users = await res.json();
