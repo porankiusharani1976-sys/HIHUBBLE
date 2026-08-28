@@ -2,16 +2,16 @@ const isCapacitor = !!window.Capacitor;
 const API_URL = isCapacitor
   ? 'https://hi-hubble-z1qx.vercel.app'
   : (
-      window.location.hostname === 'localhost' ||
-      window.location.hostname === '127.0.0.1' ||
-      window.location.hostname === '[::1]' ||
-      window.location.hostname === '::1' ||
-      window.location.hostname.startsWith('192.168.') ||
-      window.location.hostname.startsWith('10.') ||
-      window.location.hostname.startsWith('172.') ||
-      window.location.hostname.endsWith('.local')
-    ) ? `${window.location.protocol}//${window.location.hostname}:3000`
-      : window.location.origin;
+    window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1' ||
+    window.location.hostname === '[::1]' ||
+    window.location.hostname === '::1' ||
+    window.location.hostname.startsWith('192.168.') ||
+    window.location.hostname.startsWith('10.') ||
+    window.location.hostname.startsWith('172.') ||
+    window.location.hostname.endsWith('.local')
+  ) ? `${window.location.protocol}//${window.location.hostname}:3000`
+    : window.location.origin;
 
 window.API_URL = API_URL;
 
@@ -39,7 +39,7 @@ export const createPost = async (postData) => {
     try {
       const errData = await res.json();
       if (errData && errData.error) errorMsg = errData.error;
-    } catch (_) {}
+    } catch (_) { }
     throw new Error(errorMsg);
   }
   return res.json();
@@ -92,7 +92,7 @@ export const schedulePost = async (postData) => {
     try {
       const errData = await res.json();
       if (errData && errData.error) errorMsg = errData.error;
-    } catch (_) {}
+    } catch (_) { }
     throw new Error(errorMsg);
   }
   return res.json();

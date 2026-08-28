@@ -86,7 +86,7 @@ class HubbingPlaybackController {
   onViewChange(viewName) {
     this.isExploreActive = (viewName === 'explore' || viewName === 'reels');
     console.log(`[HUBBING PLAYER] onViewChange: ${viewName}, isExploreActive=${this.isExploreActive}`);
-    
+
     if (!this.isExploreActive) {
       this.deactivateCurrentReel('view_leave');
       this.pauseAllReelVideos();
@@ -104,7 +104,7 @@ class HubbingPlaybackController {
             v.pause();
           }
           v.muted = true;
-        } catch (_) {}
+        } catch (_) { }
         const card = v.closest('.reel-card');
         const playOverlay = card?.querySelector('.reel-play-icon-overlay');
         if (playOverlay) {
@@ -192,7 +192,7 @@ class HubbingPlaybackController {
 
       const rect = card.getBoundingClientRect();
       const cardHeight = rect.height || 640;
-      
+
       // Calculate visible overlap in viewport
       const visibleTop = Math.max(0, rect.top);
       const visibleBottom = Math.min(viewportHeight, rect.bottom);
@@ -254,7 +254,7 @@ class HubbingPlaybackController {
           video.removeAttribute('src');
           video.load();
           console.log(`[HUBBING PLAYER] Unloaded far off-screen reel decoder resources: ${reelId}`);
-        } catch (_) {}
+        } catch (_) { }
       }
     }, 10000);
     this.unloadTimers.set(reelId, timerId);
@@ -323,7 +323,7 @@ class HubbingPlaybackController {
       // Check if token changed while waiting for play()
       if (this.activationId !== token) {
         console.log(`[HUBBING PLAYER] Stale play token #${token} resolved (active is #${this.activationId}), pausing.`);
-        try { video.pause(); } catch (_) {}
+        try { video.pause(); } catch (_) { }
         return;
       }
 
@@ -368,7 +368,7 @@ class HubbingPlaybackController {
           this.activeVideo.pause();
         }
         this.activeVideo.muted = true;
-      } catch (_) {}
+      } catch (_) { }
     }
     if (this.activeCard) {
       this.syncCardPlayOverlay(this.activeCard, true);
@@ -475,7 +475,7 @@ function bindPostVideoAudioSync(card, video, audio) {
   video._syncBound = true;
 
   video.addEventListener('play', () => {
-    if (audio.paused) audio.play().catch(() => {});
+    if (audio.paused) audio.play().catch(() => { });
   });
   video.addEventListener('pause', () => {
     if (!audio.paused) audio.pause();
@@ -585,7 +585,7 @@ window.StoryAudioManager = {
       this.audio.addEventListener('ended', () => {
         if (this.audio && this.audio.loop) {
           this.audio.currentTime = 0;
-          this.audio.play().catch(() => {});
+          this.audio.play().catch(() => { });
         }
       });
       this.audio.addEventListener('error', (err) => {
@@ -654,7 +654,7 @@ window.StoryAudioManager = {
           window.removeEventListener('touchstart', unlockAudio, true);
           window.removeEventListener('pointerdown', unlockAudio, true);
           if (this.currentUrl && !this.isMutedState && this.audio) {
-            this.audio.play().catch(() => {});
+            this.audio.play().catch(() => { });
           }
         };
         window.addEventListener('click', unlockAudio, true);
@@ -668,7 +668,7 @@ window.StoryAudioManager = {
     if (this.audio) {
       try {
         this.audio.pause();
-      } catch (_) {}
+      } catch (_) { }
     }
     this._isPlaying = false;
   },
@@ -685,7 +685,7 @@ window.StoryAudioManager = {
       try {
         this.audio.pause();
         this.audio.currentTime = 0;
-      } catch (_) {}
+      } catch (_) { }
     }
     this._isPlaying = false;
   },
@@ -734,7 +734,7 @@ window.StoryAudioManager = {
         } else {
           this.audio.currentTime = time;
         }
-      } catch (_) {}
+      } catch (_) { }
     }
   },
 
@@ -781,7 +781,7 @@ window.StoryAudioManager = {
         this.audio.pause();
         this.audio.currentTime = 0;
         this.audio.removeAttribute('src');
-      } catch (_) {}
+      } catch (_) { }
     }
     this.currentTrack = null;
     this.currentUrl = null;
@@ -805,9 +805,9 @@ window.cleanupStoryMedia = function () {
       v.currentTime = 0;
       v.removeAttribute('src');
       v.load();
-    } catch (_) {}
+    } catch (_) { }
     if (v.parentNode && (v.closest('#review-before-container') || v.closest('#review-after-container') || v.closest('#he-media-layer'))) {
-      try { v.remove(); } catch (_) {}
+      try { v.remove(); } catch (_) { }
     }
   });
 
@@ -836,7 +836,7 @@ window.cleanupStoryMedia = function () {
   if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
     try {
       window.HubbleEditor.GlobalAudio.stop();
-    } catch (_) {}
+    } catch (_) { }
   }
 };
 
@@ -949,7 +949,7 @@ window.HubbleMusicService = {
         this.previewAudio.pause();
         this.previewAudio.currentTime = 0;
         this.previewAudio = null;
-      } catch (_) {}
+      } catch (_) { }
     }
     this.playingUrl = null;
   }
@@ -1176,7 +1176,7 @@ window.searchStoryMusic = async function (query) {
     const isSelected = String(currentSelectedId) === String(t.id);
     const item = document.createElement('div');
     item.style.cssText = `display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 12px; background: ${isSelected ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.04)'}; border: 1px solid ${isSelected ? 'rgba(168,85,247,0.4)' : 'rgba(255,255,255,0.08)'}; transition: all 0.2s; box-sizing: border-box;`;
-    
+
     item.innerHTML = `
       <img src="${t.artwork}" style="width: 36px; height: 36px; border-radius: 8px; object-fit: cover; flex-shrink: 0;" alt="Cover" />
       <div style="flex: 1; min-width: 0; text-align: left;">
@@ -1381,7 +1381,7 @@ window.searchStoryLocation = async function (query) {
     const isSelected = String(currentSelectedId) === String(p.id);
     const item = document.createElement('div');
     item.style.cssText = `display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 12px; background: ${isSelected ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.04)'}; border: 1px solid ${isSelected ? 'rgba(168,85,247,0.4)' : 'rgba(255,255,255,0.08)'}; cursor: pointer; transition: all 0.2s; box-sizing: border-box; text-align: left;`;
-    
+
     item.innerHTML = `
       <div style="width: 30px; height: 30px; border-radius: 50%; background: rgba(168,85,247,0.2); color: var(--primary, #a855f7); display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 13px;">📍</div>
       <div style="flex: 1; min-width: 0;">
@@ -2175,47 +2175,47 @@ import { initiateAudioCall, endAudioCall, listenForIncomingAudioCalls } from './
 import './video/video.css'
 import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './video/video.call.js'
 
-  // Calling Initialization Bridge
-  let callingSubscribedUserId = null;
-  window.ensureIncomingCallListeners = function() {
-    try {
-      const userStr = localStorage.getItem('invibe_user') || localStorage.getItem('invibeUser');
-      if (!userStr) return;
-      const u = JSON.parse(userStr);
-      const userId = u ? (u.id || u._id || '').toString() : '';
-      if (userId && callingSubscribedUserId !== userId) {
-        console.warn('[Calling System] Actively subscribing listeners for user:', userId);
-        callingSubscribedUserId = userId;
-        listenForIncomingAudioCalls(userId);
-        listenForIncomingVideoCalls(userId);
-      }
-    } catch (err) {
-      console.error('[Calling Setup Error]:', err);
+// Calling Initialization Bridge
+let callingSubscribedUserId = null;
+window.ensureIncomingCallListeners = function () {
+  try {
+    const userStr = localStorage.getItem('invibe_user') || localStorage.getItem('invibeUser');
+    if (!userStr) return;
+    const u = JSON.parse(userStr);
+    const userId = u ? (u.id || u._id || '').toString() : '';
+    if (userId && callingSubscribedUserId !== userId) {
+      console.warn('[Calling System] Actively subscribing listeners for user:', userId);
+      callingSubscribedUserId = userId;
+      listenForIncomingAudioCalls(userId);
+      listenForIncomingVideoCalls(userId);
     }
-  };
+  } catch (err) {
+    console.error('[Calling Setup Error]:', err);
+  }
+};
 
-  // Run immediately and also set polling check to guarantee it registers even if auth is delayed
+// Run immediately and also set polling check to guarantee it registers even if auth is delayed
+window.ensureIncomingCallListeners();
+setInterval(() => {
   window.ensureIncomingCallListeners();
-  setInterval(() => {
-    window.ensureIncomingCallListeners();
-  }, 2000);
+}, 2000);
 
-  document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', () => {
 
   const isCapacitor = !!window.Capacitor;
   const API_URL = isCapacitor
     ? 'https://hi-hubble-z1qx.vercel.app'
     : (
-        window.location.hostname === 'localhost' ||
-        window.location.hostname === '127.0.0.1' ||
-        window.location.hostname === '[::1]' ||
-        window.location.hostname === '::1' ||
-        window.location.hostname.startsWith('192.168.') ||
-        window.location.hostname.startsWith('10.') ||
-        window.location.hostname.startsWith('172.') ||
-        window.location.hostname.endsWith('.local')
-      ) ? `${window.location.protocol}//${window.location.hostname}:3000`
-        : window.location.origin;
+      window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1' ||
+      window.location.hostname === '[::1]' ||
+      window.location.hostname === '::1' ||
+      window.location.hostname.startsWith('192.168.') ||
+      window.location.hostname.startsWith('10.') ||
+      window.location.hostname.startsWith('172.') ||
+      window.location.hostname.endsWith('.local')
+    ) ? `${window.location.protocol}//${window.location.hostname}:3000`
+      : window.location.origin;
 
   window.API_URL = API_URL;
 
@@ -2226,14 +2226,14 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     window.savedHubbs = [];
   }
 
-  window.updateSavedBadgeCount = function() {
+  window.updateSavedBadgeCount = function () {
     const badge = document.querySelector('.saved-count-badge');
     if (badge) {
       badge.textContent = (window.savedHubbs || []).length;
     }
   };
 
-  window.fetchSavedHubbs = async function() {
+  window.fetchSavedHubbs = async function () {
     const token = window.getAuthToken ? window.getAuthToken() : localStorage.getItem('invibe_jwt_token');
     if (!token) return;
     try {
@@ -2241,7 +2241,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         fetch(`${API_URL}/api/posts/saved`, { headers: { 'Authorization': `Bearer ${token}` } }),
         fetch(`${API_URL}/api/reels/saved`, { headers: { 'Authorization': `Bearer ${token}` } })
       ]);
-      
+
       let allSaved = [];
       if (postsRes.ok) {
         allSaved = allSaved.concat(await postsRes.json());
@@ -2264,7 +2264,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     const cu = typeof getCurrentUser === 'function' ? getCurrentUser() : null;
     if (cu && (cu.id || cu._id)) {
       tok = (cu.id || cu._id).toString();
-      try { localStorage.setItem('invibe_jwt_token', tok); } catch (_) {}
+      try { localStorage.setItem('invibe_jwt_token', tok); } catch (_) { }
       return tok;
     }
     return null;
@@ -2401,7 +2401,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           return clean;
         }
       }
-    } catch (e) {}
+    } catch (e) { }
     return 'dark'; // default theme
   }
 
@@ -2428,7 +2428,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (save) {
       try {
         localStorage.setItem('hihubble_theme', validTheme);
-      } catch (e) {}
+      } catch (e) { }
     }
 
     const appearanceToggle = document.getElementById('appearance-toggle-checkbox');
@@ -2586,8 +2586,8 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           v.currentTime = 0;
           v.removeAttribute('src');
           v.load();
-        } catch (_) {}
-        try { v.remove(); } catch (_) {}
+        } catch (_) { }
+        try { v.remove(); } catch (_) { }
       });
       if (window.StoryAudioManager && window.HubbleEditor && window.HubbleEditor.state && window.HubbleEditor.state.musicTrack) {
         if (!window.HubbleEditor.state.musicTrack.isMuted) {
@@ -2730,9 +2730,9 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
 
   window.switchView = switchView;
 
-  window.navigateToPost = function(postId, hubType = 'post') {
+  window.navigateToPost = function (postId, hubType = 'post') {
     if (!postId) return;
-    
+
     // Close active chats
     const grid = document.querySelector('.chats-layout-grid');
     if (grid) grid.classList.remove('chatting');
@@ -2744,7 +2744,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       const tryOpenStory = () => {
         let foundGroupIdx = -1;
         let foundStoryIdx = -1;
-        
+
         if (state.storyGroups) {
           state.storyGroups.forEach((group, gIdx) => {
             (group.stories || []).forEach((story, sIdx) => {
@@ -2789,7 +2789,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         const reelEl = document.querySelector(`.reel-card[data-reel-id="${postId}"]`);
         if (reelEl) {
           reelEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          
+
           // Play the video via central controller
           const video = reelEl.querySelector('.reel-video');
           if (video && window.hubbingPlaybackController) {
@@ -2818,13 +2818,13 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         const postEl = document.getElementById(`post-${postId}`);
         if (postEl) {
           postEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          
+
           // Glow effect
           postEl.style.transition = 'box-shadow 0.4s ease, border-color 0.4s ease, transform 0.4s ease';
           postEl.style.boxShadow = '0 0 25px rgba(168, 85, 247, 0.7)';
           postEl.style.borderColor = 'var(--primary, #a855f7)';
           postEl.style.transform = 'scale(1.01)';
-          
+
           setTimeout(() => {
             postEl.style.boxShadow = '';
             postEl.style.borderColor = '';
@@ -3467,7 +3467,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         const captionText = captionEl ? captionEl.textContent : '';
         const authorNameEl = cardEl ? (cardEl.querySelector('.author-name') || cardEl.querySelector('.author-username')) : null;
         const authorName = authorNameEl ? authorNameEl.textContent.trim().replace(/^@/, '') : 'Hubber';
-        
+
         if (img) mediaData = { id, type: 'image', url: img.src };
         else if (video) mediaData = { id, type: 'video', url: video.src };
         else mediaData = { id, type: 'text', text: captionText, author: authorName };
@@ -3625,7 +3625,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
 
   function loadStoryContent(groupIndex, storyIndex, mediaIndex = 0) {
     console.log(`[STAGE 3: loadStoryContent()] Init | Group: ${groupIndex}, Story: ${storyIndex}, Media: ${mediaIndex}`);
-    
+
     // Close views panel if open
     const storyViewsPanel = document.getElementById('story-views-panel');
     if (storyViewsPanel) storyViewsPanel.classList.remove('active');
@@ -4007,7 +4007,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             video.pause();
             video.removeAttribute('src');
             video.load();
-          } catch (_) {}
+          } catch (_) { }
         };
 
         const playPromise = video.play();
@@ -4094,7 +4094,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           v.pause();
           v.removeAttribute('src');
           v.load();
-        } catch (_) {}
+        } catch (_) { }
       }
       mediaContainer.innerHTML = '';
     }
@@ -4133,7 +4133,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     const mediaContainer = document.getElementById('story-viewer-media-container');
     const video = mediaContainer ? mediaContainer.querySelector('video') : null;
     if (video && video.paused && !state.isStoryViewsOpen) {
-      video.play().catch(() => {});
+      video.play().catch(() => { });
     }
     if (window.StoryAudioManager && !state.isStoryViewsOpen) {
       window.StoryAudioManager.resume();
@@ -4229,7 +4229,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             title: storyData.name || 'HUBB on Hi-Hubble',
             text: storyData.caption || 'Check out this HUBB on Hi-Hubble!',
             url: window.location.origin + '?story=' + storyId
-          }).catch(() => {});
+          }).catch(() => { });
         } else {
           showToast('Share link copied to clipboard! 🔗');
         }
@@ -4418,7 +4418,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      
+
       storyInsightsList.innerHTML = '';
       const viewers = data.viewers || [];
       if (storyInsightsViewsPanelText) {
@@ -4430,10 +4430,10 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           const row = document.createElement('div');
           row.className = 'insights-user-card';
           row.style.cssText = 'display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); margin-bottom: 8px;';
-          
+
           const heartHtml = user.liked ? '<div class="insights-heart-badge" style="position: absolute; bottom: -2px; right: -2px; width: 18px; height: 18px; border-radius: 50%; background: #ef4444; color: white; display: flex; align-items: center; justify-content: center; font-size: 10px; border: 2px solid #1a1a24;"><i data-lucide="heart" style="width: 10px; height: 10px; fill: white;"></i></div>' : '';
           const timeStr = user.viewedAt ? formatViewerRelativeTime(user.viewedAt) : (user.liked ? 'Liked your story' : 'Viewed recently');
-          
+
           row.innerHTML = `
             <div class="insights-avatar-wrap" style="position: relative; width: 40px; height: 40px; flex-shrink: 0;">
               <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${user.fullName}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
@@ -4471,7 +4471,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
   if (storyInsightsTrigger) {
     storyInsightsTrigger.addEventListener('click', async () => {
       if (!storyViewsPanel || !storyInsightsList) return;
-      
+
       const group = state.storyGroups[state.activeGroupIndex];
       if (!group) return;
       const storyData = group.stories[state.activeStoryIndex];
@@ -4761,9 +4761,9 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             stories: []
           };
         }
-        
+
         const storyId = story._id || story.id;
-        
+
         if (story.isViewed) {
           markStorySeen(storyId, false);
         }
@@ -4940,7 +4940,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
                     if (countSpan) countSpan.textContent = target.formattedLikes || target.likeCount || '0';
                   }
                 }
-              }).catch(() => {});
+              }).catch(() => { });
             }
           }
         })
@@ -4958,7 +4958,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
                     if (countSpan) countSpan.textContent = target.formattedComments || target.commentCount || '0';
                   }
                 }
-              }).catch(() => {});
+              }).catch(() => { });
             }
           }
         })
@@ -5603,7 +5603,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         if (myId) {
           this.onlineUserIds.add(myId.toString());
         }
-      }).catch(() => {});
+      }).catch(() => { });
     },
 
     init() {
@@ -5720,7 +5720,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
   function formatConversationPreviewText(lastMsg, secretKey) {
     if (!lastMsg) return 'Start chatting...';
     const effectiveMediaType = (lastMsg.mediaType || lastMsg.media_type || (lastMsg.attachment && lastMsg.attachment.file_type) || '').toLowerCase();
-    
+
     if (effectiveMediaType === 'image' || effectiveMediaType.includes('image')) {
       return '📷 Photo';
     }
@@ -5770,7 +5770,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           decrypted = parsed.text;
         }
       }
-    } catch (e) {}
+    } catch (e) { }
 
     // Strip any remaining HTML tags from preview text
     const cleanText = decrypted.replace(/<[^>]*>/g, '').trim();
@@ -6141,7 +6141,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         const cleanPath = trimmed.replace(/^\/?(chat-media|chat-attachments)\//, '');
         const { data } = window.supabase.storage.from('chat-media').getPublicUrl(cleanPath);
         if (data?.publicUrl) return data.publicUrl;
-      } catch (_) {}
+      } catch (_) { }
     }
 
     return trimmed;
@@ -6244,8 +6244,8 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     const time = validDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     // Robust sender ID resolution
-    const msgSenderId = typeof msg.sender === 'object' 
-      ? (msg.sender._id || msg.sender.id || '') 
+    const msgSenderId = typeof msg.sender === 'object'
+      ? (msg.sender._id || msg.sender.id || '')
       : (msg.sender || msg.sender_id || '');
 
     const isSent = msgSenderId.toString() === currentUserId.toString();
@@ -6657,14 +6657,14 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
   async function markMessagesAsRead(targetUserId) {
     const token = getAuthToken();
     if (!token) return;
-    
+
     // Optimistically update local state immediately
     const threadIndex = chatThreads.findIndex(t => t.user && (t.user._id === targetUserId || t.user.id === targetUserId));
     if (threadIndex !== -1 && chatThreads[threadIndex].unreadCount > 0) {
       chatThreads[threadIndex].unreadCount = 0;
       renderChatThreadsList();
     }
-    
+
     try {
       await fetch(`${API_URL}/api/chats/${targetUserId}/read`, {
         method: 'POST',
@@ -6943,7 +6943,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (dmCameraStream) {
       try {
         dmCameraStream.getTracks().forEach(t => t.stop());
-      } catch (e) {}
+      } catch (e) { }
       dmCameraStream = null;
     }
 
@@ -7011,7 +7011,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
 
   async function switchDMCamera() {
     if (dmIsRecording) return;
-    
+
     // Check available devices gracefully
     try {
       if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
@@ -7026,7 +7026,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     }
 
     dmCurrentFacingMode = (dmCurrentFacingMode === 'user') ? 'environment' : 'user';
-    
+
     // Front camera defaults to mirrored ON; Rear camera defaults to mirrored OFF
     if (dmCurrentFacingMode === 'environment') {
       dmIsMirrored = false;
@@ -7067,7 +7067,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
   function resetDMCameraUI() {
     dmTempCapturedImage = null;
     if (dmTempRecordedUrl) {
-      try { URL.revokeObjectURL(dmTempRecordedUrl); } catch(e) {}
+      try { URL.revokeObjectURL(dmTempRecordedUrl); } catch (e) { }
       dmTempRecordedUrl = null;
     }
     dmTempRecordedBlob = null;
@@ -7100,7 +7100,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
 
     if (dmCameraVideo) {
       dmCameraVideo.style.display = 'block';
-      try { dmCameraVideo.play(); } catch(e) {}
+      try { dmCameraVideo.play(); } catch (e) { }
     }
 
     if (dmCameraModeBar) dmCameraModeBar.style.display = 'flex';
@@ -7152,13 +7152,13 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     }
 
     if (dmIsRecording && dmMediaRecorder) {
-      try { dmMediaRecorder.stop(); } catch(e) {}
+      try { dmMediaRecorder.stop(); } catch (e) { }
     }
 
     if (dmCameraStream) {
       try {
         dmCameraStream.getTracks().forEach(track => track.stop());
-      } catch(e) {}
+      } catch (e) { }
       dmCameraStream = null;
     }
 
@@ -7337,7 +7337,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (dmCameraRecordAction) dmCameraRecordAction.classList.remove('recording');
 
     if (dmMediaRecorder.state !== 'inactive') {
-      try { dmMediaRecorder.stop(); } catch(e) {}
+      try { dmMediaRecorder.stop(); } catch (e) { }
     }
   }
 
@@ -7345,7 +7345,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     const mimeType = (dmMediaRecorder && dmMediaRecorder.mimeType) ? dmMediaRecorder.mimeType : 'video/webm';
     dmTempRecordedBlob = new Blob(dmRecordedChunks, { type: mimeType });
     if (dmTempRecordedUrl) {
-      try { URL.revokeObjectURL(dmTempRecordedUrl); } catch(e) {}
+      try { URL.revokeObjectURL(dmTempRecordedUrl); } catch (e) { }
     }
     dmTempRecordedUrl = URL.createObjectURL(dmTempRecordedBlob);
 
@@ -7630,7 +7630,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         followingHubbersCache = await res.json();
         return followingHubbersCache;
       }
-    } catch(err) {
+    } catch (err) {
       console.error(err);
     }
     return [];
@@ -7644,7 +7644,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       hubberSearchDropdown.classList.add('active');
       return;
     }
-    
+
     users.forEach(u => {
       const item = document.createElement('div');
       item.className = 'hubber-dropdown-item';
@@ -7672,12 +7672,12 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       const query = inboxSearchInput.value.trim().toLowerCase();
       if (!query) {
         if (users.length === 0) {
-           if(hubberSearchDropdown) {
-              hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">You\'re not following anyone yet.</div>';
-              hubberSearchDropdown.classList.add('active');
-           }
+          if (hubberSearchDropdown) {
+            hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">You\'re not following anyone yet.</div>';
+            hubberSearchDropdown.classList.add('active');
+          }
         } else {
-           renderHubberDropdown(users);
+          renderHubberDropdown(users);
         }
       } else {
         const filtered = users.filter(u => (u.fullName || '').toLowerCase().includes(query) || (u.username || '').toLowerCase().includes(query));
@@ -7693,15 +7693,15 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       // Update Dropdown
       const users = await fetchFollowingHubbers();
       const query = inboxSearchInput.value.trim().toLowerCase();
-      
+
       if (!query) {
         if (users.length === 0) {
-           if(hubberSearchDropdown) {
-              hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">You\'re not following anyone yet.</div>';
-              hubberSearchDropdown.classList.add('active');
-           }
+          if (hubberSearchDropdown) {
+            hubberSearchDropdown.innerHTML = '<div class="hubber-dropdown-empty">You\'re not following anyone yet.</div>';
+            hubberSearchDropdown.classList.add('active');
+          }
         } else {
-           renderHubberDropdown(users);
+          renderHubberDropdown(users);
         }
       } else {
         const filtered = users.filter(u => (u.fullName || '').toLowerCase().includes(query) || (u.username || '').toLowerCase().includes(query));
@@ -7807,10 +7807,10 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     } else {
       if (chatGlobalFooter) chatGlobalFooter.style.display = 'flex';
       if (window.audioState && window.audioState.isCallActive) {
-        try { endAudioCall(); } catch(_) {}
+        try { endAudioCall(); } catch (_) { }
       }
       if (window.videoState && window.videoState.isCallActive) {
-        try { endVideoCall(); } catch(_) {}
+        try { endVideoCall(); } catch (_) { }
       }
       const watchVideo = document.getElementById('watch-together-video');
       if (watchVideo && modeName !== 'watch') {
@@ -7899,7 +7899,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     }
 
     const reader = new FileReader();
-    reader.onload = function(evt) {
+    reader.onload = function (evt) {
       const dataUrl = evt.target.result;
       pendingImageAttachment = {
         file,
@@ -8858,7 +8858,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (activeAudioStream) {
       try {
         activeAudioStream.getTracks().forEach(track => track.stop());
-      } catch (_) {}
+      } catch (_) { }
       activeAudioStream = null;
     }
   }
@@ -8871,7 +8871,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (tempAudioObjectUrl) {
       try {
         URL.revokeObjectURL(tempAudioObjectUrl);
-      } catch (_) {}
+      } catch (_) { }
       tempAudioObjectUrl = null;
     }
     if (voiceNotePreviewAudio) {
@@ -8938,7 +8938,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           tempVoiceNoteBlob = audioBlob;
 
           if (tempAudioObjectUrl) {
-            try { URL.revokeObjectURL(tempAudioObjectUrl); } catch (_) {}
+            try { URL.revokeObjectURL(tempAudioObjectUrl); } catch (_) { }
           }
           tempAudioObjectUrl = URL.createObjectURL(audioBlob);
 
@@ -10028,8 +10028,8 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
               renderShareCards(cachedShareUsers, key, modal, shareList);
               return;
             }
-            const filteredHubbies = cachedShareUsers.filter(u => 
-              (u.fullName || '').toLowerCase().includes(query.toLowerCase()) || 
+            const filteredHubbies = cachedShareUsers.filter(u =>
+              (u.fullName || '').toLowerCase().includes(query.toLowerCase()) ||
               (u.username || '').toLowerCase().includes(query.toLowerCase())
             );
             renderShareCards(filteredHubbies, key, modal, shareList);
@@ -10244,154 +10244,154 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     }
   }
 
-      // Multi-Share submission logic
-      document.addEventListener('click', async (e) => {
-        const submitBtn = e.target.closest('.multi-share-submit-btn');
-        if (submitBtn && currentShareSelection.size > 0 && currentShareKey) {
-          e.preventDefault();
-          e.stopPropagation();
+  // Multi-Share submission logic
+  document.addEventListener('click', async (e) => {
+    const submitBtn = e.target.closest('.multi-share-submit-btn');
+    if (submitBtn && currentShareSelection.size > 0 && currentShareKey) {
+      e.preventDefault();
+      e.stopPropagation();
 
-          const token = localStorage.getItem('invibe_jwt_token');
-          const currentUser = getCurrentUser();
-          const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
-          if (!currentUser || !token) return;
+      const token = localStorage.getItem('invibe_jwt_token');
+      const currentUser = getCurrentUser();
+      const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+      if (!currentUser || !token) return;
 
-          const originalContent = submitBtn.innerHTML;
-          submitBtn.disabled = true;
-          submitBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 14px; height: 14px;"></i>`;
-          lucide.createIcons({ icons: { loader: window.lucide.icons.Loader } });
+      const originalContent = submitBtn.innerHTML;
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 14px; height: 14px;"></i>`;
+      lucide.createIcons({ icons: { loader: window.lucide.icons.Loader } });
 
-          try {
-            const key = currentShareKey;
-            const isStory = key.startsWith('story_');
-            const isReel = key.startsWith('reel_') || key.startsWith('reel');
-            const isPost = key.startsWith('post_');
-            const rawId = key.replace(/^(story_|reel_|post_)/, '');
+      try {
+        const key = currentShareKey;
+        const isStory = key.startsWith('story_');
+        const isReel = key.startsWith('reel_') || key.startsWith('reel');
+        const isPost = key.startsWith('post_');
+        const rawId = key.replace(/^(story_|reel_|post_)/, '');
 
-            let hubPayload = {
-              text: isStory ? 'Shared a Hub Story' : (isReel ? 'Shared a Reel' : 'Shared a Post'),
-              hubType: isStory ? 'story' : (isReel ? 'reel' : 'post'),
-              hubId: rawId,
-              thumbnail: '',
-              isVideo: false,
-              authorName: currentUser.fullName || currentUser.username || 'Hubber',
-              authorAvatar: currentUser.profileImage || '',
-              timestamp: new Date().toISOString()
-            };
+        let hubPayload = {
+          text: isStory ? 'Shared a Hub Story' : (isReel ? 'Shared a Reel' : 'Shared a Post'),
+          hubType: isStory ? 'story' : (isReel ? 'reel' : 'post'),
+          hubId: rawId,
+          thumbnail: '',
+          isVideo: false,
+          authorName: currentUser.fullName || currentUser.username || 'Hubber',
+          authorAvatar: currentUser.profileImage || '',
+          timestamp: new Date().toISOString()
+        };
 
-            if (isStory && state.storyGroups) {
-              state.storyGroups.forEach(g => {
-                (g.stories || []).forEach(s => {
-                  if (s._id === rawId || ('story_' + s._id) === key) {
-                    hubPayload.thumbnail = s.img || '';
-                    hubPayload.authorName = s.name || hubPayload.authorName;
-                    hubPayload.authorAvatar = s.avatar || '';
-                    hubPayload.text = s.caption ? `Shared a Hub: "${s.caption}"` : 'Shared a Hub Story';
-                  }
-                });
-              });
-            }
-
-            if (isPost) {
-              let postObj = null;
-              if (window.feedPosts) {
-                postObj = window.feedPosts.find(p => p._id === rawId);
+        if (isStory && state.storyGroups) {
+          state.storyGroups.forEach(g => {
+            (g.stories || []).forEach(s => {
+              if (s._id === rawId || ('story_' + s._id) === key) {
+                hubPayload.thumbnail = s.img || '';
+                hubPayload.authorName = s.name || hubPayload.authorName;
+                hubPayload.authorAvatar = s.avatar || '';
+                hubPayload.text = s.caption ? `Shared a Hub: "${s.caption}"` : 'Shared a Hub Story';
               }
-              if (!postObj) {
-                try {
-                  const res = await fetch(`${API_URL}/api/posts/${rawId}`, {
-                    headers: { 'Authorization': `Bearer ${token}` }
-                  });
-                  if (res.ok) {
-                    postObj = await res.json();
-                  }
-                } catch (err) {
-                  console.error("Error fetching post for sharing:", err);
-                }
-              }
-
-              if (postObj) {
-                let thumbnail = '';
-                let isVideo = false;
-                if (postObj.mediaItems && postObj.mediaItems.length > 0) {
-                  thumbnail = postObj.mediaItems[0].url || '';
-                  isVideo = postObj.mediaItems[0].type === 'video';
-                } else if (postObj.mediaUrl) {
-                  thumbnail = postObj.mediaUrl;
-                  isVideo = postObj.mediaType === 'video';
-                }
-                hubPayload.thumbnail = thumbnail;
-                hubPayload.isVideo = isVideo;
-                hubPayload.authorName = postObj.author?.fullName || postObj.author?.username || 'Hubber';
-                hubPayload.authorAvatar = postObj.author?.profileImage || '';
-                hubPayload.text = postObj.caption ? `Shared a Post: "${postObj.caption}"` : 'Shared a Post';
-              }
-            }
-
-            if (isReel) {
-              let reelObj = null;
-              if (window.feedReels) {
-                reelObj = window.feedReels.find(r => (r._id || r.id || '').toString() === rawId.toString());
-              }
-              if (reelObj) {
-                hubPayload.thumbnail = reelObj.videoUrl || '';
-                hubPayload.isVideo = true;
-                hubPayload.authorName = reelObj.author?.fullName || reelObj.author?.username || 'Hubber';
-                hubPayload.authorAvatar = reelObj.author?.profileImage || '';
-                hubPayload.text = reelObj.caption ? `Shared a Reel: "${reelObj.caption}"` : 'Shared a Reel';
-              }
-            }
-
-            const payloadString = JSON.stringify(hubPayload);
-            let successCount = 0;
-            const promises = Array.from(currentShareSelection.values()).map(async (u) => {
-              const secretKey = getChatSecretKey(currentUserId, u._id);
-              const encryptedText = encryptMessage(payloadString, secretKey);
-              
-              const sendRes = await fetch(`${API_URL}/api/chats/message`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${token}`
-                },
-                body: JSON.stringify({
-                  recipient: u._id,
-                  content: encryptedText,
-                  mediaUrl: key,
-                  mediaType: 'hub',
-                  mediaName: isStory ? 'Shared Hub Story' : (isReel ? 'Shared Reel' : 'Shared Post'),
-                  mediaSize: 'Link'
-                })
-              });
-              
-              if (sendRes.ok) successCount++;
             });
+          });
+        }
 
-            await Promise.allSettled(promises);
-            
-            if (successCount > 0) {
-              showToast(`Shared successfully to ${successCount} Hubbie${successCount > 1 ? 's' : ''}! ✈️`);
-            } else {
-              showToast('Failed to share item.');
+        if (isPost) {
+          let postObj = null;
+          if (window.feedPosts) {
+            postObj = window.feedPosts.find(p => p._id === rawId);
+          }
+          if (!postObj) {
+            try {
+              const res = await fetch(`${API_URL}/api/posts/${rawId}`, {
+                headers: { 'Authorization': `Bearer ${token}` }
+              });
+              if (res.ok) {
+                postObj = await res.json();
+              }
+            } catch (err) {
+              console.error("Error fetching post for sharing:", err);
             }
+          }
 
-            const modal = submitBtn.closest('.story-viewer-overlay');
-            if (modal) modal.classList.remove('active');
-            currentShareSelection.clear();
-            currentShareKey = null;
-
-            loadChatThreads();
-            // Not doing specific fetchMessages unless single share but this is fine
-
-          } catch (err) {
-            console.error('Error in multi-share:', err);
-            showToast('Failed to share item.');
-          } finally {
-            submitBtn.disabled = false;
-            submitBtn.innerHTML = originalContent;
+          if (postObj) {
+            let thumbnail = '';
+            let isVideo = false;
+            if (postObj.mediaItems && postObj.mediaItems.length > 0) {
+              thumbnail = postObj.mediaItems[0].url || '';
+              isVideo = postObj.mediaItems[0].type === 'video';
+            } else if (postObj.mediaUrl) {
+              thumbnail = postObj.mediaUrl;
+              isVideo = postObj.mediaType === 'video';
+            }
+            hubPayload.thumbnail = thumbnail;
+            hubPayload.isVideo = isVideo;
+            hubPayload.authorName = postObj.author?.fullName || postObj.author?.username || 'Hubber';
+            hubPayload.authorAvatar = postObj.author?.profileImage || '';
+            hubPayload.text = postObj.caption ? `Shared a Post: "${postObj.caption}"` : 'Shared a Post';
           }
         }
-      });
+
+        if (isReel) {
+          let reelObj = null;
+          if (window.feedReels) {
+            reelObj = window.feedReels.find(r => (r._id || r.id || '').toString() === rawId.toString());
+          }
+          if (reelObj) {
+            hubPayload.thumbnail = reelObj.videoUrl || '';
+            hubPayload.isVideo = true;
+            hubPayload.authorName = reelObj.author?.fullName || reelObj.author?.username || 'Hubber';
+            hubPayload.authorAvatar = reelObj.author?.profileImage || '';
+            hubPayload.text = reelObj.caption ? `Shared a Reel: "${reelObj.caption}"` : 'Shared a Reel';
+          }
+        }
+
+        const payloadString = JSON.stringify(hubPayload);
+        let successCount = 0;
+        const promises = Array.from(currentShareSelection.values()).map(async (u) => {
+          const secretKey = getChatSecretKey(currentUserId, u._id);
+          const encryptedText = encryptMessage(payloadString, secretKey);
+
+          const sendRes = await fetch(`${API_URL}/api/chats/message`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+              recipient: u._id,
+              content: encryptedText,
+              mediaUrl: key,
+              mediaType: 'hub',
+              mediaName: isStory ? 'Shared Hub Story' : (isReel ? 'Shared Reel' : 'Shared Post'),
+              mediaSize: 'Link'
+            })
+          });
+
+          if (sendRes.ok) successCount++;
+        });
+
+        await Promise.allSettled(promises);
+
+        if (successCount > 0) {
+          showToast(`Shared successfully to ${successCount} Hubbie${successCount > 1 ? 's' : ''}! ✈️`);
+        } else {
+          showToast('Failed to share item.');
+        }
+
+        const modal = submitBtn.closest('.story-viewer-overlay');
+        if (modal) modal.classList.remove('active');
+        currentShareSelection.clear();
+        currentShareKey = null;
+
+        loadChatThreads();
+        // Not doing specific fetchMessages unless single share but this is fine
+
+      } catch (err) {
+        console.error('Error in multi-share:', err);
+        showToast('Failed to share item.');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalContent;
+      }
+    }
+  });
 
   // Share trigger click
   document.addEventListener('click', async (e) => {
@@ -11392,7 +11392,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       const card = btnElement.closest('.reel-card');
       const video = card ? card.querySelector('video') : null;
       const starIcon = btnElement.querySelector('i, svg');
-      
+
       if (data.isSaved) {
         btnElement.classList.add('saved');
         if (starIcon) {
@@ -11415,7 +11415,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
         window.savedHubbs = window.savedHubbs.filter(s => s.id !== reelId);
         showToast('Reel removed from bookmarks.');
       }
-      
+
       const savedGrid = document.getElementById('profile-saved-grid');
       if (savedGrid && savedGrid.classList.contains('active')) {
         if (typeof window.fetchSavedHubbs === 'function') {
@@ -11988,7 +11988,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             renderModalHubbersList(cachedSuggestedHubbers);
             return;
           }
-          const filtered = cachedSuggestedHubbers.filter(u => 
+          const filtered = cachedSuggestedHubbers.filter(u =>
             (u.fullName && u.fullName.toLowerCase().includes(q)) ||
             (u.username && u.username.toLowerCase().includes(q))
           );
@@ -12197,12 +12197,12 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (mainContent) {
       const mainContentRect = mainContent.getBoundingClientRect();
       const nextCardRect = nextCard.getBoundingClientRect();
-      
+
       const header = document.querySelector('#view-explore .explore-header-row');
       const headerHeight = header ? header.offsetHeight : 0;
-      
+
       const targetScrollTop = nextCardRect.top - mainContentRect.top + mainContent.scrollTop - headerHeight - 8;
-      
+
       mainContent.scrollTo({
         top: targetScrollTop,
         behavior: 'smooth'
@@ -12247,7 +12247,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             if (isCurrentlyFullscreen) {
               exitReelFullscreen();
             }
-            
+
             const scroller = video.closest('.reels-scroller');
             if (scroller) {
               const cards = Array.from(scroller.querySelectorAll('.reel-card'));
@@ -12535,13 +12535,13 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
               if (mainContent) {
                 const mainContentRect = mainContent.getBoundingClientRect();
                 const nextCardRect = nextCard.getBoundingClientRect();
-                
+
                 // Get header offset dynamically if it exists (e.g. on Explore/Hubbing page)
                 const header = document.querySelector('#view-explore .explore-header-row');
                 const headerHeight = header ? header.offsetHeight : 0;
-                
+
                 const targetScrollTop = nextCardRect.top - mainContentRect.top + mainContent.scrollTop - headerHeight - 8;
-                
+
                 mainContent.scrollTo({
                   top: targetScrollTop,
                   behavior: 'smooth'
@@ -12556,39 +12556,39 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       if (moreBtn) {
         // Ensure z-index is set high to sit above any bottom nav zones
         moreBtn.style.cssText = "position: relative; z-index: 10 !important;";
-        
+
         moreBtn.addEventListener('mousedown', (e) => e.stopPropagation());
         moreBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
         moreBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
-        
+
         moreBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           e.preventDefault();
-          
+
           const existingDropdown = moreBtn.querySelector('.reel-action-dropdown');
           if (existingDropdown) {
             existingDropdown.remove();
           } else {
             // Close any other open dropdowns
             document.querySelectorAll('.reel-action-dropdown').forEach(d => d.remove());
-            
+
             // Check current fullscreen state
             const isCurrentlyFullscreen = document.fullscreenElement === card || document.webkitFullscreenElement === card;
-            
+
             // Create dropdown menu
             const dropdown = document.createElement('div');
             dropdown.className = 'reel-action-dropdown';
             dropdown.style.cssText = `position: absolute; bottom: 48px; right: 0; background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; padding: 6px; display: flex; flex-direction: column; gap: 4px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 100; min-width: 140px;`;
-            
+
             dropdown.innerHTML = `
               <button class="menu-item copy-link" style="background: none; border: none; color: white; padding: 8px 12px; border-radius: 8px; font-size: 12px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 500; transition: background 0.15s; width: 100%; box-sizing: border-box;"><i data-lucide="copy" style="width: 13px; height: 13px; stroke: white;"></i> Copy Link</button>
               <button class="menu-item toggle-fullscreen" style="background: none; border: none; color: white; padding: 8px 12px; border-radius: 8px; font-size: 12px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 500; transition: background 0.15s; width: 100%; box-sizing: border-box;"><i data-lucide="${isCurrentlyFullscreen ? 'minimize' : 'maximize'}" style="width: 13px; height: 13px; stroke: white;"></i> ${isCurrentlyFullscreen ? 'Exit Full Screen' : 'Full Screen'}</button>
               <button class="menu-item toggle-autoplay" style="background: none; border: none; color: white; padding: 8px 12px; border-radius: 8px; font-size: 12px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 500; transition: background 0.15s; width: 100%; box-sizing: border-box;"><i data-lucide="play-circle" style="width: 13px; height: 13px; stroke: white;"></i> Autoplay${window.reelsAutoplay ? ' ✓' : ''}</button>
             `;
-            
+
             moreBtn.appendChild(dropdown);
             if (window.debouncedCreateIcons) window.debouncedCreateIcons();
-            
+
             // 1. Copy Link Click
             const copyLinkBtn = dropdown.querySelector('.copy-link');
             if (copyLinkBtn) {
@@ -12599,7 +12599,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
                 copyReelLink(reelId);
               });
             }
-            
+
             // 2. Full Screen Click
             const fsBtn = dropdown.querySelector('.toggle-fullscreen');
             if (fsBtn) {
@@ -12614,7 +12614,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
                 }
               });
             }
-            
+
             // 3. Autoplay Click
             const apBtn = dropdown.querySelector('.toggle-autoplay');
             if (apBtn) {
@@ -12831,7 +12831,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             `;
             const video = item.querySelector('video');
             if (video) {
-              item.addEventListener('mouseenter', () => video.play().catch(() => {}));
+              item.addEventListener('mouseenter', () => video.play().catch(() => { }));
               item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
             }
             reelsGrid.appendChild(item);
@@ -12858,7 +12858,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             `;
             const video = item.querySelector('video');
             if (video) {
-              item.addEventListener('mouseenter', () => video.play().catch(() => {}));
+              item.addEventListener('mouseenter', () => video.play().catch(() => { }));
               item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
             }
             taggedGrid.appendChild(item);
@@ -13236,19 +13236,19 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
   window.renderSavedHubbs = renderSavedHubbs;
   async function renderSavedHubbs() {
     const savedGrid = document.getElementById('profile-saved-grid');
-      if (!savedGrid) return;
+    if (!savedGrid) return;
 
-      if (typeof window.fetchSavedHubbs === 'function') {
-        await window.fetchSavedHubbs();
-      }
+    if (typeof window.fetchSavedHubbs === 'function') {
+      await window.fetchSavedHubbs();
+    }
 
-      if (!window.activeSavedFilter) {
-        window.activeSavedFilter = 'posts';
-      }
+    if (!window.activeSavedFilter) {
+      window.activeSavedFilter = 'posts';
+    }
 
-      let wrapper = savedGrid.querySelector('.saved-hubbs-wrapper');
-      if (!wrapper) {
-        savedGrid.innerHTML = `
+    let wrapper = savedGrid.querySelector('.saved-hubbs-wrapper');
+    if (!wrapper) {
+      savedGrid.innerHTML = `
           <div class="saved-hubbs-wrapper" style="grid-column: 1 / -1; width: 100%; display: flex; flex-direction: column; gap: 16px;">
             <!-- Header -->
             <div class="saved-hubbs-header" style="margin-bottom: 8px;">
@@ -13273,85 +13273,85 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
             </div>
           </div>
         `;
-        
-        wrapper = savedGrid.querySelector('.saved-hubbs-wrapper');
 
-        const postsBtn = wrapper.querySelector('#saved-filter-posts');
-        const reelsBtn = wrapper.querySelector('#saved-filter-reels');
-
-        postsBtn.addEventListener('click', () => {
-          window.activeSavedFilter = 'posts';
-          renderSavedHubbs();
-        });
-
-        reelsBtn.addEventListener('click', () => {
-          window.activeSavedFilter = 'reels';
-          renderSavedHubbs();
-        });
-      }
+      wrapper = savedGrid.querySelector('.saved-hubbs-wrapper');
 
       const postsBtn = wrapper.querySelector('#saved-filter-posts');
       const reelsBtn = wrapper.querySelector('#saved-filter-reels');
-      const postsContainer = wrapper.querySelector('#saved-posts-container');
-      const reelsContainer = wrapper.querySelector('#saved-reels-container');
-      const reelsScroller = reelsContainer.querySelector('.reels-scroller');
 
-      if (window.activeSavedFilter === 'posts') {
-        postsBtn.classList.add('active');
-        reelsBtn.classList.remove('active');
-        postsContainer.style.display = 'grid';
-        reelsContainer.style.display = 'none';
+      postsBtn.addEventListener('click', () => {
+        window.activeSavedFilter = 'posts';
+        renderSavedHubbs();
+      });
 
-        postsContainer.innerHTML = '';
-        const savedPosts = (window.savedHubbs || []).filter(item => !item.isReel);
-        
-        if (savedPosts.length === 0) {
-          postsContainer.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved posts yet.</div>';
-        } else {
-          savedPosts.forEach(post => {
-            const item = document.createElement('div');
-            item.className = 'profile-grid-item';
-            item.style.cursor = 'pointer';
-            item.innerHTML = `
+      reelsBtn.addEventListener('click', () => {
+        window.activeSavedFilter = 'reels';
+        renderSavedHubbs();
+      });
+    }
+
+    const postsBtn = wrapper.querySelector('#saved-filter-posts');
+    const reelsBtn = wrapper.querySelector('#saved-filter-reels');
+    const postsContainer = wrapper.querySelector('#saved-posts-container');
+    const reelsContainer = wrapper.querySelector('#saved-reels-container');
+    const reelsScroller = reelsContainer.querySelector('.reels-scroller');
+
+    if (window.activeSavedFilter === 'posts') {
+      postsBtn.classList.add('active');
+      reelsBtn.classList.remove('active');
+      postsContainer.style.display = 'grid';
+      reelsContainer.style.display = 'none';
+
+      postsContainer.innerHTML = '';
+      const savedPosts = (window.savedHubbs || []).filter(item => !item.isReel);
+
+      if (savedPosts.length === 0) {
+        postsContainer.innerHTML = '<div class="profile-grid-empty" style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved posts yet.</div>';
+      } else {
+        savedPosts.forEach(post => {
+          const item = document.createElement('div');
+          item.className = 'profile-grid-item';
+          item.style.cursor = 'pointer';
+          item.innerHTML = `
               <img src="${post.mediaUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=800&q=80'}" alt="Hub" />
               <div class="profile-grid-item-overlay">
                 <span><i data-lucide="heart"></i> ${(post.likes || []).length}</span>
                 <span><i data-lucide="message-square"></i> ${(post.comments || []).length}</span>
               </div>
             `;
-            item.addEventListener('click', () => {
-              openProfilePostViewer(post);
-            });
-            postsContainer.appendChild(item);
+          item.addEventListener('click', () => {
+            openProfilePostViewer(post);
           });
-        }
+          postsContainer.appendChild(item);
+        });
+      }
+    } else {
+      postsBtn.classList.remove('active');
+      reelsBtn.classList.add('active');
+      postsContainer.style.display = 'none';
+      reelsContainer.style.display = 'flex';
+
+      reelsScroller.innerHTML = '';
+      const savedReels = (window.savedHubbs || []).filter(item => item.isReel);
+
+      if (savedReels.length === 0) {
+        reelsScroller.innerHTML = '<div class="profile-grid-empty" style="text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved reels yet.</div>';
       } else {
-        postsBtn.classList.remove('active');
-        reelsBtn.classList.add('active');
-        postsContainer.style.display = 'none';
-        reelsContainer.style.display = 'flex';
+        savedReels.forEach(reel => {
+          const authorName = reel.author ? (reel.author.fullName || reel.author.username || 'Hubble User') : 'Hubble User';
+          const authorUser = reel.author ? (reel.author.username || 'hubble_user') : 'hubble_user';
+          const authorAvatar = reel.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
 
-        reelsScroller.innerHTML = '';
-        const savedReels = (window.savedHubbs || []).filter(item => item.isReel);
+          const captionText = reel.caption || '';
+          const captionHtml = captionText.replace(/#(\w+)/g, '<span style="color:#c084fc; font-weight:600;">#$1</span>');
+          const isReelSaved = true;
 
-        if (savedReels.length === 0) {
-          reelsScroller.innerHTML = '<div class="profile-grid-empty" style="text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;">No saved reels yet.</div>';
-        } else {
-          savedReels.forEach(reel => {
-            const authorName = reel.author ? (reel.author.fullName || reel.author.username || 'Hubble User') : 'Hubble User';
-            const authorUser = reel.author ? (reel.author.username || 'hubble_user') : 'hubble_user';
-            const authorAvatar = reel.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
+          const card = document.createElement('div');
+          card.className = 'reel-card';
+          card.setAttribute('data-reel-id', reel._id || reel.id);
+          card.style.cssText = `position: relative; width: 100%; height: 640px; margin: 0 auto 24px auto; border-radius: 18px; overflow: hidden; background: #000; box-shadow: 0 12px 35px rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.12); box-sizing: border-box;`;
 
-            const captionText = reel.caption || '';
-            const captionHtml = captionText.replace(/#(\w+)/g, '<span style="color:#c084fc; font-weight:600;">#$1</span>');
-            const isReelSaved = true;
-
-            const card = document.createElement('div');
-            card.className = 'reel-card';
-            card.setAttribute('data-reel-id', reel._id || reel.id);
-            card.style.cssText = `position: relative; width: 100%; height: 640px; margin: 0 auto 24px auto; border-radius: 18px; overflow: hidden; background: #000; box-shadow: 0 12px 35px rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.12); box-sizing: border-box;`;
-
-            card.innerHTML = `
+          card.innerHTML = `
               <video data-src="${reel.videoUrl}" loop muted playsinline preload="none" class="reel-video" style="width:100%; height:100%; object-fit:cover; display:block;"></video>
               
               <div class="reel-play-icon-overlay" style="cursor: pointer; z-index: 4;">
@@ -13472,24 +13472,24 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
               </div>
             `;
 
-            const video = card.querySelector('.reel-video');
-            if (video) {
-              video.addEventListener('error', () => {
-                console.error('[HUBBING PLAYER] Saved reel ERROR reelId=' + (reel._id || reel.id), video.error);
-                card.setAttribute('data-reel-failed', 'true');
-                const overlay = card.querySelector('.reel-play-icon-overlay');
-                if (overlay) overlay.innerHTML = '<span style="color:rgba(255,255,255,0.6);font-size:12px;">Video unavailable</span>';
-              });
-            }
+          const video = card.querySelector('.reel-video');
+          if (video) {
+            video.addEventListener('error', () => {
+              console.error('[HUBBING PLAYER] Saved reel ERROR reelId=' + (reel._id || reel.id), video.error);
+              card.setAttribute('data-reel-failed', 'true');
+              const overlay = card.querySelector('.reel-play-icon-overlay');
+              if (overlay) overlay.innerHTML = '<span style="color:rgba(255,255,255,0.6);font-size:12px;">Video unavailable</span>';
+            });
+          }
 
-            reelsScroller.appendChild(card);
-          });
-          wireReelInteractions(reelsScroller);
-        }
+          reelsScroller.appendChild(card);
+        });
+        wireReelInteractions(reelsScroller);
       }
-
-      if (window.debouncedCreateIcons) window.debouncedCreateIcons();
     }
+
+    if (window.debouncedCreateIcons) window.debouncedCreateIcons();
+  }
 
   // Bind follow/unfollow action on user profile
   const profileFollowBtn = document.getElementById('profile-follow-btn');
@@ -13814,7 +13814,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           const res = await fetch(`${API_URL}/api/users/search?q=${encodeURIComponent(query)}`, {
             headers: { 'Authorization': `Bearer ${token}` }
           });
-          
+
           if (!res.ok) throw new Error('Search request failed');
           const users = await res.json();
 
@@ -14580,7 +14580,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       console.warn('[DM-RUNTIME] realtime unsubscribe:', Date.now());
       try {
         window.supabase.removeChannel(dmState.realtimeChannel);
-      } catch (_) {}
+      } catch (_) { }
       dmState.realtimeChannel = null;
     }
 
@@ -14658,7 +14658,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
     if (notificationsRealtimeChannel) {
       try {
         window.supabase.removeChannel(notificationsRealtimeChannel);
-      } catch (_) {}
+      } catch (_) { }
       notificationsRealtimeChannel = null;
     }
 
@@ -14673,7 +14673,7 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
           const newNotif = payload.new;
           const oldNotif = payload.old;
           const targetId = ((newNotif && (newNotif.recipient_id || newNotif.user_id)) || (oldNotif && (oldNotif.recipient_id || oldNotif.user_id)) || '').toString();
-          
+
           if (!targetId || targetId === currentUserId) {
             loadNotifications();
             if (payload.eventType === 'INSERT' && newNotif) {
@@ -14882,11 +14882,11 @@ import { initiateVideoCall, endVideoCall, listenForIncomingVideoCalls } from './
       item.addEventListener('click', async (e) => {
         if (e.target.closest('.btn-accept-request, .btn-reject-request')) return;
         e.stopPropagation();
-        
+
         if (item.classList.contains('unread')) {
           item.classList.remove('unread');
           recalcNotificationBadges();
-          
+
           const token = localStorage.getItem('invibe_jwt_token');
           if (token && notif._id) {
             try {
@@ -16803,7 +16803,7 @@ async function createMutedVideoBlob(fileOrBlob) {
       const videoTrack = stream.getVideoTracks()[0];
       const mutedStream = new MediaStream([videoTrack]);
       const mimeType = (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4')) ? 'video/mp4' : 'video/webm';
-      
+
       const chunks = [];
       const recorder = new MediaRecorder(mutedStream, { mimeType });
       recorder.ondataavailable = (e) => {
@@ -16854,7 +16854,7 @@ async function resolveMediaToDataUrl(upload) {
         try {
           const res = await fetch(url);
           fileObj = await res.blob();
-        } catch (_) {}
+        } catch (_) { }
       }
     }
 
@@ -17129,7 +17129,7 @@ async function generateCompositeImageBlob(uploads, layout) {
       canvas.width = 1080;
       canvas.height = 1920;
       const ctx = canvas.getContext('2d');
-      
+
       ctx.fillStyle = '#000000';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -17138,7 +17138,7 @@ async function generateCompositeImageBlob(uploads, layout) {
       else if (layout === 'side-by-side' || uploads.length === 2) { cols = 2; rows = 1; }
       else if (layout === 'vertical-split') { cols = 1; rows = 2; }
       else if (uploads.length >= 5) { cols = 2; rows = Math.ceil(uploads.length / 2); }
-      else if (uploads.length === 3) { cols = 2; rows = 2; } 
+      else if (uploads.length === 3) { cols = 2; rows = 2; }
 
       const gap = 15;
       const totalGapX = gap * (cols - 1);
@@ -17150,7 +17150,7 @@ async function generateCompositeImageBlob(uploads, layout) {
       for (let i = 0; i < uploads.length; i++) {
         const url = await resolveMediaToDataUrl(uploads[i]);
         if (!url) continue;
-        
+
         const img = new Image();
         await new Promise((res) => {
           img.onload = res;
@@ -17163,7 +17163,7 @@ async function generateCompositeImageBlob(uploads, layout) {
       images.forEach((img, idx) => {
         if (!img.width) return;
         let row, col, w, h, cx, cy;
-        
+
         if (uploads.length === 3 && idx === 0) {
           col = 0; row = 0;
           w = canvas.width; h = cellH;
@@ -17182,22 +17182,22 @@ async function generateCompositeImageBlob(uploads, layout) {
         const imgRatio = img.width / img.height;
         const cellRatio = w / h;
         let sx, sy, sw, sh;
-        
+
         if (imgRatio > cellRatio) {
-           sh = img.height;
-           sw = img.height * cellRatio;
-           sx = (img.width - sw) / 2;
-           sy = 0;
+          sh = img.height;
+          sw = img.height * cellRatio;
+          sx = (img.width - sw) / 2;
+          sy = 0;
         } else {
-           sw = img.width;
-           sh = img.width / cellRatio;
-           sx = 0;
-           sy = (img.height - sh) / 2;
+          sw = img.width;
+          sh = img.width / cellRatio;
+          sx = 0;
+          sy = (img.height - sh) / 2;
         }
 
         ctx.drawImage(img, sx, sy, sw, sh, cx, cy, w, h);
       });
-      
+
       canvas.toBlob((blob) => {
         resolve(blob);
       }, 'image/jpeg', 0.95);
@@ -17229,10 +17229,10 @@ window.publishHubb = async function () {
   // Pause any active playback during upload
   const activeVideos = document.querySelectorAll('#review-slider-wrapper video, #he-media-layer video');
   activeVideos.forEach(v => {
-    try { v.pause(); } catch (_) {}
+    try { v.pause(); } catch (_) { }
   });
   if (window.HubbleEditor && window.HubbleEditor.GlobalAudio) {
-    try { window.HubbleEditor.GlobalAudio.pause(); } catch (_) {}
+    try { window.HubbleEditor.GlobalAudio.pause(); } catch (_) { }
   }
 
   const pubBtn = document.getElementById('review-publish-btn');
@@ -17263,24 +17263,24 @@ window.publishHubb = async function () {
 
     // Check if we need to composite images
     const allImages = uploadsToProcess.length > 0 && uploadsToProcess.every(u => {
-       const type = u.type || (u.file ? u.file.type : '');
-       return !type.startsWith('video');
+      const type = u.type || (u.file ? u.file.type : '');
+      return !type.startsWith('video');
     });
 
     if (uploadsToProcess.length > 1 && allImages) {
       console.log('[ShareHubs Publish] Multiple images detected. Generating composite image.');
       if (pubBtn) pubBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 18px; height: 18px;"></i> Compositing...`;
       if (window.lucide) window.lucide.createIcons();
-      
+
       const layout = (window.HubbleEditor && window.HubbleEditor.activeLayout) || 'original';
       const effectiveLayout = window.getEffectiveLayout ? window.getEffectiveLayout(layout, uploadsToProcess) : '2x2-grid';
-      
+
       const compositeBlob = await generateCompositeImageBlob(uploadsToProcess, effectiveLayout);
-      
+
       if (compositeBlob) {
         if (pubBtn) pubBtn.innerHTML = `<i data-lucide="loader" class="animate-spin" style="width: 18px; height: 18px;"></i> ${isScheduled ? 'Scheduling HUB...' : 'Sharing HUB...'}`;
         if (window.lucide) window.lucide.createIcons();
-        
+
         // Wrap into single upload object format
         const compositeUpload = {
           file: compositeBlob,
@@ -17427,7 +17427,7 @@ window.publishHubb = async function () {
           if (window.DraftsDB && window.DraftsDB.deleteDraft) {
             await window.DraftsDB.deleteDraft(window.currentDraftId);
           }
-        } catch (_) {}
+        } catch (_) { }
         window.currentDraftId = null;
         window.currentDraftCreatedAt = null;
         if (typeof window.renderDraftsList === 'function') {
