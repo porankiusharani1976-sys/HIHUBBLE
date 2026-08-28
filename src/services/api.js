@@ -1,6 +1,6 @@
 const isCapacitor = !!window.Capacitor;
 const API_URL = isCapacitor
-  ? 'https://hi-hubble-z1qx.vercel.app'
+  ? 'https://hihubble-five.vercel.app'
   : (
     window.location.hostname === 'localhost' ||
     window.location.hostname === '127.0.0.1' ||
