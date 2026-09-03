@@ -162,12 +162,30 @@ body::after {
 
 /* App Container */
 .app-container {
-  display: flex !important;
+  display: flex;
   flex-direction: column;
   height: 100dvh;
   overflow: hidden;
   z-index: 1;
   position: relative;
+}
+
+/* Strict Authentication State DOM Isolation */
+body:not(.logged-in) #app-container,
+body.logged-out #app-container,
+#app-container.auth-hidden {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+body.logged-in #auth-view,
+#auth-view.hidden {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
 /* Typography helpers */

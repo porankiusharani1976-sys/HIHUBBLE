@@ -113,24 +113,52 @@ export async function initAuth() {
   if (tabBtnLogin) tabBtnLogin.addEventListener('click', () => switchTab('login'));
 
   function showAuthView() {
+    document.body.classList.add('logged-out');
+    document.body.classList.remove('logged-in');
     if (authView) {
       authView.classList.remove('hidden');
+      authView.style.removeProperty('display');
       authView.style.display = 'flex';
     }
-    if (appContainer) appContainer.style.display = 'none';
-    switchTab('signup');
+    if (appContainer) {
+      appContainer.classList.add('auth-hidden');
+      appContainer.style.setProperty('display', 'none', 'important');
+    }
+    const homeFeed = document.getElementById('home-feed-posts');
+    if (homeFeed) {
+      homeFeed.innerHTML = '';
+    }
+    switchTab(activeTab || 'signup');
   }
 
   function showAppView() {
     stopWebcam();
+    document.body.classList.add('logged-in');
+    document.body.classList.remove('logged-out');
     if (authView) {
       authView.classList.add('hidden');
-      authView.style.display = 'none';
+      authView.style.setProperty('display', 'none', 'important');
     }
-    if (appContainer) appContainer.style.display = 'block';
+    if (appContainer) {
+      appContainer.classList.remove('auth-hidden');
+      appContainer.style.removeProperty('display');
+      appContainer.style.display = 'flex';
+    }
     updateAppUI();
     window.dispatchEvent(new CustomEvent('auth-changed'));
   }
+
+  // Smooth scroll active input into center view on mobile virtual keyboard popup
+  const authInputs = document.querySelectorAll('#auth-welcome-panel input, #auth-welcome-panel select');
+  authInputs.forEach(input => {
+    input.addEventListener('focus', () => {
+      setTimeout(() => {
+        try {
+          input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } catch (_) {}
+      }, 250);
+    });
+  });
 
   function stopWebcam() {
     if (webcamStream) {

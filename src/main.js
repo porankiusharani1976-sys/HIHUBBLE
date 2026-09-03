@@ -2555,12 +2555,26 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   window.getAuthToken = getAuthToken;
 
+  function isUserAuthenticated() {
+    const isLoggedIn = localStorage.getItem('invibeIsLoggedIn') === 'true';
+    const token = getAuthToken();
+    return Boolean(isLoggedIn && token);
+  }
+  window.isUserAuthenticated = isUserAuthenticated;
+
   initAuth();
-  updateAppUI();
-  window.fetchSavedHubbs();
-  window.addEventListener('auth-changed', () => {
+  if (isUserAuthenticated()) {
     updateAppUI();
     window.fetchSavedHubbs();
+  }
+  window.addEventListener('auth-changed', () => {
+    if (isUserAuthenticated()) {
+      updateAppUI();
+      window.fetchSavedHubbs();
+      if (typeof window.loadFeedPosts === 'function') window.loadFeedPosts();
+      if (typeof window.loadFeedReels === 'function') window.loadFeedReels();
+      if (typeof scheduleBackgroundLoaders === 'function') scheduleBackgroundLoaders();
+    }
   });
 
   function triggerAnimatedLogout() {
@@ -11762,6 +11776,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const FEED_CACHE_TTL = 60 * 1000; // 60 seconds
 
   async function loadFeedPosts(forceRefresh = false) {
+    if (typeof window.isUserAuthenticated === 'function' && !window.isUserAuthenticated()) {
+      return; // Do not fetch or render feed if unauthenticated
+    }
     const feedContainer = document.getElementById('home-feed-posts');
     if (!feedContainer) return;
 
@@ -12437,6 +12454,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const REELS_CACHE_TTL = 120 * 1000; // 2 minutes
 
   async function loadFeedReels(forceRefresh = false) {
+    if (typeof window.isUserAuthenticated === 'function' && !window.isUserAuthenticated()) {
+      return; // Do not fetch or render reels if unauthenticated
+    }
     const scroller = document.querySelector('#explore-reels-container .reels-scroller');
     if (!scroller) return;
 
@@ -16213,62 +16233,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // --- PROGRESSIVE APP INITIALIZATION & DEDUPLICATED BACKGROUND LOADERS ---
-  // 1. Immediately load feed posts for Home view
-  loadFeedPosts();
-
-  // Deduplication flags for secondary background tasks
-  let isProfileStatsLoading = false;
-  let isFollowSuggestionsLoading = false;
-  let isStoriesLoading = false;
-  let isActiveVibersLoading = false;
-  let isNotificationsLoading = false;
-  let _backgroundLoadersTimer = null;
-
-  function scheduleBackgroundLoaders() {
-    if (_backgroundLoadersTimer) {
-      clearTimeout(_backgroundLoadersTimer);
-    }
-    _backgroundLoadersTimer = setTimeout(() => {
-      _backgroundLoadersTimer = null;
-
-      // Stagger non-critical background data loading progressively so initial app shell render is instant (< 20ms)
-      if (!isProfileStatsLoading && typeof loadProfileStats === 'function') {
-        isProfileStatsLoading = true;
-        Promise.resolve(loadProfileStats()).finally(() => { isProfileStatsLoading = false; });
-      }
-
-      setTimeout(() => {
-        if (!isFollowSuggestionsLoading && typeof loadFollowSuggestions === 'function') {
-          isFollowSuggestionsLoading = true;
-          Promise.resolve(loadFollowSuggestions()).finally(() => { isFollowSuggestionsLoading = false; });
-        }
-      }, 150);
-
-      setTimeout(() => {
-        if (!isStoriesLoading && typeof loadStories === 'function') {
-          isStoriesLoading = true;
-          Promise.resolve(loadStories()).finally(() => { isStoriesLoading = false; });
-        }
-      }, 300);
-
-      setTimeout(() => {
-        if (!isActiveVibersLoading && typeof loadActiveVibers === 'function') {
-          isActiveVibersLoading = true;
-          Promise.resolve(loadActiveVibers()).finally(() => { isActiveVibersLoading = false; });
-        }
-      }, 450);
-
-      setTimeout(() => {
-        if (!isNotificationsLoading && typeof loadNotifications === 'function') {
-          isNotificationsLoading = true;
-          Promise.resolve(loadNotifications()).finally(() => { isNotificationsLoading = false; });
-        }
-      }, 600);
-    }, 100);
+  if (isUserAuthenticated()) {
+    loadFeedPosts();
+    scheduleBackgroundLoaders();
   }
-
-  // Schedule background loading after home feed starts rendering
-  scheduleBackgroundLoaders();
 
   // Custom auth reload hook
   window.updateAppUI = function () {
@@ -17090,9 +17058,11 @@ document.addEventListener('DOMContentLoaded', () => {
     loadFollowSuggestions();
   });
 
-  // Initial load once
-  loadNotifications();
-  loadChatThreads();
+  // Initial load once if authenticated
+  if (isUserAuthenticated()) {
+    loadNotifications();
+    loadChatThreads();
+  }
 
   function setupVideoScrollObserver() {
     // 1. Post Media Video Observer (Isolated from Reels)
@@ -21666,11 +21636,13 @@ document.addEventListener('DOMContentLoaded', () => {
     : window.location.origin;
 
   initVideoEditor(api, window.showToast, window.loadFeedReels || window.loadFeed);
-  if (typeof window.loadFeedPosts === 'function') {
-    window.loadFeedPosts();
-  }
-  if (typeof window.loadFeedReels === 'function') {
-    window.loadFeedReels();
+  if (isUserAuthenticated()) {
+    if (typeof window.loadFeedPosts === 'function') {
+      window.loadFeedPosts();
+    }
+    if (typeof window.loadFeedReels === 'function') {
+      window.loadFeedReels();
+    }
   }
 
   // Check for deep-linked Reel on load
