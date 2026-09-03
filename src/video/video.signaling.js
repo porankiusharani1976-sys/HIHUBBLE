@@ -48,7 +48,7 @@ export const videoSignaling = {
   },
 
   sendInitialCallInvite(recipientUserId, callId, initiatorId) {
-    const inviteChannelName = `user-calls-signaling-${recipientUserId}`;
+    const inviteChannelName = `user-video-calls-signaling-${recipientUserId}`;
     console.log(`[Video Signaling] Dispatching initial invite to: ${inviteChannelName}`);
     
     const chan = supabase.channel(inviteChannelName, {
@@ -80,7 +80,7 @@ export const videoSignaling = {
       supabase.removeChannel(inviteChannel);
     }
 
-    const inviteChannelName = `user-calls-signaling-${userId}`;
+    const inviteChannelName = `user-video-calls-signaling-${userId}`;
     console.log(`[Video Signaling] Subscribing to user invite channel: ${inviteChannelName}`);
     
     inviteChannel = supabase.channel(inviteChannelName, {

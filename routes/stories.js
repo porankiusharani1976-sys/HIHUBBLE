@@ -37,6 +37,15 @@ function mapStoryToFrontend(s, likes = [], reqUserId = null) {
     } catch (_) {}
   }
 
+  const cleanMediaUrl = (s.media_url && !s.media_url.trim().toLowerCase().startsWith('blob:')) ? s.media_url : '';
+  const rawItems = (s.mediaItems && s.mediaItems.length > 0) ? s.mediaItems : [{
+    id: s.id,
+    mediaUrl: cleanMediaUrl,
+    mediaType: s.media_type || 'image',
+    displayOrder: 1
+  }];
+  const cleanItems = rawItems.filter(item => item && item.mediaUrl && !item.mediaUrl.trim().toLowerCase().startsWith('blob:'));
+
   return {
     _id: s.id,
     id: s.id,
@@ -47,11 +56,11 @@ function mapStoryToFrontend(s, likes = [], reqUserId = null) {
       username: author.username || 'user',
       profileImage: author.profile_image_url || ''
     },
-    mediaUrl: s.media_url,
+    mediaUrl: cleanMediaUrl,
     mediaType: s.media_type || 'image',
-    mediaItems: s.mediaItems || [{
+    mediaItems: cleanItems.length > 0 ? cleanItems : [{
       id: s.id,
-      mediaUrl: s.media_url,
+      mediaUrl: cleanMediaUrl,
       mediaType: s.media_type || 'image',
       displayOrder: 1
     }],
@@ -75,41 +84,65 @@ function mapStoryToFrontend(s, likes = [], reqUserId = null) {
 }
 
 // Helper to upload media item (base64 or URL) to permanent Supabase Storage
-async function uploadMediaItem(userId, mediaUrl, mediaType) {
-  if (!mediaUrl) return { url: '', type: 'image' };
+async function uploadMediaItem(userId, mediaUrl, mediaType, prefix = 'story') {
+  if (!mediaUrl) return { url: '', type: 'image', storagePath: null, bucket: null };
+
+  // Rule 1: Reject temporary browser blob URLs immediately
+  if (typeof mediaUrl === 'string' && mediaUrl.trim().toLowerCase().startsWith('blob:')) {
+    throw new Error('Browser blob URLs cannot be persisted. Please provide raw base64 or a durable storage URL.');
+  }
+
   let finalMediaUrl = mediaUrl;
   let finalType = mediaType || 'image';
+  let storagePath = null;
+  let bucketName = null;
 
   if (typeof mediaUrl === 'string' && mediaUrl.startsWith('data:')) {
-    try {
-      const matches = mediaUrl.match(/^data:([a-zA-Z0-9\/]+);base64,(.+)$/);
-      if (matches && matches.length === 3) {
-        const mimeType = matches[1];
-        const isVideo = mimeType.startsWith('video');
-        finalType = isVideo ? 'video' : 'image';
-        const base64Data = matches[2];
-        const buffer = Buffer.from(base64Data, 'base64');
-        const ext = mimeType.split('/')[1] || (isVideo ? 'mp4' : 'png');
-        const bucketName = isVideo ? 'post-videos' : 'post-images';
-        const filename = `${userId}/story_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+    const matches = mediaUrl.match(/^data:([a-zA-Z0-9\/\-+.]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      throw new Error('Malformed base64 data URL.');
+    }
 
-        const { error: uploadErr } = await supabase.storage
-          .from(bucketName)
-          .upload(filename, buffer, { contentType: mimeType, upsert: true });
+    const mimeType = matches[1].toLowerCase();
+    const isVideo = mimeType.startsWith('video');
+    const isAudio = mimeType.startsWith('audio');
+    finalType = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
 
-        if (!uploadErr) {
-          const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(filename);
-          if (publicUrlData?.publicUrl) {
-            finalMediaUrl = publicUrlData.publicUrl;
-          }
-        }
-      }
-    } catch (uploadExc) {
-      console.warn("Story storage upload notice:", uploadExc.message);
+    const base64Data = matches[2];
+    const buffer = Buffer.from(base64Data, 'base64');
+    if (buffer.length === 0) {
+      throw new Error('Media payload is empty.');
+    }
+
+    let ext = mimeType.split('/')[1]?.split('+')[0] || (isVideo ? 'mp4' : (isAudio ? 'mp3' : 'jpeg'));
+    if (ext === 'quicktime') ext = 'mov';
+    if (ext === 'octet-stream') ext = isVideo ? 'mp4' : 'jpeg';
+
+    bucketName = isVideo ? 'post-videos' : 'post-images';
+    storagePath = `${userId}/${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from(bucketName)
+      .upload(storagePath, buffer, { contentType: mimeType, upsert: true });
+
+    if (uploadErr) {
+      console.error(`[Story Storage Upload Error in ${bucketName}]:`, uploadErr.message);
+      throw new Error(`Failed to upload story media to storage: ${uploadErr.message}`);
+    }
+
+    const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(storagePath);
+    if (!publicUrlData?.publicUrl) {
+      throw new Error('Failed to retrieve public storage URL for story media.');
+    }
+
+    finalMediaUrl = publicUrlData.publicUrl;
+  } else if (typeof mediaUrl === 'string') {
+    if (!mediaUrl.startsWith('http://') && !mediaUrl.startsWith('https://')) {
+      throw new Error('Invalid media URL scheme. Only secure HTTP/HTTPS URLs are allowed.');
     }
   }
 
-  return { url: finalMediaUrl, type: finalType };
+  return { url: finalMediaUrl, type: finalType, storagePath, bucket: bucketName };
 }
 
 router.post('/api/stories', authenticateToken, async (req, res) => {
@@ -118,18 +151,26 @@ router.post('/api/stories', authenticateToken, async (req, res) => {
   const items = (rawMediaItems && rawMediaItems.length > 0) ? rawMediaItems : [{ url: rawMediaUrl, type: rawMediaType }];
   if (!items[0] || !items[0].url) return res.status(400).json({ error: 'Media URL is required.' });
 
+  const userId = req.user.id;
+  const nowIso = new Date().toISOString();
+  const processedItems = [];
+
   try {
-    const userId = req.user.id;
-    const nowIso = new Date().toISOString();
-    
-    // Process all media items (uploading data URLs if necessary)
-    const processedItems = await Promise.all(items.map(async (item) => {
-      const result = await uploadMediaItem(userId, item.url, item.type);
-      return {
+    // 1. Process and upload all media items to permanent storage FIRST
+    for (const item of items) {
+      if (!item.url) continue;
+      const result = await uploadMediaItem(userId, item.url, item.type, 'story');
+      processedItems.push({
         url: result.url,
-        type: isDraft ? `draft-${result.type || 'image'}` : (result.type || 'image')
-      };
-    }));
+        type: isDraft ? `draft-${result.type || 'image'}` : (result.type || 'image'),
+        storagePath: result.storagePath,
+        bucket: result.bucket
+      });
+    }
+
+    if (processedItems.length === 0) {
+      return res.status(400).json({ error: 'No valid media items provided.' });
+    }
 
     const primaryItem = processedItems[0];
     
@@ -143,6 +184,7 @@ router.post('/api/stories', authenticateToken, async (req, res) => {
       });
     }
 
+    // 2. Insert into stories table
     const { data: newStory, error } = await supabase.from('stories').insert([{
       author_id: userId,
       media_url: primaryItem.url,
@@ -155,9 +197,17 @@ router.post('/api/stories', authenticateToken, async (req, res) => {
       created_at: nowIso
     }]).select('*, author:profiles!author_id(id, full_name, username, profile_image_url)').single();
     
-    if (error) throw error;
+    if (error || !newStory) {
+      // Compensating storage cleanup
+      for (const item of processedItems) {
+        if (item.storagePath && item.bucket) {
+          try { await supabase.storage.from(item.bucket).remove([item.storagePath]); } catch (_) {}
+        }
+      }
+      return res.status(500).json({ error: error?.message || 'Failed to create story record.' });
+    }
 
-    // Insert into story_media
+    // 3. Insert into story_media
     if (processedItems.length > 0) {
       const mediaRecords = processedItems.map((item, idx) => ({
         story_id: newStory.id,
@@ -165,7 +215,10 @@ router.post('/api/stories', authenticateToken, async (req, res) => {
         media_type: item.type,
         display_order: idx + 1
       }));
-      await supabase.from('story_media').insert(mediaRecords);
+      const { error: smErr } = await supabase.from('story_media').insert(mediaRecords);
+      if (smErr) {
+        console.warn('story_media insert warning:', smErr.message);
+      }
       newStory.mediaItems = mediaRecords.map(r => ({
         id: r.id || newStory.id,
         mediaUrl: r.media_url,
@@ -175,10 +228,16 @@ router.post('/api/stories', authenticateToken, async (req, res) => {
     }
 
     console.log(`[BACKEND POST /api/stories SUCCESS] StoryId: ${newStory.id} | created_at: ${newStory.created_at} | items: ${processedItems.length}`);
-    res.status(201).json(mapStoryToFrontend(newStory, []));
+    return res.status(201).json(mapStoryToFrontend(newStory, []));
   } catch (err) {
-    console.error('Error creating story:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Error creating story:', err.message);
+    // Compensating storage cleanup
+    for (const item of processedItems) {
+      if (item.storagePath && item.bucket) {
+        try { await supabase.storage.from(item.bucket).remove([item.storagePath]); } catch (_) {}
+      }
+    }
+    return res.status(400).json({ error: err.message || 'Failed to publish story.' });
   }
 });
 
@@ -189,17 +248,28 @@ router.post('/api/stories/schedule', authenticateToken, async (req, res) => {
   if (!items[0] || !items[0].url) return res.status(400).json({ error: 'Media URL is required.' });
   if (!scheduledAt) return res.status(400).json({ error: 'Scheduled time is required.' });
 
-  try {
-    const userId = req.user.id;
-    const scheduledIso = new Date(scheduledAt).toISOString();
-    const nowIso = new Date().toISOString();
-    const isDue = new Date(scheduledIso).getTime() <= Date.now();
+  const userId = req.user.id;
+  const scheduledIso = new Date(scheduledAt).toISOString();
+  const nowIso = new Date().toISOString();
+  const isDue = new Date(scheduledIso).getTime() <= Date.now();
+  const processedItems = [];
 
-    // Process all media items (uploading data URLs if necessary)
-    const processedItems = await Promise.all(items.map(async (item) => {
-      const result = await uploadMediaItem(userId, item.url, item.type);
-      return { url: result.url, type: result.type || 'image' };
-    }));
+  try {
+    // 1. Process and upload all media items to permanent storage FIRST
+    for (const item of items) {
+      if (!item.url) continue;
+      const result = await uploadMediaItem(userId, item.url, item.type, 'story_sched');
+      processedItems.push({
+        url: result.url,
+        type: result.type || 'image',
+        storagePath: result.storagePath,
+        bucket: result.bucket
+      });
+    }
+
+    if (processedItems.length === 0) {
+      return res.status(400).json({ error: 'No valid media items provided.' });
+    }
 
     const primaryItem = processedItems[0];
 
@@ -213,7 +283,7 @@ router.post('/api/stories/schedule', authenticateToken, async (req, res) => {
       });
     }
 
-    // Insert exactly one story record directly into Supabase stories table
+    // 2. Insert into stories table
     const { data: newStory, error: insertErr } = await supabase.from('stories').insert([{
       author_id: userId,
       media_url: primaryItem.url,
@@ -226,12 +296,17 @@ router.post('/api/stories/schedule', authenticateToken, async (req, res) => {
       created_at: nowIso
     }]).select('*, author:profiles!author_id(id, full_name, username, profile_image_url)').single();
 
-    if (insertErr) {
+    if (insertErr || !newStory) {
       console.error('Supabase story schedule insert error:', insertErr);
-      throw insertErr;
+      for (const item of processedItems) {
+        if (item.storagePath && item.bucket) {
+          try { await supabase.storage.from(item.bucket).remove([item.storagePath]); } catch (_) {}
+        }
+      }
+      return res.status(500).json({ error: insertErr?.message || 'Failed to schedule story.' });
     }
 
-    // Insert into story_media
+    // 3. Insert into story_media
     if (processedItems.length > 0) {
       const mediaRecords = processedItems.map((item, idx) => ({
         story_id: newStory.id,

@@ -21,7 +21,7 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.set('etag', false);
+app.set('etag', false); // Server updated with strict presence & auth validation
 
 // Enable CORS for all routes and preflight requests
 app.use(cors({

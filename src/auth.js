@@ -129,6 +129,7 @@ export async function initAuth() {
     }
     if (appContainer) appContainer.style.display = 'block';
     updateAppUI();
+    window.dispatchEvent(new CustomEvent('auth-changed'));
   }
 
   function stopWebcam() {
@@ -207,33 +208,48 @@ export async function initAuth() {
     }, 1000);
   }
 
-  // --- 6-DIGIT OTP INPUT AUTO-ADVANCE ---
+  // --- 6-DIGIT OTP INPUT AUTO-ADVANCE & NUMERIC SANITIZATION ---
   if (otpInputs && otpInputs.length > 0) {
     otpInputs.forEach((input, index) => {
       input.addEventListener('input', (e) => {
-        const val = e.target.value;
-        if (val.length >= 1) {
-          input.value = val.charAt(0);
+        hideError(inlineOtpErrorMsg);
+        // Retain only digits
+        const raw = e.target.value.replace(/\D/g, '');
+        if (raw.length >= 1) {
+          input.value = raw.charAt(0);
           if (index < otpInputs.length - 1) {
             otpInputs[index + 1].focus();
           }
+        } else {
+          input.value = '';
         }
       });
 
       input.addEventListener('keydown', (e) => {
-        if (e.key === 'Backspace' && !input.value && index > 0) {
-          otpInputs[index - 1].focus();
+        if (e.key === 'Backspace') {
+          hideError(inlineOtpErrorMsg);
+          if (!input.value && index > 0) {
+            otpInputs[index - 1].focus();
+          }
         }
       });
 
       input.addEventListener('paste', (e) => {
         e.preventDefault();
-        const pasted = (e.clipboardData || window.clipboardData).getData('text').trim();
-        if (/^\d{6}$/.test(pasted)) {
-          pasted.split('').forEach((char, i) => {
+        hideError(inlineOtpErrorMsg);
+        const pasted = (e.clipboardData || window.clipboardData).getData('text').trim().replace(/\D/g, '');
+        if (pasted.length >= 6) {
+          const digits = pasted.slice(0, 6).split('');
+          digits.forEach((char, i) => {
             if (otpInputs[i]) otpInputs[i].value = char;
           });
           if (otpInputs[5]) otpInputs[5].focus();
+        } else if (pasted.length > 0) {
+          pasted.split('').forEach((char, i) => {
+            if (otpInputs[index + i]) otpInputs[index + i].value = char;
+          });
+          const nextIdx = Math.min(index + pasted.length, otpInputs.length - 1);
+          if (otpInputs[nextIdx]) otpInputs[nextIdx].focus();
         }
       });
     });
@@ -312,10 +328,22 @@ export async function initAuth() {
     const username = usernameInput ? usernameInput.value.trim() : '';
     const password = passwordInput ? passwordInput.value : '';
     const phone = phoneInput ? phoneInput.value.trim() : '';
+    const genderInput = document.getElementById('signup-gender-input');
+    const dobInput = document.getElementById('signup-dob-input');
+    const gender = genderInput ? genderInput.value.trim() : '';
+    const dateOfBirth = dobInput ? dobInput.value.trim() : '';
 
     if (!fullName) return showError(usernameError, 'Please enter your full name.');
     if (!email || !email.includes('@')) return showError(usernameError, 'Please enter a valid email address.');
     if (!username) return showError(usernameError, 'Please choose a username.');
+    
+    const genderContainer = document.querySelector('.signup-mobile-field');
+    const isMobileSignup = genderContainer && window.getComputedStyle(genderContainer).display !== 'none';
+    if (isMobileSignup) {
+      if (!gender) return showError(usernameError, 'Please select your gender.');
+      if (!dateOfBirth) return showError(usernameError, 'Please enter your date of birth.');
+    }
+    
     if (!password || password.length < 4) return showError(usernameError, 'Password must be at least 4 characters long.');
 
     hideError(usernameError);
@@ -352,7 +380,9 @@ export async function initAuth() {
           email: normalizedEmail,
           username: normalizedUsername,
           password,
-          phoneNumber: phone
+          phoneNumber: phone,
+          gender: isMobileSignup ? gender : null,
+          dateOfBirth: isMobileSignup ? dateOfBirth : null
         })
       });
 
@@ -366,7 +396,9 @@ export async function initAuth() {
         fullName,
         username: normalizedUsername,
         password,
-        phoneNumber: phone || null
+        phoneNumber: phone || null,
+        gender: isMobileSignup ? gender : null,
+        dateOfBirth: isMobileSignup ? dateOfBirth : null
       };
 
       // Smoothly transition card to 6-digit OTP verification step UI
@@ -518,7 +550,7 @@ export async function initAuth() {
   }
 
   // =========================================================================
-  // 3. LOGIN FLOW (Direct Supabase Auth + Profiles Table Verification)
+  // 3. LOGIN FLOW (Authoritative Custom Backend Authentication)
   // =========================================================================
   async function handleLoginSubmit() {
     const input = loginUsernameInput ? loginUsernameInput.value.trim() : '';
@@ -536,91 +568,46 @@ export async function initAuth() {
     }
 
     try {
-      const normalizedInput = input.toLowerCase();
+      const res = await fetch((window.API_URL || '') + '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: input,
+          password: password
+        })
+      });
 
-      // Find user profile in public.profiles table by username or email
-      const { data: userProfile, error: profileFetchErr } = await supabase.from('profiles')
-        .select('*')
-        .or(`username.eq.${normalizedInput},email.eq.${normalizedInput}`)
-        .maybeSingle();
+      const data = await res.json();
 
-      if (profileFetchErr) {
-        logAuthDiagnostic('handleLoginSubmit profileFetch', { message: profileFetchErr.message, code: profileFetchErr.code });
+      if (!res.ok || !data.success) {
+        logAuthDiagnostic('handleLoginSubmit Failed', { input });
+        return showError(loginErrorMsg, data.error || 'Invalid username/email or password.');
       }
 
-      let authenticatedUser = null;
-      let jwtToken = null;
-
-      // 1. Try official Supabase Auth signInWithPassword if target email is available
-      const targetEmail = userProfile?.email || (normalizedInput.includes('@') ? normalizedInput : null);
-      if (targetEmail) {
-        try {
-          const { data: authSignInRes, error: authSignInErr } = await supabase.auth.signInWithPassword({
-            email: targetEmail,
-            password: password
-          });
-
-          if (!authSignInErr && authSignInRes?.user) {
-            jwtToken = authSignInRes.session?.access_token || null;
-            authenticatedUser = {
-              id: authSignInRes.user.id,
-              username: userProfile?.username || authSignInRes.user.user_metadata?.username || targetEmail.split('@')[0],
-              email: targetEmail,
-              fullName: userProfile?.full_name || authSignInRes.user.user_metadata?.full_name || 'User',
-              profileImage: userProfile?.profile_image_url || null
-            };
-          } else if (authSignInErr) {
-            logAuthDiagnostic('supabase.auth.signInWithPassword Notice', { message: authSignInErr.message, status: authSignInErr.status });
-          }
-        } catch (sbErr) {
-          logAuthDiagnostic('supabase.auth.signInWithPassword Exception', { message: sbErr.message });
-        }
-      }
-
-      // 2. Fallback to bcrypt verification against public.profiles table
-      if (!authenticatedUser && userProfile && userProfile.password_hash) {
-        const passwordMatches = await bcrypt.compare(password, userProfile.password_hash);
-        if (passwordMatches) {
-          authenticatedUser = {
-            id: userProfile.id,
-            username: userProfile.username,
-            email: userProfile.email,
-            fullName: userProfile.full_name || userProfile.username,
-            phoneNumber: userProfile.phone_number || null,
-            profileImage: userProfile.profile_image_url || null
-          };
-        }
-      }
-
-      if (!authenticatedUser) {
-        logAuthDiagnostic('handleLoginSubmit Failed', { input: normalizedInput });
-        return showError(loginErrorMsg, 'Invalid username/email or password.');
-      }
-
-      // Update online status in Supabase profiles
-      try {
-        await supabase.from('profiles').update({
-          is_online: true,
-          last_active_at: new Date().toISOString()
-        }).eq('id', authenticatedUser.id);
-      } catch (_) {}
+      const authenticatedUser = data.user;
+      const jwtToken = data.token;
 
       // Store authenticated user session
       localStorage.setItem('invibeUser', JSON.stringify(authenticatedUser));
       if (authenticatedUser.profileImage) {
         localStorage.setItem('invibeProfileImage', authenticatedUser.profileImage);
+      } else {
+        localStorage.removeItem('invibeProfileImage');
+      }
+      if (authenticatedUser.bannerImage) {
+        localStorage.setItem('invibeBannerImage', authenticatedUser.bannerImage);
+      } else {
+        localStorage.removeItem('invibeBannerImage');
       }
       localStorage.setItem('invibeIsLoggedIn', 'true');
       if (jwtToken) {
         localStorage.setItem('invibe_jwt_token', jwtToken);
-      } else if (authenticatedUser?.id) {
-        localStorage.setItem('invibe_jwt_token', authenticatedUser.id);
       }
 
       showAppView();
     } catch (err) {
       logAuthDiagnostic('handleLoginSubmit Unexpected Exception', { message: err.message });
-      showError(loginErrorMsg, err.message || 'Invalid username or password.');
+      showError(loginErrorMsg, err.message || 'Unable to log in. Please try again.');
     } finally {
       if (btnLoginSubmit) {
         btnLoginSubmit.disabled = false;
@@ -782,6 +769,7 @@ export function handleLogout() {
 
   localStorage.removeItem('invibeUser');
   localStorage.removeItem('invibeProfileImage');
+  localStorage.removeItem('invibeBannerImage');
   localStorage.removeItem('invibeIsLoggedIn');
   localStorage.removeItem('invibe_jwt_token');
 
@@ -890,7 +878,4 @@ export function updateAppUI() {
       })
       .catch(() => {});
   }
-
-  // Dispatch event so downstream features initialize
-  window.dispatchEvent(new CustomEvent('auth-changed'));
 }

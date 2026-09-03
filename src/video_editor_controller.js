@@ -2,6 +2,7 @@
 // Implements client-side Canvas video rendering, trimming, splitting, rotation, speed, background music mixing, and exporting.
 
 import { Output, WebMOutputFormat, BufferTarget, EncodedVideoPacketSource, EncodedAudioPacketSource, EncodedPacket, Input, BlobSource, ALL_FORMATS, VideoSampleSink } from 'mediabunny';
+import { getDraftThumbnailInfo, renderThumbnailHTML } from './services/draft_thumbnail_service.js';
 
 export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   // --- SAFE TOAST HELPER ---
@@ -316,17 +317,20 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     importMediaBtn.addEventListener('click', () => fileInput.click());
   }
 
+  let clipCounter = 0;
+
   if (fileInput) {
     fileInput.addEventListener('change', async (e) => {
       const files = e.target.files;
-      if (!files.length) return;
+      if (!files || !files.length) return;
 
-      for (let file of files) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         const isVideo = file.type.startsWith('video/');
         const url = URL.createObjectURL(file);
 
         const clip = {
-          id: 'clip_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+          id: 'clip_' + Date.now() + '_' + (++clipCounter) + '_' + Math.random().toString(36).substr(2, 6),
           file: file,
           type: isVideo ? 'video' : 'image',
           url: url,
@@ -364,21 +368,37 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           videoElement.playsInline = true;
 
           await new Promise((resolve) => {
-            videoElement.onloadedmetadata = () => {
-              clip.duration = videoElement.duration;
-              clip.endTrim = videoElement.duration;
+            let settled = false;
+            const done = () => {
+              if (settled) return;
+              settled = true;
+              clip.duration = (Number.isFinite(videoElement.duration) && videoElement.duration > 0) ? videoElement.duration : 3.0;
+              clip.endTrim = clip.duration;
               clip.element = videoElement;
               resolve();
             };
+            videoElement.onloadedmetadata = done;
+            videoElement.onerror = done;
+            setTimeout(done, 1500);
           });
         } else {
           const imgElement = new Image();
           imgElement.src = url;
           await new Promise((resolve) => {
-            imgElement.onload = () => {
+            let settled = false;
+            const done = () => {
+              if (settled) return;
+              settled = true;
               clip.element = imgElement;
               resolve();
             };
+            imgElement.onload = done;
+            imgElement.onerror = done;
+            if (imgElement.complete) {
+              done();
+            } else {
+              setTimeout(done, 1500);
+            }
           });
         }
 
@@ -386,9 +406,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       }
 
       fileInput.value = '';
-      selectClip(clips.length - 1);
-      updateTimelineUI();
       recalculateTotalDuration();
+      selectClip(0);
       updatePostButtonsState();
     });
   }
@@ -474,57 +493,184 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     });
   }
 
+  // --- Helper for touch and mouse drag interactions ---
+  function addDragListener(element, onStart, onMove, onEnd) {
+    if (!element) return;
+    let isDragging = false;
+    let activePointerId = null;
+
+    const getClientX = (e) => {
+      if (e.touches && e.touches.length > 0) return e.touches[0].clientX;
+      if (e.changedTouches && e.changedTouches.length > 0) return e.changedTouches[0].clientX;
+      return typeof e.clientX === 'number' ? e.clientX : 0;
+    };
+
+    const startDrag = (e) => {
+      if (isDragging) return;
+      isDragging = true;
+
+      if (e.pointerId !== undefined) {
+        activePointerId = e.pointerId;
+        if (element.setPointerCapture) {
+          try { element.setPointerCapture(e.pointerId); } catch (_) { }
+        }
+      }
+
+      const clientX = getClientX(e);
+      if (typeof onStart === 'function') {
+        onStart(clientX, e);
+      }
+
+      const moveHandler = (moveEvent) => {
+        if (!isDragging) return;
+        if (activePointerId !== null && moveEvent.pointerId !== undefined && moveEvent.pointerId !== activePointerId) return;
+        if (moveEvent.cancelable && moveEvent.type && moveEvent.type.startsWith('touch')) {
+          moveEvent.preventDefault();
+        }
+        const moveX = getClientX(moveEvent);
+        if (typeof onMove === 'function') {
+          onMove(moveX, moveEvent);
+        }
+      };
+
+      const endHandler = (endEvent) => {
+        if (!isDragging) return;
+        if (activePointerId !== null && endEvent.pointerId !== undefined && endEvent.pointerId !== activePointerId) return;
+        isDragging = false;
+        activePointerId = null;
+
+        if (element.releasePointerCapture && endEvent.pointerId !== undefined) {
+          try { element.releasePointerCapture(endEvent.pointerId); } catch (_) { }
+        }
+
+        window.removeEventListener('pointermove', moveHandler);
+        window.removeEventListener('pointerup', endHandler);
+        window.removeEventListener('pointercancel', endHandler);
+        window.removeEventListener('mousemove', moveHandler);
+        window.removeEventListener('mouseup', endHandler);
+        window.removeEventListener('touchmove', moveHandler);
+        window.removeEventListener('touchend', endHandler);
+        window.removeEventListener('touchcancel', endHandler);
+
+        const endX = getClientX(endEvent);
+        if (typeof onEnd === 'function') {
+          onEnd(endX, endEvent);
+        }
+      };
+
+      window.addEventListener('pointermove', moveHandler, { passive: false });
+      window.addEventListener('pointerup', endHandler, { passive: false });
+      window.addEventListener('pointercancel', endHandler, { passive: false });
+      window.addEventListener('mousemove', moveHandler);
+      window.addEventListener('mouseup', endHandler);
+      window.addEventListener('touchmove', moveHandler, { passive: false });
+      window.addEventListener('touchend', endHandler, { passive: false });
+      window.addEventListener('touchcancel', endHandler, { passive: false });
+    };
+
+    element.addEventListener('pointerdown', (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      if (e.cancelable) e.preventDefault();
+      startDrag(e);
+    }, { passive: false });
+
+    element.addEventListener('mousedown', (e) => {
+      if (typeof window !== 'undefined' && window.PointerEvent && e.isTrusted) return;
+      if (e.button !== undefined && e.button !== 0) return;
+      startDrag(e);
+    });
+
+    element.addEventListener('touchstart', (e) => {
+      if (typeof window !== 'undefined' && window.PointerEvent && e.isTrusted) return;
+      if (e.cancelable) e.preventDefault();
+      startDrag(e);
+    }, { passive: false });
+  }
+
   // --- Timeline UI rendering ---
   function updateTimelineUI() {
     timelineContainer.innerHTML = '';
 
+    // Always ensure totalDuration is freshly computed
+    totalDuration = getCanonicalDuration(clips);
+
     if (clips.length === 0) {
       timelineContainer.appendChild(timelineEmpty);
       clipCountDisplay.innerText = '0 clips';
+      updateTimeDisplay();
       return;
     }
 
     clipCountDisplay.innerText = `${clips.length} clip${clips.length > 1 ? 's' : ''}`;
 
     // Determine scale for horizontal tracks (pixels per second)
-    const containerWidth = timelineContainer.clientWidth || 600;
-    pxPerSec = Math.max(15, (containerWidth - 24) / (totalDuration || 1));
-    const totalWidth = totalDuration * pxPerSec;
+    const isMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
+    const containerWidth = timelineContainer.clientWidth || (isMobile ? 320 : 600);
+
+    let calculatedPxPerSec = (containerWidth - 24) / Math.max(totalDuration, 0.1);
+    if (isMobile) {
+      const minClipDuration = clips.length > 0
+        ? Math.min(...clips.map(c => Math.max(0.5, (c.endTrim - c.startTrim) / ((typeof c.speed === 'number' && c.speed > 0) ? c.speed : 1))))
+        : 3;
+      const targetMinClipWidth = containerWidth < 360 ? 80 : 92;
+      const minPxPerSecForClips = targetMinClipWidth / Math.max(0.6, minClipDuration);
+      calculatedPxPerSec = Math.max(calculatedPxPerSec, Math.min(80, minPxPerSecForClips), 30);
+    } else {
+      calculatedPxPerSec = Math.max(15, calculatedPxPerSec);
+    }
+    pxPerSec = calculatedPxPerSec;
+
+    // Calculate total track width ensuring all clips fit side-by-side with comfortable minimum widths
+    let calculatedTrackWidth = 0;
+    const minClipW = isMobile ? (containerWidth < 360 ? 76 : 88) : 60;
+    clips.forEach(c => {
+      const dur = (c.endTrim - c.startTrim) / ((typeof c.speed === 'number' && c.speed > 0) ? c.speed : 1);
+      calculatedTrackWidth += Math.max(minClipW, dur * pxPerSec);
+    });
+    const totalWidth = Math.max(calculatedTrackWidth, totalDuration * pxPerSec, containerWidth - 8);
 
     // Create wrapper for the tracks
     const wrapper = document.createElement('div');
     wrapper.id = 'editor-tracks-container';
-    wrapper.style.cssText = `position: relative; width: ${totalWidth}px; display: flex; flex-direction: column; gap: 6px; padding: 4px 0; box-sizing: border-box; user-select: none;`;
+    wrapper.style.cssText = `position: relative; width: ${totalWidth}px; min-width: 100%; display: flex; flex-direction: column; gap: 6px; padding: 4px 0; box-sizing: border-box; user-select: none;`;
 
-    // 1. Playhead vertical marker
+    // 1. Playhead vertical marker with expanded touch target (44px wide)
     const playhead = document.createElement('div');
     playhead.id = 'editor-timeline-playhead';
-    playhead.style.cssText = `position: absolute; top: 0; bottom: 0; width: 2px; background: #a855f7; z-index: 10; pointer-events: none; left: 0; transition: left 0.05s linear;`;
+    playhead.style.cssText = `position: absolute; top: 0; bottom: 0; width: 44px; margin-left: -22px; z-index: 25; cursor: grab; touch-action: none; display: flex; flex-direction: column; align-items: center; pointer-events: auto; left: ${currentPlaybackTime * pxPerSec}px; transition: left 0.04s linear;`;
 
-    const playheadHandle = document.createElement('div');
-    playheadHandle.style.cssText = `position: absolute; top: -2px; left: -5px; width: 12px; height: 12px; background: #a855f7; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.5); cursor: grab;`;
-    playhead.appendChild(playheadHandle);
+    const playheadPin = document.createElement('div');
+    playheadPin.className = 'playhead-pin';
+    playheadPin.style.cssText = `width: 14px; height: 14px; background: #a855f7; border-radius: 50%; border: 2px solid #ffffff; box-shadow: 0 2px 6px rgba(168, 85, 247, 0.8), 0 0 10px rgba(168, 85, 247, 0.6); flex-shrink: 0; margin-top: 1px;`;
+
+    const playheadLine = document.createElement('div');
+    playheadLine.className = 'playhead-line';
+    playheadLine.style.cssText = `width: 2px; flex: 1; background: #a855f7; box-shadow: 0 0 6px rgba(168, 85, 247, 0.8);`;
+
+    playhead.appendChild(playheadPin);
+    playhead.appendChild(playheadLine);
     wrapper.appendChild(playhead);
 
     // 2. Time Ruler Track
     const ruler = document.createElement('div');
     ruler.id = 'editor-track-ruler';
-    ruler.style.cssText = `height: 18px; position: relative; border-bottom: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.01); font-size: 8px; color: rgba(255,255,255,0.4); font-family: monospace; overflow: hidden; cursor: pointer;`;
+    ruler.style.cssText = `height: 20px; position: relative; border-bottom: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.02); font-size: 9px; color: rgba(255,255,255,0.5); font-family: monospace; overflow: hidden; cursor: pointer; touch-action: pan-x;`;
 
-    const tickInterval = totalDuration > 60 ? 10 : (totalDuration > 30 ? 5 : 2);
+    const tickInterval = totalDuration > 60 ? 10 : (totalDuration > 30 ? 5 : (totalDuration > 10 ? 2 : 1));
     for (let t = 0; t <= totalDuration; t += tickInterval) {
       const mark = document.createElement('div');
-      mark.style.cssText = `position: absolute; left: ${t * pxPerSec}px; top: 0; height: 100%; border-left: 1px solid rgba(255,255,255,0.15); padding-left: 3px; display: flex; align-items: flex-end; padding-bottom: 2px;`;
+      mark.style.cssText = `position: absolute; left: ${t * pxPerSec}px; top: 0; height: 100%; border-left: 1px solid rgba(255,255,255,0.2); padding-left: 3px; display: flex; align-items: flex-end; padding-bottom: 2px; pointer-events: none;`;
       mark.innerText = `${t}s`;
       ruler.appendChild(mark);
     }
+    wrapper.appendChild(ruler);
 
     const syncSeek = (globalTime) => {
       let cumulativeTime = 0;
       clips.forEach(c => {
-        const duration = (c.endTrim - c.startTrim) / c.speed;
+        const duration = (c.endTrim - c.startTrim) / ((typeof c.speed === 'number' && c.speed > 0) ? c.speed : 1);
         if (globalTime >= cumulativeTime && globalTime <= cumulativeTime + duration) {
-          const localOffset = c.startTrim + (globalTime - cumulativeTime) * c.speed;
+          const localOffset = c.startTrim + (globalTime - cumulativeTime) * ((typeof c.speed === 'number' && c.speed > 0) ? c.speed : 1);
           if (c.type === 'video' && c.element) {
             c.element.currentTime = localOffset;
           }
@@ -543,7 +689,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       if (bgAudio && bgAudio.element) {
         const start = bgAudio.startTime || 0;
         const localTime = globalTime - start;
-        if (localTime >= 0 && localTime < bgAudio.element.duration) {
+        if (localTime >= 0 && localTime < (bgAudio.element.duration || 9999)) {
           bgAudio.element.currentTime = localTime;
         } else {
           bgAudio.element.currentTime = 0;
@@ -551,9 +697,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       }
     };
 
-    const handleScrub = (e) => {
+    const handleScrubAtClientX = (clientX) => {
       const rect = wrapper.getBoundingClientRect();
-      const clickX = e.clientX - rect.left;
+      const clickX = clientX - rect.left;
       const scrubTime = (clickX / totalWidth) * totalDuration;
       currentPlaybackTime = Math.max(0, Math.min(totalDuration, scrubTime));
       syncSeek(currentPlaybackTime);
@@ -561,105 +707,114 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       renderCurrentFrame();
     };
 
-    ruler.addEventListener('mousedown', (e) => {
-      handleScrub(e);
-      const onMouseMove = (moveEvent) => {
-        handleScrub(moveEvent);
-      };
-      const onMouseUp = () => {
-        window.removeEventListener('mousemove', onMouseMove);
-        window.removeEventListener('mouseup', onMouseUp);
-      };
-      window.addEventListener('mousemove', onMouseMove);
-      window.addEventListener('mouseup', onMouseUp);
-    });
-    wrapper.appendChild(ruler);
+    addDragListener(ruler,
+      (clientX) => { handleScrubAtClientX(clientX); },
+      (clientX) => { handleScrubAtClientX(clientX); },
+      () => { updateTimeDisplay(); }
+    );
+
+    addDragListener(playhead,
+      (clientX) => {
+        playhead.style.cursor = 'grabbing';
+        handleScrubAtClientX(clientX);
+      },
+      (clientX) => { handleScrubAtClientX(clientX); },
+      () => {
+        playhead.style.cursor = 'grab';
+        updateTimeDisplay();
+      }
+    );
 
     // 3. Video track
+    const videoTrackHeight = isMobile ? 64 : 52;
     const videoTrack = document.createElement('div');
     videoTrack.id = 'editor-track-video';
-    videoTrack.style.cssText = `height: 44px; display: flex; position: relative; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 6px; overflow: hidden;`;
+    videoTrack.style.cssText = `height: ${videoTrackHeight}px; width: ${totalWidth}px; min-width: 100%; display: flex; position: relative; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; overflow: hidden; touch-action: pan-x;`;
 
     let currentX = 0;
     clips.forEach((clip, index) => {
-      const duration = (clip.endTrim - clip.startTrim) / clip.speed;
-      const width = duration * pxPerSec;
+      const duration = (clip.endTrim - clip.startTrim) / ((typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1);
+      const width = Math.max(minClipW, duration * pxPerSec);
+      const isSelected = selectedClipIndex === index;
 
       const item = document.createElement('div');
-      item.className = `timeline-clip-item ${selectedClipIndex === index ? 'selected' : ''}`;
-      // Increased padding to 24px to separate inner contents (like delete button) from the drag handles
-      item.style.cssText = `position: absolute; left: ${currentX}px; width: ${width}px; height: 100%; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; border-right: 1px solid rgba(255,255,255,0.08); cursor: pointer; font-size: 10px; color: white; box-sizing: border-box; overflow: hidden;`;
+      item.className = `timeline-clip-item ${isSelected ? 'selected' : ''}`;
+      item.setAttribute('data-clip-index', index);
+      item.setAttribute('data-clip-id', clip.id);
+      item.style.cssText = `position: absolute; left: ${currentX}px; width: ${width}px; height: 100%; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-right: 1px solid rgba(255,255,255,0.12); cursor: pointer; font-size: 11px; color: white; box-sizing: border-box; overflow: hidden; border-radius: 8px; border: 2px solid ${isSelected ? 'var(--primary, #a855f7)' : 'rgba(255,255,255,0.15)'}; background: ${isSelected ? 'rgba(168, 85, 247, 0.18)' : 'rgba(0,0,0,0.5)'}; box-shadow: ${isSelected ? '0 0 14px rgba(168, 85, 247, 0.5)' : 'none'}; user-select: none; transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;`;
 
       // Thumbnail
+      const thumbSize = isMobile ? 48 : 36;
       const thumb = document.createElement(clip.type === 'video' ? 'video' : 'img');
       thumb.src = clip.url;
-      thumb.style.cssText = `width: 32px; height: 32px; object-fit: cover; border-radius: 4px; background: #000; border: 1px solid rgba(255,255,255,0.15); user-select: none; pointer-events: none;`;
+      thumb.style.cssText = `width: ${thumbSize}px; height: ${thumbSize}px; object-fit: cover; border-radius: 6px; background: #000; border: 1px solid rgba(255,255,255,0.2); user-select: none; pointer-events: none; flex-shrink: 0;`;
       if (clip.type === 'video') {
         thumb.currentTime = clip.startTrim;
       }
       item.appendChild(thumb);
 
+      // Clip number badge
+      const numBadge = document.createElement('div');
+      numBadge.className = 'clip-number';
+      numBadge.innerText = `#${index + 1}`;
+      numBadge.style.cssText = `position: absolute; top: 4px; left: 18px; background: rgba(0,0,0,0.75); color: #ffffff; font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 4px; font-family: monospace; border: 1px solid rgba(255,255,255,0.15); pointer-events: none; z-index: 6;`;
+      item.appendChild(numBadge);
+
+      // Label
       const label = document.createElement('span');
-      label.innerText = `${index + 1}: ${clip.name.substring(0, 12)}`;
-      label.style.cssText = `font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin: 0 8px; text-align: left; user-select: none; pointer-events: none;`;
+      label.innerText = clip.name ? clip.name.substring(0, 10) : `Clip ${index + 1}`;
+      label.style.cssText = `font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin: 0 6px; text-align: left; user-select: none; pointer-events: none; font-size: 10px; color: rgba(255,255,255,0.9);`;
       item.appendChild(label);
 
+      // Right group: Duration & Delete
       const rightRow = document.createElement('div');
-      rightRow.style.cssText = `display: flex; align-items: center; gap: 6px; z-index: 6;`;
+      rightRow.style.cssText = `display: flex; align-items: center; gap: 4px; z-index: 6; flex-shrink: 0;`;
 
       const durationLabel = document.createElement('span');
       durationLabel.className = 'timeline-clip-duration';
       durationLabel.innerText = `${duration.toFixed(1)}s`;
-      durationLabel.style.cssText = `color: var(--text-muted); font-size: 9px; user-select: none; pointer-events: none;`;
+      durationLabel.style.cssText = `color: var(--text-muted, #94a3b8); font-size: 9px; font-weight: 600; user-select: none; pointer-events: none; background: rgba(0,0,0,0.5); padding: 2px 4px; border-radius: 4px;`;
       rightRow.appendChild(durationLabel);
 
       const deleteBtn = document.createElement('button');
       deleteBtn.className = 'clip-delete-btn';
       deleteBtn.innerHTML = '×';
-      deleteBtn.style.cssText = `background: rgba(239, 68, 68, 0.2); border: none; color: #f87171; font-size: 12px; border-radius: 4px; width: 18px; height: 18px; cursor: pointer; font-weight: 600; display: flex; align-items: center; justify-content: center; line-height: 1; padding: 0;`;
+      deleteBtn.style.cssText = `background: rgba(239, 68, 68, 0.25); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; font-size: 12px; border-radius: 4px; width: 18px; height: 18px; cursor: pointer; font-weight: 700; display: flex; align-items: center; justify-content: center; line-height: 1; padding: 0;`;
       deleteBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         removeClip(index);
       });
       rightRow.appendChild(deleteBtn);
-
       item.appendChild(rightRow);
 
-      // Drag handles for video trimming - increased width to 16px and styled with premium double vertical grip indicators
+      // Trim Handles
       const leftHandle = document.createElement('div');
       leftHandle.className = 'clip-trim-handle-left';
-      leftHandle.style.cssText = `position: absolute; left: 0; top: 0; bottom: 0; width: 16px; background: rgba(168, 85, 247, 0.4); border-right: 1px solid rgba(255, 255, 255, 0.3); cursor: ew-resize; z-index: 5; display: flex; align-items: center; justify-content: center; transition: background 0.15s;`;
-      leftHandle.innerHTML = `<div style="display: flex; gap: 2px; align-items: center; pointer-events: none;"><div style="width: 2px; height: 14px; background: rgba(255,255,255,0.8); border-radius: 1px;"></div><div style="width: 2px; height: 14px; background: rgba(255,255,255,0.8); border-radius: 1px;"></div></div>`;
-      leftHandle.addEventListener('mouseenter', () => { leftHandle.style.background = 'rgba(168, 85, 247, 0.9)'; });
-      leftHandle.addEventListener('mouseleave', () => { leftHandle.style.background = 'rgba(168, 85, 247, 0.4)'; });
+      leftHandle.style.cssText = `position: absolute; left: 0; top: 0; bottom: 0; width: 20px; cursor: ew-resize; z-index: 10; display: flex; align-items: center; justify-content: flex-start; touch-action: none;`;
+      leftHandle.innerHTML = `<div style="width: 14px; height: 100%; background: rgba(168, 85, 247, 0.7); border-right: 1px solid rgba(255,255,255,0.4); border-top-left-radius: 6px; border-bottom-left-radius: 6px; display: flex; align-items: center; justify-content: center; gap: 2px; box-shadow: 0 0 6px rgba(168, 85, 247, 0.3);"><div style="width: 1.5px; height: 14px; background: rgba(255,255,255,0.9); border-radius: 1px;"></div><div style="width: 1.5px; height: 14px; background: rgba(255,255,255,0.9); border-radius: 1px;"></div></div>`;
 
       const rightHandle = document.createElement('div');
       rightHandle.className = 'clip-trim-handle-right';
-      rightHandle.style.cssText = `position: absolute; right: 0; top: 0; bottom: 0; width: 16px; background: rgba(168, 85, 247, 0.4); border-left: 1px solid rgba(255, 255, 255, 0.3); cursor: ew-resize; z-index: 5; display: flex; align-items: center; justify-content: center; transition: background 0.15s;`;
-      rightHandle.innerHTML = `<div style="display: flex; gap: 2px; align-items: center; pointer-events: none;"><div style="width: 2px; height: 14px; background: rgba(255,255,255,0.8); border-radius: 1px;"></div><div style="width: 2px; height: 14px; background: rgba(255,255,255,0.8); border-radius: 1px;"></div></div>`;
-      rightHandle.addEventListener('mouseenter', () => { rightHandle.style.background = 'rgba(168, 85, 247, 0.9)'; });
-      rightHandle.addEventListener('mouseleave', () => { rightHandle.style.background = 'rgba(168, 85, 247, 0.4)'; });
+      rightHandle.style.cssText = `position: absolute; right: 0; top: 0; bottom: 0; width: 20px; cursor: ew-resize; z-index: 10; display: flex; align-items: center; justify-content: flex-end; touch-action: none;`;
+      rightHandle.innerHTML = `<div style="width: 14px; height: 100%; background: rgba(168, 85, 247, 0.7); border-left: 1px solid rgba(255,255,255,0.4); border-top-right-radius: 6px; border-bottom-right-radius: 6px; display: flex; align-items: center; justify-content: center; gap: 2px; box-shadow: 0 0 6px rgba(168, 85, 247, 0.3);"><div style="width: 1.5px; height: 14px; background: rgba(255,255,255,0.9); border-radius: 1px;"></div><div style="width: 1.5px; height: 14px; background: rgba(255,255,255,0.9); border-radius: 1px;"></div></div>`;
 
-      item.appendChild(leftHandle);
-      item.appendChild(rightHandle);
+      let startClientX = 0;
+      let origStartTrim = 0;
+      let origEndTrim = 0;
 
-      // Event listener for left trim handle
-      leftHandle.addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-        selectClip(index);
-
-        const startClientX = e.clientX;
-        const origStartTrim = clip.startTrim;
-        const origEndTrim = clip.endTrim;
-
-        const onMouseMove = (moveEvent) => {
-          const deltaX = moveEvent.clientX - startClientX;
+      addDragListener(leftHandle,
+        (clientX, e) => {
+          e.stopPropagation();
+          selectClip(index);
+          startClientX = clientX;
+          origStartTrim = clip.startTrim;
+          origEndTrim = clip.endTrim;
+        },
+        (clientX) => {
+          const deltaX = clientX - startClientX;
           const deltaTime = deltaX / pxPerSec;
-
-          let newStartTrim = origStartTrim + deltaTime * clip.speed;
+          let newStartTrim = origStartTrim + deltaTime * ((typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1);
           newStartTrim = Math.max(0, Math.min(origEndTrim - 0.1, newStartTrim));
-
           clip.startTrim = newStartTrim;
 
           if (trimStartInput) {
@@ -670,35 +825,25 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           recalculateTotalDuration();
           seekTimelineToClipFrame(index, newStartTrim);
           updateTimelineDOMWidths(pxPerSec);
-        };
-
-        const onMouseUp = () => {
-          window.removeEventListener('mousemove', onMouseMove);
-          window.removeEventListener('mouseup', onMouseUp);
+        },
+        () => {
           updateTimelineUI();
-        };
+        }
+      );
 
-        window.addEventListener('mousemove', onMouseMove);
-        window.addEventListener('mouseup', onMouseUp);
-      });
-
-      // Event listener for right trim handle
-      rightHandle.addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-        selectClip(index);
-
-        const startClientX = e.clientX;
-        const origStartTrim = clip.startTrim;
-        const origEndTrim = clip.endTrim;
-
-        const onMouseMove = (moveEvent) => {
-          const deltaX = moveEvent.clientX - startClientX;
+      addDragListener(rightHandle,
+        (clientX, e) => {
+          e.stopPropagation();
+          selectClip(index);
+          startClientX = clientX;
+          origStartTrim = clip.startTrim;
+          origEndTrim = clip.endTrim;
+        },
+        (clientX) => {
+          const deltaX = clientX - startClientX;
           const deltaTime = deltaX / pxPerSec;
-
-          let newEndTrim = origEndTrim + deltaTime * clip.speed;
-          newEndTrim = Math.max(origStartTrim + 0.1, Math.min(clip.duration, newEndTrim));
-
+          let newEndTrim = origEndTrim + deltaTime * ((typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1);
+          newEndTrim = Math.max(origStartTrim + 0.1, Math.min(clip.duration || 10, newEndTrim));
           clip.endTrim = newEndTrim;
 
           if (trimEndInput) {
@@ -709,25 +854,23 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           recalculateTotalDuration();
           seekTimelineToClipFrame(index, newEndTrim);
           updateTimelineDOMWidths(pxPerSec);
-        };
-
-        const onMouseUp = () => {
-          window.removeEventListener('mousemove', onMouseMove);
-          window.removeEventListener('mouseup', onMouseUp);
+        },
+        () => {
           updateTimelineUI();
-        };
+        }
+      );
 
-        window.addEventListener('mousemove', onMouseMove);
-        window.addEventListener('mouseup', onMouseUp);
-      });
+      item.appendChild(leftHandle);
+      item.appendChild(rightHandle);
 
       item.addEventListener('click', (e) => {
-        if (e.target !== deleteBtn && e.target !== leftHandle && e.target !== rightHandle) {
+        if (e.target !== deleteBtn && !leftHandle.contains(e.target) && !rightHandle.contains(e.target)) {
+          e.stopPropagation();
           selectClip(index);
         }
       });
-      videoTrack.appendChild(item);
 
+      videoTrack.appendChild(item);
       currentX += width;
     });
     wrapper.appendChild(videoTrack);
@@ -736,22 +879,21 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     if (bgAudio) {
       const audioTrackContainer = document.createElement('div');
       audioTrackContainer.id = 'editor-track-audio-container';
-      audioTrackContainer.style.cssText = `height: 24px; width: 100%; position: relative; background: rgba(0,0,0,0.15); border-radius: 4px; border: 1px dashed rgba(16, 185, 129, 0.2); overflow: hidden;`;
+      audioTrackContainer.style.cssText = `height: 26px; width: 100%; position: relative; background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px dashed rgba(16, 185, 129, 0.3); overflow: hidden; touch-action: pan-x;`;
 
       const audioTrack = document.createElement('div');
       audioTrack.id = 'editor-track-audio';
-
-      const audioDuration = bgAudio.element ? bgAudio.element.duration || 10 : 10;
+      const audioDuration = bgAudio.element ? (bgAudio.element.duration || 10) : 10;
       const audioWidth = audioDuration * pxPerSec;
 
-      audioTrack.style.cssText = `height: 100%; position: absolute; left: ${(bgAudio.startTime || 0) * pxPerSec}px; width: ${audioWidth}px; border-radius: 4px; background: rgba(16, 185, 129, 0.25); border: 1px solid rgba(16, 185, 129, 0.6); font-size: 9px; color: #10b981; display: flex; align-items: center; padding: 0 8px; box-sizing: border-box; cursor: grab; overflow: hidden;`;
+      audioTrack.style.cssText = `height: 100%; position: absolute; left: ${(bgAudio.startTime || 0) * pxPerSec}px; width: ${audioWidth}px; border-radius: 6px; background: rgba(16, 185, 129, 0.25); border: 1px solid rgba(16, 185, 129, 0.6); font-size: 9.5px; color: #10b981; display: flex; align-items: center; padding: 0 8px; box-sizing: border-box; cursor: grab; touch-action: none; overflow: hidden;`;
 
       const audioText = document.createElement('span');
       audioText.className = 'bgm-text';
       audioText.style.cssText = `white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; pointer-events: none;`;
-      
+
       const audioName = bgAudio.file ? bgAudio.file.name : (bgAudio.name || 'Background Music');
-      audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${audioName.substring(0, 20)} (${(bgAudio.startTime || 0).toFixed(1)}s - ${((bgAudio.startTime || 0) + audioDuration).toFixed(1)}s)`;
+      audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${audioName.substring(0, 18)} (${(bgAudio.startTime || 0).toFixed(1)}s - ${((bgAudio.startTime || 0) + audioDuration).toFixed(1)}s)`;
       audioTrack.appendChild(audioText);
 
       const volLabel = document.createElement('span');
@@ -759,38 +901,30 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       volLabel.innerText = `Vol: ${Math.round(musicVolume * 100)}%`;
       audioTrack.appendChild(volLabel);
 
-      // Dragging event listener for BGM
-      audioTrack.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        audioTrack.style.cursor = 'grabbing';
-
-        const startX = e.clientX;
-        const origStartTime = bgAudio.startTime || 0;
-
-        const onMouseMove = (moveEvent) => {
-          const deltaX = moveEvent.clientX - startX;
+      let startAudioX = 0;
+      let origAudioStartTime = 0;
+      addDragListener(audioTrack,
+        (clientX, e) => {
+          e.stopPropagation();
+          audioTrack.style.cursor = 'grabbing';
+          startAudioX = clientX;
+          origAudioStartTime = bgAudio.startTime || 0;
+        },
+        (clientX) => {
+          const deltaX = clientX - startAudioX;
           const deltaTime = deltaX / pxPerSec;
-          let newStartTime = origStartTime + deltaTime;
+          let newStartTime = origAudioStartTime + deltaTime;
           newStartTime = Math.max(0, Math.min(totalDuration - 0.2, newStartTime));
-
           bgAudio.startTime = newStartTime;
           audioTrack.style.left = `${newStartTime * pxPerSec}px`;
-
           const currentAudioName = bgAudio.file ? bgAudio.file.name : (bgAudio.name || 'Background Music');
-          audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${currentAudioName.substring(0, 20)} (${newStartTime.toFixed(1)}s - ${(newStartTime + audioDuration).toFixed(1)}s)`;
-        };
-
-        const onMouseUp = () => {
+          audioText.innerHTML = `<span style="font-weight:bold; margin-right:4px;">🎵 BGM:</span> ${currentAudioName.substring(0, 18)} (${newStartTime.toFixed(1)}s - ${(newStartTime + audioDuration).toFixed(1)}s)`;
+        },
+        () => {
           audioTrack.style.cursor = 'grab';
-          window.removeEventListener('mousemove', onMouseMove);
-          window.removeEventListener('mouseup', onMouseUp);
           updateTimelineUI();
-        };
-
-        window.addEventListener('mousemove', onMouseMove);
-        window.addEventListener('mouseup', onMouseUp);
-      });
+        }
+      );
 
       audioTrackContainer.appendChild(audioTrack);
       wrapper.appendChild(audioTrackContainer);
@@ -803,11 +937,11 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     if (hasVoiceover) {
       const voiceTrack = document.createElement('div');
       voiceTrack.id = 'editor-track-voiceover';
-      voiceTrack.style.cssText = `height: 24px; display: flex; position: relative; border-radius: 4px; background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); font-size: 9px; color: #f87171; align-items: center; padding: 0 8px; box-sizing: border-box; overflow: hidden;`;
+      voiceTrack.style.cssText = `height: 26px; display: flex; position: relative; border-radius: 6px; background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); font-size: 9.5px; color: #f87171; align-items: center; padding: 0 8px; box-sizing: border-box; overflow: hidden;`;
 
       let vX = 0;
       clips.forEach((c, idx) => {
-        const duration = (c.endTrim - c.startTrim) / c.speed;
+        const duration = (c.endTrim - c.startTrim) / ((typeof c.speed === 'number' && c.speed > 0) ? c.speed : 1);
         if (c.voiceOverUrl) {
           const vBar = document.createElement('div');
           vBar.style.cssText = `position: absolute; left: ${vX}px; width: ${duration * pxPerSec}px; height: 100%; display: flex; align-items: center; background: rgba(248, 113, 113, 0.2); border-right: 1px solid rgba(248, 113, 113, 0.3); padding: 0 6px; box-sizing: border-box;`;
@@ -825,13 +959,15 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   }
 
   function seekTimelineToClipFrame(index, frameTime) {
+    if (index === null || index === undefined || !clips[index]) return;
     let cumulativeTime = 0;
     for (let i = 0; i < index; i++) {
-      cumulativeTime += (clips[i].endTrim - clips[i].startTrim) / clips[i].speed;
+      cumulativeTime += (clips[i].endTrim - clips[i].startTrim) / ((typeof clips[i].speed === 'number' && clips[i].speed > 0) ? clips[i].speed : 1);
     }
 
     const clip = clips[index];
-    const offset = (frameTime - clip.startTrim) / clip.speed;
+    const speed = (typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1;
+    const offset = (frameTime - clip.startTrim) / speed;
     currentPlaybackTime = cumulativeTime + offset;
 
     if (clip && clip.element) {
@@ -844,30 +980,22 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     renderCurrentFrame();
   }
 
-  function updateTimelineDOMWidths(pxPerSec) {
+  function updateTimelineDOMWidths(currentPxPerSec) {
     const wrapper = document.getElementById('editor-tracks-container');
     if (!wrapper) return;
 
-    const totalWidth = totalDuration * pxPerSec;
-    wrapper.style.width = `${totalWidth}px`;
+    totalDuration = getCanonicalDuration(clips);
+    const effPxPerSec = currentPxPerSec || pxPerSec;
+    const totalWidth = totalDuration * effPxPerSec;
 
-    const ruler = document.getElementById('editor-track-ruler');
-    if (ruler) {
-      ruler.innerHTML = '';
-      const tickInterval = totalDuration > 60 ? 10 : (totalDuration > 30 ? 5 : 2);
-      for (let t = 0; t <= totalDuration; t += tickInterval) {
-        const mark = document.createElement('div');
-        mark.style.cssText = `position: absolute; left: ${t * pxPerSec}px; top: 0; height: 100%; border-left: 1px solid rgba(255,255,255,0.15); padding-left: 3px; display: flex; align-items: flex-end; padding-bottom: 2px;`;
-        mark.innerText = `${t}s`;
-        ruler.appendChild(mark);
-      }
-    }
+    const isMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
+    const minClipW = isMobile ? 80 : 60;
 
     const clipItems = wrapper.querySelectorAll('.timeline-clip-item');
     let currentX = 0;
     clips.forEach((clip, index) => {
-      const duration = (clip.endTrim - clip.startTrim) / clip.speed;
-      const width = duration * pxPerSec;
+      const duration = (clip.endTrim - clip.startTrim) / ((typeof clip.speed === 'number' && clip.speed > 0) ? clip.speed : 1);
+      const width = Math.max(minClipW, duration * effPxPerSec);
 
       const item = clipItems[index];
       if (item) {
@@ -882,12 +1010,26 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       currentX += width;
     });
 
+    wrapper.style.width = `${Math.max(currentX, totalWidth)}px`;
+
+    const ruler = document.getElementById('editor-track-ruler');
+    if (ruler) {
+      ruler.innerHTML = '';
+      const tickInterval = totalDuration > 60 ? 10 : (totalDuration > 30 ? 5 : (totalDuration > 10 ? 2 : 1));
+      for (let t = 0; t <= totalDuration; t += tickInterval) {
+        const mark = document.createElement('div');
+        mark.style.cssText = `position: absolute; left: ${t * effPxPerSec}px; top: 0; height: 100%; border-left: 1px solid rgba(255,255,255,0.2); padding-left: 3px; display: flex; align-items: flex-end; padding-bottom: 2px; pointer-events: none;`;
+        mark.innerText = `${t}s`;
+        ruler.appendChild(mark);
+      }
+    }
+
     if (bgAudio) {
       const audioTrack = document.getElementById('editor-track-audio');
       if (audioTrack) {
-        const audioDuration = bgAudio.element ? bgAudio.element.duration || 10 : 10;
-        audioTrack.style.left = `${(bgAudio.startTime || 0) * pxPerSec}px`;
-        audioTrack.style.width = `${audioDuration * pxPerSec}px`;
+        const audioDuration = bgAudio.element ? (bgAudio.element.duration || 10) : 10;
+        audioTrack.style.left = `${(bgAudio.startTime || 0) * effPxPerSec}px`;
+        audioTrack.style.width = `${audioDuration * effPxPerSec}px`;
       }
     }
 
@@ -897,13 +1039,13 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       const vBars = voiceTrack.children;
       let barIdx = 0;
       clips.forEach((c, idx) => {
-        const duration = (c.endTrim - c.startTrim) / c.speed;
+        const duration = (c.endTrim - c.startTrim) / ((typeof c.speed === 'number' && c.speed > 0) ? c.speed : 1);
         if (c.voiceOverUrl && barIdx < vBars.length) {
           const vBar = vBars[barIdx++];
           vBar.style.left = `${vX}px`;
-          vBar.style.width = `${duration * pxPerSec}px`;
+          vBar.style.width = `${duration * effPxPerSec}px`;
         }
-        vX += duration * pxPerSec;
+        vX += duration * effPxPerSec;
       });
       voiceTrack.style.width = `${vX}px`;
     }
@@ -939,12 +1081,17 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   }
 
   function selectClip(index) {
-    if (index >= clips.length) {
-      selectedClipIndex = clips.length > 0 ? clips.length - 1 : null;
+    if (index === null || index === undefined || clips.length === 0) {
+      selectedClipIndex = null;
+    } else if (index >= clips.length) {
+      selectedClipIndex = clips.length - 1;
+    } else if (index < 0) {
+      selectedClipIndex = 0;
     } else {
       selectedClipIndex = index;
     }
 
+    totalDuration = getCanonicalDuration(clips);
     updateTimelineUI();
 
     if (selectedClipIndex === null) {
@@ -994,15 +1141,16 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     }
     speedSelect.disabled = false;
 
-    trimStartInput.value = clip.startTrim.toFixed(1);
-    trimStartInput.max = (clip.endTrim - 0.1).toFixed(1);
-    trimEndInput.value = clip.endTrim.toFixed(1);
-    trimEndInput.max = clip.duration.toFixed(1);
+    trimStartInput.value = (clip.startTrim || 0).toFixed(1);
+    trimStartInput.max = ((clip.endTrim || clip.duration || 3) - 0.1).toFixed(1);
+    trimEndInput.value = (clip.endTrim || clip.duration || 3).toFixed(1);
+    trimEndInput.max = (clip.duration || 3).toFixed(1);
 
-    speedSelect.value = clip.speed.toString();
+    speedSelect.value = (clip.speed || 1.0).toString();
 
     // Update Advanced Editor Sliders & Selects
     if (advFilterSelect) advFilterSelect.value = clip.filterType || 'none';
+    setActiveQuickFilterUI(clip.filterType || 'none');
     if (advBrightness) {
       advBrightness.value = clip.brightness || 100;
       advBrightVal.innerText = `${clip.brightness || 100}%`;
@@ -1037,19 +1185,20 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   }
 
   function removeClip(index) {
+    if (index === null || index === undefined || index < 0 || index >= clips.length) return;
     const clip = clips[index];
     try { URL.revokeObjectURL(clip.url); } catch (e) { }
 
     clips.splice(index, 1);
+    totalDuration = getCanonicalDuration(clips);
+
     if (selectedClipIndex === index) {
-      selectedClipIndex = clips.length > 0 ? 0 : null;
+      selectedClipIndex = clips.length > 0 ? Math.min(index, clips.length - 1) : null;
     } else if (selectedClipIndex > index) {
       selectedClipIndex--;
     }
 
     selectClip(selectedClipIndex);
-    updateTimelineUI();
-    recalculateTotalDuration();
     updatePostButtonsState();
   }
 
@@ -1081,8 +1230,19 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     if (playhead && totalDuration > 0) {
       const container = document.getElementById('editor-tracks-container');
       if (container) {
-        const pxPerSec = container.clientWidth / totalDuration;
-        playhead.style.left = `${currentPlaybackTime * pxPerSec}px`;
+        const effectivePxPerSec = container.clientWidth / totalDuration;
+        const playheadX = currentPlaybackTime * effectivePxPerSec;
+        playhead.style.left = `${playheadX}px`;
+
+        if (timelineContainer && isPlaying) {
+          const scrollLeft = timelineContainer.scrollLeft;
+          const viewWidth = timelineContainer.clientWidth;
+          if (playheadX > scrollLeft + viewWidth - 40) {
+            timelineContainer.scrollLeft = playheadX - viewWidth / 2;
+          } else if (playheadX < scrollLeft) {
+            timelineContainer.scrollLeft = Math.max(0, playheadX - 40);
+          }
+        }
       }
     }
   }
@@ -1859,7 +2019,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       filterString += ` brightness(${clip.exposure || 100}%)`;
     }
     if (clip.filterType === 'grayscale') {
-      filterString += ' grayscale(100%)';
+      filterString += ' grayscale(100%) contrast(110%)';
     } else if (clip.filterType === 'sepia') {
       filterString += ' sepia(100%)';
     } else if (clip.filterType === 'vintage') {
@@ -1868,6 +2028,12 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       filterString += ' hue-rotate(30deg) saturate(90%)';
     } else if (clip.filterType === 'warm') {
       filterString += ' hue-rotate(-20deg) saturate(110%)';
+    } else if (clip.filterType === 'vibrant') {
+      filterString += ' saturate(160%) contrast(115%) brightness(105%)';
+    } else if (clip.filterType === 'cyber') {
+      filterString += ' hue-rotate(180deg) saturate(180%) contrast(120%) brightness(110%)';
+    } else if (clip.filterType === 'cinema') {
+      filterString += ' contrast(130%) brightness(95%) saturate(110%)';
     }
     ctxTarget.filter = filterString;
 
@@ -1919,7 +2085,7 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       filterString += ` brightness(${clip.exposure || 100}%)`;
     }
     if (clip.filterType === 'grayscale') {
-      filterString += ' grayscale(100%)';
+      filterString += ' grayscale(100%) contrast(110%)';
     } else if (clip.filterType === 'sepia') {
       filterString += ' sepia(100%)';
     } else if (clip.filterType === 'vintage') {
@@ -1928,6 +2094,12 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       filterString += ' hue-rotate(30deg) saturate(90%)';
     } else if (clip.filterType === 'warm') {
       filterString += ' hue-rotate(-20deg) saturate(110%)';
+    } else if (clip.filterType === 'vibrant') {
+      filterString += ' saturate(160%) contrast(115%) brightness(105%)';
+    } else if (clip.filterType === 'cyber') {
+      filterString += ' hue-rotate(180deg) saturate(180%) contrast(120%) brightness(110%)';
+    } else if (clip.filterType === 'cinema') {
+      filterString += ' contrast(130%) brightness(95%) saturate(110%)';
     }
     ctxTarget.filter = filterString;
 
@@ -2390,16 +2562,18 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   if (toScreen2Btn) {
     toScreen2Btn.addEventListener('click', () => {
       pausePlayback();
-      screen1.style.display = 'none';
-      screen2.style.display = 'block';
+      screen1.style.setProperty('display', 'none', 'important');
+      screen2.style.setProperty('display', 'block', 'important');
+      screen3.style.setProperty('display', 'none', 'important');
     });
   }
 
   // --- Screen 2 Details & Chips Handling ---
   if (backToScreen1Btn) {
     backToScreen1Btn.addEventListener('click', () => {
-      screen2.style.display = 'none';
-      screen1.style.display = 'flex';
+      screen2.style.setProperty('display', 'none', 'important');
+      screen3.style.setProperty('display', 'none', 'important');
+      screen1.style.setProperty('display', 'flex', 'important');
     });
   }
 
@@ -2632,8 +2806,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   // Screen 2 -> Screen 3 (Render Review & Compile Preview Video)
   if (toScreen3Btn) {
     toScreen3Btn.addEventListener('click', async () => {
-      screen2.style.display = 'none';
-      screen3.style.display = 'block';
+      screen1.style.setProperty('display', 'none', 'important');
+      screen2.style.setProperty('display', 'none', 'important');
+      screen3.style.setProperty('display', 'block', 'important');
 
       // Update Summary Fields
       reviewCaption.innerText = captionInput.value.trim() || 'No caption written.';
@@ -2651,8 +2826,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     backToScreen2Btn.addEventListener('click', () => {
       // Pause final preview
       if (finalVideo) finalVideo.pause();
-      screen3.style.display = 'none';
-      screen2.style.display = 'block';
+      screen1.style.setProperty('display', 'none', 'important');
+      screen3.style.setProperty('display', 'none', 'important');
+      screen2.style.setProperty('display', 'block', 'important');
     });
   }
 
@@ -3647,9 +3823,9 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     recalculateTotalDuration();
     updateCanvasDimensions();
 
-    screen2.style.display = 'none';
-    screen3.style.display = 'none';
-    screen1.style.display = 'flex';
+    screen2.style.setProperty('display', 'none', 'important');
+    screen3.style.setProperty('display', 'none', 'important');
+    screen1.style.setProperty('display', 'flex', 'important');
     switchEditorTab('basic');
   }
 
@@ -3845,11 +4021,69 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     });
   });
 
+  // --- Quick Preset Filters Controller ---
+  const quickFilterCards = document.querySelectorAll('.quick-filter-card');
+  const activeFilterNameDisplay = document.getElementById('editor-active-filter-name');
+  const quickVoiceoverBtn = document.getElementById('editor-quick-voiceover-btn');
+
+  function setActiveQuickFilterUI(filterType) {
+    const activeType = filterType || 'none';
+    quickFilterCards.forEach(card => {
+      const cardFilter = card.getAttribute('data-filter') || 'none';
+      if (cardFilter === activeType) {
+        card.classList.add('active');
+        if (activeFilterNameDisplay) {
+          activeFilterNameDisplay.innerText = card.querySelector('span')?.innerText || 'Normal';
+        }
+      } else {
+        card.classList.remove('active');
+      }
+    });
+    if (advFilterSelect) {
+      advFilterSelect.value = activeType;
+    }
+  }
+
+  quickFilterCards.forEach(card => {
+    card.addEventListener('click', () => {
+      if (selectedClipIndex === null) {
+        showToast('Please select a clip to apply filter! 🎥');
+        return;
+      }
+      const filterType = card.getAttribute('data-filter') || 'none';
+      const clip = clips[selectedClipIndex];
+      clip.filterType = filterType;
+      setActiveQuickFilterUI(filterType);
+      showToast(`Applied ${card.querySelector('span')?.innerText || filterType} Filter ✨`);
+      renderCurrentFrame();
+    });
+  });
+
+  if (quickVoiceoverBtn) {
+    quickVoiceoverBtn.addEventListener('click', () => {
+      if (selectedClipIndex === null) {
+        showToast('Please select a clip to add voiceover! 🎙️');
+        return;
+      }
+      switchEditorTab('advanced');
+      if (tabAdvanced) {
+        tabAdvanced.click();
+      }
+      const voiceSection = document.querySelector('#editor-advanced-panel .adv-section:nth-child(6)');
+      if (voiceSection) {
+        const voiceHeader = voiceSection.querySelector('.adv-header');
+        if (voiceHeader) voiceHeader.click();
+      }
+    });
+  }
+
   // 2. Filters & Color Adjustments
   if (advFilterSelect) {
     advFilterSelect.addEventListener('change', () => {
       if (selectedClipIndex === null) return;
-      clips[selectedClipIndex].filterType = advFilterSelect.value;
+      const filterVal = advFilterSelect.value;
+      clips[selectedClipIndex].filterType = filterVal;
+      setActiveQuickFilterUI(filterVal);
       renderCurrentFrame();
     });
   }
@@ -4499,13 +4733,6 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     });
   }
 
-  // Hook dropdown updates to import media and selection transitions
-  if (fileInput) {
-    fileInput.addEventListener('change', () => {
-      setTimeout(updateTimelineUI, 100);
-    });
-  }
-
   if (tabBasic) tabBasic.addEventListener('click', () => switchEditorTab('basic'));
   if (tabAdvanced) tabAdvanced.addEventListener('click', () => switchEditorTab('advanced'));
   if (tabPro) tabPro.addEventListener('click', () => switchEditorTab('pro'));
@@ -4702,12 +4929,14 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           hour: '2-digit',
           minute: '2-digit'
         });
+        
+        const thumbInfo = getDraftThumbnailInfo(d);
 
         const card = document.createElement('div');
         card.className = 'draft-card';
         card.innerHTML = `
           <div class="draft-card-thumb">
-            ${d.thumbnailUrl ? `<video src="${d.thumbnailUrl}" muted playsinline></video>` : '<i data-lucide="video" style="width: 24px; height: 24px; color: rgba(255,255,255,0.4);"></i>'}
+            ${renderThumbnailHTML(thumbInfo)}
           </div>
           <div class="draft-card-info">
             <h4 class="draft-card-title">${d.caption || 'Untitled Draft'}</h4>
@@ -4904,11 +5133,12 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
         audioNameSpan.innerText = bgAudio.name;
       }
 
+      totalDuration = getCanonicalDuration(clips);
       if (clips.length > 0) {
         selectClip(0);
+      } else {
+        updateTimelineUI();
       }
-      updateTimelineUI();
-      recalculateTotalDuration();
       updatePostButtonsState();
       showToast('Draft restored! 🎥✨');
 

@@ -3,7 +3,7 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { supabase } from '../supabase.js';
-import { otps, sendOTPEmailHelper, authenticateToken } from '../utils.js';
+import { sendOTPEmailHelper, authenticateToken } from '../utils.js';
 
 const router = express.Router();
 
@@ -11,10 +11,10 @@ const router = express.Router();
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || process.env.VITE_SUPABASE_ANON_KEY || 'hihubble-secure-jwt-secret';
 
 // ==========================================
-// 1. SIGNUP OTP: Generate 6-digit OTP and send email
+// 1. SIGNUP OTP: Generate 6-digit OTP and send email via Gmail SMTP
 // ==========================================
 router.post('/api/auth/signup-otp', async (req, res) => {
-  const { fullName, email, username, password, phoneNumber } = req.body;
+  const { fullName, email, username, password, phoneNumber, gender, dateOfBirth } = req.body;
   if (!fullName || !email || !username || !password) {
     return res.status(400).json({ error: 'Name, email, username, and password are required.' });
   }
@@ -22,59 +22,98 @@ router.post('/api/auth/signup-otp', async (req, res) => {
   const normalizedEmail = email.trim().toLowerCase();
   const normalizedUsername = username.trim().toLowerCase();
 
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+
   try {
-    // Pre-check email and username availability in public.profiles table
+    // 1. Pre-check email and username availability in public.profiles table
     const { data: emailExists } = await supabase.from('profiles').select('id').eq('email', normalizedEmail).maybeSingle();
     if (emailExists) return res.status(400).json({ error: 'This email address is already registered.' });
 
     const { data: usernameExists } = await supabase.from('profiles').select('id').eq('username', normalizedUsername).maybeSingle();
     if (usernameExists) return res.status(400).json({ error: 'This username is already taken.' });
 
-    // Generate cryptographically secure 6-digit OTP
-    const otp = crypto.randomInt(100000, 1000000).toString();
-    otps.set(normalizedEmail, {
-      otp,
-      attempts: 0,
-      expiresAt: Date.now() + 5 * 60 * 1000,
-      type: 'signup',
-      payload: {
-        fullName: fullName.trim(),
-        email: normalizedEmail,
-        username: normalizedUsername,
-        password,
-        phoneNumber: phoneNumber ? phoneNumber.trim() : null
-      }
-    });
+    // 2. Enforce 25-second resend cooldown using persistent database timestamps
+    const { data: recentOtp } = await supabase
+      .from('email_verification_otps')
+      .select('last_sent_at')
+      .eq('email', normalizedEmail)
+      .order('last_sent_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    // Attempt to send OTP via SMTP. sendOTPEmailHelper will THROW on SMTP failure.
-    let result;
+    if (recentOtp && recentOtp.last_sent_at) {
+      const elapsed = Date.now() - new Date(recentOtp.last_sent_at).getTime();
+      if (elapsed < 25000) {
+        const waitSecs = Math.ceil((25000 - elapsed) / 1000);
+        return res.status(429).json({
+          error: `Please wait ${waitSecs} seconds before requesting another verification code.`,
+          cooldown: waitSecs
+        });
+      }
+    }
+
+    // 3. Invalidate any prior unconsumed signup OTP records for this email
+    await supabase
+      .from('email_verification_otps')
+      .delete()
+      .eq('email', normalizedEmail)
+      .eq('type', 'signup');
+
+    // 4. Generate cryptographically secure 6-digit numeric OTP
+    const otp = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10-minute expiry
+
+    // 5. Store hashed OTP and pending signup payload in database
+    const { data: insertedOtp, error: insertErr } = await supabase
+      .from('email_verification_otps')
+      .insert([{
+        email: normalizedEmail,
+        otp_hash: otpHash,
+        type: 'signup',
+        payload: {
+          fullName: fullName.trim(),
+          email: normalizedEmail,
+          username: normalizedUsername,
+          password,
+          phoneNumber: phoneNumber ? phoneNumber.trim() : null,
+          gender: gender || null,
+          dateOfBirth: dateOfBirth || null
+        },
+        attempts: 0,
+        expires_at: expiresAt,
+        last_sent_at: new Date().toISOString()
+      }])
+      .select('id')
+      .single();
+
+    if (insertErr || !insertedOtp) {
+      console.error('[Signup OTP] Failed to store OTP in database:', insertErr?.message);
+      return res.status(500).json({ error: 'Unable to initialize verification. Please try again.' });
+    }
+
+    // 6. Send OTP via Nodemailer Gmail SMTP
     try {
-      result = await sendOTPEmailHelper(normalizedEmail, otp);
+      await sendOTPEmailHelper(normalizedEmail, otp);
     } catch (smtpErr) {
-      // SMTP send failed — delete the stored OTP so a fresh attempt can be made
-      otps.delete(normalizedEmail);
-      console.error('[Signup OTP] SMTP send error for', normalizedEmail, ':', smtpErr.message);
+      // Clean up the stored OTP on SMTP failure so user can retry cleanly
+      await supabase.from('email_verification_otps').delete().eq('id', insertedOtp.id);
+      console.error('[Signup OTP] SMTP dispatch error for', normalizedEmail, ':', smtpErr.message);
       console.error('[Signup OTP] SMTP error code:', smtpErr.code || 'N/A');
       return res.status(500).json({
-        error: 'Unable to send verification code. Please check your email address and try again.'
+        error: 'Unable to send verification code right now. Please try again.'
       });
     }
 
-    if (result.success) {
-      res.json({
-        success: true,
-        message: '6-digit verification code sent to your email.'
-      });
-    } else {
-      // Cooldown or config error returned without throwing
-      otps.delete(normalizedEmail);
-      res.status(result.cooldown ? 429 : 500).json({
-        error: result.details || 'Failed to send OTP via email.',
-        cooldown: result.cooldown
-      });
-    }
+    return res.json({
+      success: true,
+      message: '6-digit verification code sent to your email.'
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[Signup OTP] Unexpected error:', err.message);
+    res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
   }
 });
 
@@ -87,40 +126,69 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP code are required.' });
 
   const normalizedEmail = email.trim().toLowerCase();
-  const record = otps.get(normalizedEmail);
-
-  if (!record) return res.status(400).json({ error: 'Invalid or expired verification code.' });
-  if (Date.now() > record.expiresAt) {
-    otps.delete(normalizedEmail);
-    return res.status(400).json({ error: 'Invalid or expired verification code.' });
-  }
-
-  // Brute-force protection: Enforce maximum 5 verification attempts
-  if (record.attempts >= 5) {
-    otps.delete(normalizedEmail);
-    return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
-  }
-
-  if (record.otp !== otp.trim() && otp.trim() !== '123456') {
-    record.attempts = (record.attempts || 0) + 1;
-    if (record.attempts >= 5) {
-      otps.delete(normalizedEmail);
-      return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
-    }
-    return res.status(400).json({ error: 'Invalid or expired verification code.' });
-  }
+  const enteredOtp = otp.trim();
 
   try {
-    otps.delete(normalizedEmail);
-    const { fullName, username, password, phoneNumber } = record.payload;
+    // 1. Fetch active, unconsumed signup OTP record from database
+    const { data: record, error: fetchErr } = await supabase
+      .from('email_verification_otps')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .eq('type', 'signup')
+      .is('consumed_at', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (fetchErr || !record) {
+      return res.status(400).json({ error: 'Invalid or expired verification code.' });
+    }
+
+    // 2. Check 10-minute expiry
+    if (new Date(record.expires_at) < new Date()) {
+      await supabase.from('email_verification_otps').delete().eq('id', record.id);
+      return res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
+    }
+
+    // 3. Brute-force protection: Enforce maximum 5 verification attempts
+    if (record.attempts >= 5) {
+      await supabase.from('email_verification_otps').delete().eq('id', record.id);
+      return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
+    }
+
+    // 4. Constant-time hash verification
+    const enteredHash = crypto.createHash('sha256').update(enteredOtp).digest('hex');
+    const enteredBuf = Buffer.from(enteredHash, 'hex');
+    const storedBuf = Buffer.from(record.otp_hash, 'hex');
+    const isMatch = (enteredBuf.length === storedBuf.length) && crypto.timingSafeEqual(enteredBuf, storedBuf);
+
+    if (!isMatch) {
+      const nextAttempts = (record.attempts || 0) + 1;
+      if (nextAttempts >= 5) {
+        await supabase.from('email_verification_otps').delete().eq('id', record.id);
+        return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
+      }
+      await supabase.from('email_verification_otps').update({ attempts: nextAttempts }).eq('id', record.id);
+      return res.status(400).json({ error: 'Invalid verification code.' });
+    }
+
+    // 5. Mark OTP as consumed and clean up
+    await supabase.from('email_verification_otps').update({ consumed_at: new Date().toISOString() }).eq('id', record.id);
+    await supabase.from('email_verification_otps').delete().eq('email', normalizedEmail);
+
+    // 6. Extract pending registration payload
+    const { fullName, username, password, phoneNumber, gender, dateOfBirth } = record.payload || {};
+    if (!fullName || !username || !password) {
+      return res.status(400).json({ error: 'Registration session details missing. Please sign up again.' });
+    }
+
     const nowIso = new Date().toISOString();
 
-    // Hash password using bcrypt
+    // 7. Hash password with bcrypt
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
 
-    // Insert user profile into public.profiles database table
-    const { data: newUser, error: createError } = await supabase.from('profiles').insert([{
+    let insertPayload = {
       full_name: fullName,
       username: username,
       email: normalizedEmail,
@@ -128,18 +196,32 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       phone_number: phoneNumber,
       is_online: true,
       last_active_at: nowIso
-    }]).select().single();
+    };
+    
+    if (gender) insertPayload.gender = gender;
+    if (dateOfBirth) insertPayload.date_of_birth = dateOfBirth;
 
-    let userObj = newUser;
-
-    if (createError) {
-      console.error('Error creating profile in Supabase profiles table:', createError);
-      return res.status(500).json({ error: `Failed to create user profile in database: ${createError.message}. Please check database table permissions.` });
+    // 8. Insert finalized user profile into public.profiles database table
+    let { data: newUser, error: createError } = await supabase.from('profiles').insert([insertPayload]).select().single();
+    
+    // Fallback if optional columns don't exist
+    if (createError && createError.code === '42703') {
+      console.warn('[Signup Verification] Column not found error (42703). Retrying without gender/date_of_birth.');
+      delete insertPayload.gender;
+      delete insertPayload.date_of_birth;
+      const retryResult = await supabase.from('profiles').insert([insertPayload]).select().single();
+      newUser = retryResult.data;
+      createError = retryResult.error;
     }
 
-    const userId = userObj.id;
+    if (createError || !newUser) {
+      console.error('[Signup Verification] Error creating profile in Supabase profiles table:', createError);
+      return res.status(500).json({ error: 'Failed to create user profile in database. Please check database permissions.' });
+    }
 
-    // Record login history in public.login_history table
+    const userId = newUser.id;
+
+    // 9. Record login history in public.login_history table
     try {
       const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
       const userAgent = req.headers['user-agent'] || 'Browser';
@@ -151,7 +233,7 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       }]);
     } catch (_) {}
 
-    // Record active status in public.online_users table
+    // 10. Record active status in public.online_users table
     try {
       await supabase.from('online_users').upsert([{
         user_id: userId,
@@ -159,9 +241,9 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       }]);
     } catch (_) {}
 
-    // Issue JWT token
+    // 11. Issue JWT token (7-day duration)
     const token = jwt.sign(
-      { id: userId, sub: userId, username: userObj.username, email: normalizedEmail, role: 'authenticated', aud: 'authenticated' },
+      { id: userId, sub: userId, username: newUser.username, email: normalizedEmail, role: 'authenticated', aud: 'authenticated' },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -172,15 +254,16 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       token,
       user: {
         id: userId,
-        username: userObj.username,
-        email: userObj.email,
-        fullName: userObj.full_name || userObj.username,
-        phoneNumber: userObj.phone_number || null,
-        profileImage: userObj.profile_image_url || null
+        username: newUser.username,
+        email: newUser.email,
+        fullName: newUser.full_name || newUser.username,
+        phoneNumber: newUser.phone_number || null,
+        profileImage: newUser.profile_image_url || null
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[Signup Verification] Unexpected error:', err.message);
+    res.status(500).json({ error: 'An unexpected error occurred during verification.' });
   }
 });
 
@@ -335,27 +418,66 @@ router.post('/api/auth/forgot-otp', async (req, res) => {
   if (!username || !newPassword) return res.status(400).json({ error: 'Username and new password are required.' });
 
   try {
-    const { data: user } = await supabase.from('profiles').select('id, email').eq('username', username.toLowerCase()).maybeSingle();
-    if (!user) return res.status(404).json({ error: 'Username not found.' });
+    const normalizedUsername = username.trim().toLowerCase();
+    const { data: user } = await supabase.from('profiles').select('id, email').eq('username', normalizedUsername).maybeSingle();
+    if (!user || !user.email) return res.status(404).json({ error: 'Username not found or has no email associated.' });
 
-    const otp = crypto.randomInt(100000, 1000000).toString();
-    otps.set(user.email.toLowerCase(), {
-      otp,
-      attempts: 0,
-      expiresAt: Date.now() + 5 * 60 * 1000,
-      type: 'forgot',
-      payload: { userId: user.id, newPassword }
-    });
+    const normalizedEmail = user.email.trim().toLowerCase();
 
-    try {
-      await sendOTPEmailHelper(user.email, otp);
-    } catch (smtpErr) {
-      otps.delete(user.email.toLowerCase());
-      console.error('[Forgot OTP] SMTP error:', smtpErr.message);
-      return res.status(500).json({ error: 'Unable to send verification code. Please try again.' });
+    // Check 25s cooldown
+    const { data: recentOtp } = await supabase
+      .from('email_verification_otps')
+      .select('last_sent_at')
+      .eq('email', normalizedEmail)
+      .order('last_sent_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (recentOtp && recentOtp.last_sent_at) {
+      const elapsed = Date.now() - new Date(recentOtp.last_sent_at).getTime();
+      if (elapsed < 25000) {
+        const waitSecs = Math.ceil((25000 - elapsed) / 1000);
+        return res.status(429).json({
+          error: `Please wait ${waitSecs} seconds before requesting another code.`,
+          cooldown: waitSecs
+        });
+      }
     }
 
-    res.json({ success: true, message: 'OTP sent successfully.', email: user.email });
+    // Invalidate existing forgot OTPs
+    await supabase.from('email_verification_otps').delete().eq('email', normalizedEmail).eq('type', 'forgot');
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    const { data: insertedOtp, error: insertErr } = await supabase
+      .from('email_verification_otps')
+      .insert([{
+        email: normalizedEmail,
+        otp_hash: otpHash,
+        type: 'forgot',
+        payload: { userId: user.id, newPassword },
+        attempts: 0,
+        expires_at: expiresAt,
+        last_sent_at: new Date().toISOString()
+      }])
+      .select('id')
+      .single();
+
+    if (insertErr || !insertedOtp) {
+      return res.status(500).json({ error: 'Unable to initialize password reset. Please try again.' });
+    }
+
+    try {
+      await sendOTPEmailHelper(normalizedEmail, otp);
+    } catch (smtpErr) {
+      await supabase.from('email_verification_otps').delete().eq('id', insertedOtp.id);
+      console.error('[Forgot OTP] SMTP error:', smtpErr.message);
+      return res.status(500).json({ error: 'Unable to send verification code right now. Please try again.' });
+    }
+
+    res.json({ success: true, message: 'Verification code sent to your email.', email: normalizedEmail });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -364,14 +486,50 @@ router.post('/api/auth/forgot-otp', async (req, res) => {
 
 router.post('/api/auth/verify-forgot-otp', async (req, res) => {
   const { email, otp } = req.body;
-  const record = otps.get(email.toLowerCase());
+  if (!email || !otp) return res.status(400).json({ error: 'Email and OTP code are required.' });
 
-  if (!record || record.type !== 'forgot') return res.status(400).json({ error: 'No forgot password session found.' });
-  if (Date.now() > record.expiresAt) { otps.delete(email.toLowerCase()); return res.status(400).json({ error: 'OTP expired.' }); }
-  if (record.otp !== otp) return res.status(400).json({ error: 'Invalid OTP.' });
+  const normalizedEmail = email.trim().toLowerCase();
+  const enteredOtp = otp.trim();
 
   try {
-    otps.delete(email.toLowerCase());
+    const { data: record, error: fetchErr } = await supabase
+      .from('email_verification_otps')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .eq('type', 'forgot')
+      .is('consumed_at', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (fetchErr || !record) return res.status(400).json({ error: 'No active password reset session found.' });
+    if (new Date(record.expires_at) < new Date()) {
+      await supabase.from('email_verification_otps').delete().eq('id', record.id);
+      return res.status(400).json({ error: 'Verification code has expired.' });
+    }
+    if (record.attempts >= 5) {
+      await supabase.from('email_verification_otps').delete().eq('id', record.id);
+      return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
+    }
+
+    const enteredHash = crypto.createHash('sha256').update(enteredOtp).digest('hex');
+    const enteredBuf = Buffer.from(enteredHash, 'hex');
+    const storedBuf = Buffer.from(record.otp_hash, 'hex');
+    const isMatch = (enteredBuf.length === storedBuf.length) && crypto.timingSafeEqual(enteredBuf, storedBuf);
+
+    if (!isMatch) {
+      const nextAttempts = (record.attempts || 0) + 1;
+      if (nextAttempts >= 5) {
+        await supabase.from('email_verification_otps').delete().eq('id', record.id);
+        return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
+      }
+      await supabase.from('email_verification_otps').update({ attempts: nextAttempts }).eq('id', record.id);
+      return res.status(400).json({ error: 'Invalid verification code.' });
+    }
+
+    await supabase.from('email_verification_otps').update({ consumed_at: new Date().toISOString() }).eq('id', record.id);
+    await supabase.from('email_verification_otps').delete().eq('email', normalizedEmail);
+
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(record.payload.newPassword, salt);
 

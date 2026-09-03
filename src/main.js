@@ -1,5 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+import { getDraftThumbnailInfo, renderThumbnailHTML } from './services/draft_thumbnail_service.js';
 import CreatePost from './pages/CreatePost/CreatePost.jsx';
 import { initVideoEditor } from './video_editor_controller.js';
 import { Input, Output, BlobSource, BufferTarget, WebMOutputFormat, Mp4OutputFormat, Conversion, ALL_FORMATS } from 'mediabunny';
@@ -30,7 +31,7 @@ class HubbingPlaybackController {
   bindGlobalScrollListener() {
     if (this.scrollListenerBound) return;
     const bindScroller = () => {
-      const scroller = document.querySelector('.main-content');
+      const scroller = document.getElementById('explore-reels-container');
       if (scroller && !scroller._hubbingScrollBound) {
         scroller._hubbingScrollBound = true;
         this.scrollListenerBound = true;
@@ -177,8 +178,11 @@ class HubbingPlaybackController {
       return;
     }
 
-    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-    const viewportCenter = viewportHeight / 2;
+    const scrollerRect = exploreContainer.getBoundingClientRect();
+    const scrollerTop = scrollerRect.top;
+    const scrollerBottom = scrollerRect.bottom;
+    const scrollerHeight = scrollerRect.height;
+    const scrollerCenter = scrollerTop + scrollerHeight / 2;
 
     let bestCandidate = null;
     let minCenterDistance = Infinity;
@@ -193,14 +197,15 @@ class HubbingPlaybackController {
       const rect = card.getBoundingClientRect();
       const cardHeight = rect.height || 640;
 
-      // Calculate visible overlap in viewport
-      const visibleTop = Math.max(0, rect.top);
-      const visibleBottom = Math.min(viewportHeight, rect.bottom);
+      // Calculate visible overlap in container viewport
+      const visibleTop = Math.max(scrollerTop, rect.top);
+      const visibleBottom = Math.min(scrollerBottom, rect.bottom);
       const visibleHeight = Math.max(0, visibleBottom - visibleTop);
       const visibleRatio = visibleHeight / cardHeight;
 
-      const cardCenter = rect.top + (cardHeight / 2);
-      const centerDistance = Math.abs(cardCenter - viewportCenter);
+      // Calculate distance of card center from container center
+      const cardCenter = rect.top + cardHeight / 2;
+      const centerDistance = Math.abs(cardCenter - scrollerCenter);
 
       // Card must be at least 25% visible in viewport
       if (visibleRatio >= 0.25) {
@@ -647,7 +652,7 @@ window.StoryAudioManager = {
 
     this.audio.muted = !!this.isMutedState;
     return this.audio.play().catch(e => {
-      console.warn('[StoryAudioManager.play] Autoplay notice:', e.message || e);
+      console.debug('[StoryAudioManager.play] Autoplay notice:', e.message || e);
       if (e.name === 'NotAllowedError') {
         const unlockAudio = () => {
           window.removeEventListener('click', unlockAudio, true);
@@ -1720,9 +1725,9 @@ window.renderDraftsList = async function () {
     drafts.slice(0, 4).forEach(d => {
       const timeStr = window.formatRelativeTime(d.lastModified || d.createdAt);
       const title = d.caption || d.title || 'Untitled HUBB';
-      const imgUrl = d.thumbDataUrl || d.mediaThumbUrl || (d.mediaFile ? URL.createObjectURL(d.mediaFile) : '');
+      const thumbInfo = getDraftThumbnailInfo(d);
       const mediaCount = (d.mediaItems && d.mediaItems.length) || (d.mediaCount || 1);
-      const isVideo = (d.mediaType && d.mediaType.startsWith('video')) || (d.mediaItems && d.mediaItems[0] && d.mediaItems[0].type && d.mediaItems[0].type.startsWith('video'));
+      const isVideo = thumbInfo.isVideo;
 
       // Sidebar item in Create Hubbs view
       if (list) {
@@ -1739,7 +1744,7 @@ window.renderDraftsList = async function () {
         item.innerHTML = `
           <div style="display:flex; gap:10px; align-items:center; min-width:0; flex:1; overflow:hidden;">
             <div style="position:relative; width:44px; height:44px; flex-shrink:0; border-radius:10px; overflow:hidden; background:#111; border: 1px solid rgba(255,255,255,0.1);">
-              ${imgUrl ? `<img src="${imgUrl}" style="width:100%; height:100%; object-fit:cover;" alt="Thumbnail">` : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:var(--text-muted);"><i data-lucide="image" style="width:20px; height:20px;"></i></div>`}
+              ${renderThumbnailHTML(thumbInfo)}
               ${mediaCount > 1 ? `<div style="position:absolute; bottom:2px; right:2px; background:var(--primary); color:white; font-size:0.55rem; font-weight:700; padding:1px 4px; border-radius:6px; line-height:1.1;">${mediaCount}</div>` : ''}
               ${isVideo ? `<div style="position:absolute; top:2px; left:2px; background:rgba(0,0,0,0.6); color:white; font-size:0.5rem; padding:1px 3px; border-radius:4px;"><i data-lucide="video" style="width:8px; height:8px;"></i></div>` : ''}
             </div>
@@ -1794,13 +1799,256 @@ window.renderDraftsList = async function () {
   if (window.lucide) window.lucide.createIcons();
 };
 
+// --- HUBBS DRAFTS MULTI-SELECTION & BULK DELETION CONTROLLER ---
+window.draftsSelectionMode = false;
+window.selectedDraftIds = new Set();
+
+window.enterDraftsSelectionMode = function () {
+  window.draftsSelectionMode = true;
+  window.selectedDraftIds.clear();
+
+  const modal = document.getElementById('story-drafts-modal');
+  if (modal) modal.classList.add('selection-mode');
+
+  const normActions = document.getElementById('see-all-drafts-normal-actions');
+  const selActions = document.getElementById('see-all-drafts-selection-actions');
+  if (normActions) normActions.style.display = 'none';
+  if (selActions) selActions.style.display = 'flex';
+
+  window.updateDraftsSelectionUI();
+
+  const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+  window.renderSeeAllDrafts(searchVal);
+};
+
+window.exitDraftsSelectionMode = function () {
+  window.draftsSelectionMode = false;
+  window.selectedDraftIds.clear();
+
+  const modal = document.getElementById('story-drafts-modal');
+  if (modal) modal.classList.remove('selection-mode');
+
+  const normActions = document.getElementById('see-all-drafts-normal-actions');
+  const selActions = document.getElementById('see-all-drafts-selection-actions');
+  if (normActions) normActions.style.display = 'flex';
+  if (selActions) selActions.style.display = 'none';
+
+  window.updateDraftsSelectionUI();
+
+  const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+  window.renderSeeAllDrafts(searchVal);
+};
+
+window.updateDraftsSelectionUI = function () {
+  const count = window.selectedDraftIds.size;
+  const countEl = document.getElementById('see-all-drafts-selected-count');
+  if (countEl) countEl.innerText = count;
+
+  const delBtn = document.getElementById('see-all-drafts-delete-selected-btn');
+  if (delBtn) {
+    if (count > 0) {
+      delBtn.disabled = false;
+      delBtn.style.opacity = '1';
+      delBtn.style.cursor = 'pointer';
+      delBtn.style.pointerEvents = 'auto';
+    } else {
+      delBtn.disabled = true;
+      delBtn.style.opacity = '0.5';
+      delBtn.style.cursor = 'not-allowed';
+      delBtn.style.pointerEvents = 'none';
+    }
+  }
+};
+
+window.toggleDraftSelection = function (id) {
+  if (!id) return;
+  if (window.selectedDraftIds.has(id)) {
+    window.selectedDraftIds.delete(id);
+  } else {
+    window.selectedDraftIds.add(id);
+  }
+
+  // Visual card update
+  const card = document.querySelector(`.see-all-draft-card[data-draft-id="${id}"]`);
+  if (card) {
+    const isSelected = window.selectedDraftIds.has(id);
+    card.classList.toggle('selected', isSelected);
+    const chk = card.querySelector('.see-all-draft-checkbox');
+    if (chk) chk.classList.toggle('checked', isSelected);
+  }
+
+  window.updateDraftsSelectionUI();
+};
+
+window.selectAllDrafts = function () {
+  if (!window.draftsSelectionMode) {
+    window.draftsSelectionMode = true;
+    const modal = document.getElementById('story-drafts-modal');
+    if (modal) modal.classList.add('selection-mode');
+    const normActions = document.getElementById('see-all-drafts-normal-actions');
+    const selActions = document.getElementById('see-all-drafts-selection-actions');
+    if (normActions) normActions.style.display = 'none';
+    if (selActions) selActions.style.display = 'flex';
+  }
+
+  const cards = document.querySelectorAll('#story-drafts-list .see-all-draft-card');
+  cards.forEach(card => {
+    const id = card.getAttribute('data-draft-id');
+    if (id) {
+      window.selectedDraftIds.add(id);
+      card.classList.add('selected');
+      const chk = card.querySelector('.see-all-draft-checkbox');
+      if (chk) chk.classList.add('checked');
+    }
+  });
+
+  window.updateDraftsSelectionUI();
+};
+
+window.closeDraftsConfirmDialog = function () {
+  const dialog = document.getElementById('see-all-drafts-confirm-dialog');
+  if (dialog) dialog.style.display = 'none';
+};
+
+window.promptDeleteSelectedDrafts = function () {
+  const count = window.selectedDraftIds.size;
+  if (count === 0) {
+    showToast('No drafts selected.');
+    return;
+  }
+
+  const dialog = document.getElementById('see-all-drafts-confirm-dialog');
+  const titleEl = document.getElementById('see-all-drafts-confirm-title');
+  const descEl = document.getElementById('see-all-drafts-confirm-desc');
+  const confirmBtn = document.getElementById('see-all-drafts-confirm-delete-btn');
+
+  if (titleEl) titleEl.innerText = `Delete ${count} Selected Draft${count > 1 ? 's' : ''}?`;
+  if (descEl) descEl.innerText = `Are you sure you want to delete ${count} selected HUBB draft${count > 1 ? 's' : ''}? This action cannot be undone.`;
+  if (confirmBtn) {
+    confirmBtn.innerText = `Delete (${count})`;
+    confirmBtn.onclick = window.executeDeleteSelectedDrafts;
+  }
+
+  if (dialog) dialog.style.display = 'flex';
+};
+
+window.executeDeleteSelectedDrafts = async function () {
+  window.closeDraftsConfirmDialog();
+  const idsToDelete = Array.from(window.selectedDraftIds);
+  if (idsToDelete.length === 0) return;
+
+  try {
+    for (const id of idsToDelete) {
+      await DraftsDB.deleteDraft(id);
+      if (window.currentDraftId === id) {
+        window.currentDraftId = null;
+        window.currentDraftCreatedAt = null;
+      }
+    }
+
+    const count = idsToDelete.length;
+    showToast(`${count} draft${count > 1 ? 's' : ''} deleted! 🗑️`);
+    window.selectedDraftIds.clear();
+    window.exitDraftsSelectionMode();
+    await window.renderDraftsList();
+    const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+    await window.renderSeeAllDrafts(searchVal);
+    window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'delete_bulk', count } }));
+  } catch (err) {
+    console.error('Failed to delete selected drafts:', err);
+    showToast('Error deleting selected drafts.');
+  }
+};
+
+window.promptDeleteAllDrafts = async function () {
+  const drafts = await DraftsDB.getDrafts();
+  if (!drafts || drafts.length === 0) {
+    showToast('No drafts to delete.');
+    return;
+  }
+
+  const dialog = document.getElementById('see-all-drafts-confirm-dialog');
+  const titleEl = document.getElementById('see-all-drafts-confirm-title');
+  const descEl = document.getElementById('see-all-drafts-confirm-desc');
+  const confirmBtn = document.getElementById('see-all-drafts-confirm-delete-btn');
+
+  if (titleEl) titleEl.innerText = 'Delete All HUBB Drafts?';
+  if (descEl) descEl.innerText = `Are you sure you want to permanently delete all ${drafts.length} HUBB drafts? This action cannot be undone.`;
+  if (confirmBtn) {
+    confirmBtn.innerText = `Delete All (${drafts.length})`;
+    confirmBtn.onclick = window.executeDeleteAllDrafts;
+  }
+
+  if (dialog) dialog.style.display = 'flex';
+};
+
+window.executeDeleteAllDrafts = async function () {
+  window.closeDraftsConfirmDialog();
+  try {
+    const drafts = await DraftsDB.getDrafts();
+    for (const d of drafts) {
+      await DraftsDB.deleteDraft(d.id);
+    }
+    window.currentDraftId = null;
+    window.currentDraftCreatedAt = null;
+    window.selectedDraftIds.clear();
+    window.exitDraftsSelectionMode();
+    showToast('All HUBB drafts deleted! 🗑️');
+    await window.renderDraftsList();
+    await window.renderSeeAllDrafts('');
+    window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'delete_all' } }));
+  } catch (err) {
+    console.error('Failed to delete all drafts:', err);
+    showToast('Error deleting all drafts.');
+  }
+};
+
 window.renderSeeAllDrafts = async function (query = '') {
   const modalList = document.getElementById('story-drafts-list');
   const countBadge = document.getElementById('see-all-drafts-count-badge');
+  const bottomBar = document.getElementById('see-all-drafts-bottom-bar');
+  const searchBox = document.getElementById('see-all-drafts-search-container');
   if (!modalList) return;
 
   const drafts = await DraftsDB.getDrafts();
-  if (countBadge) countBadge.innerText = drafts.length;
+  const totalCount = drafts.length;
+  if (countBadge) countBadge.innerText = totalCount;
+
+  if (totalCount === 0) {
+    if (bottomBar) bottomBar.style.display = 'none';
+    if (searchBox) searchBox.style.display = 'none';
+    window.draftsSelectionMode = false;
+    window.selectedDraftIds.clear();
+    const modal = document.getElementById('story-drafts-modal');
+    if (modal) modal.classList.remove('selection-mode');
+
+    modalList.innerHTML = `
+      <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:54px 20px; text-align:center; color:var(--text-muted);">
+        <div style="width:64px; height:64px; border-radius:50%; background:rgba(168,85,247,0.1); color:var(--primary); display:flex; align-items:center; justify-content:center; margin-bottom:16px;">
+          <i data-lucide="folder" style="width:32px; height:32px;"></i>
+        </div>
+        <h4 style="margin:0 0 6px 0; color:var(--text-main); font-size:1.15rem; font-weight:700;">No HUBBs Drafts Yet</h4>
+        <p style="margin:0; font-size:0.88rem; opacity:0.75; max-width:280px; line-height:1.4;">Saved HUBBs will appear here.</p>
+      </div>
+    `;
+    if (window.lucide) window.lucide.createIcons();
+    return;
+  }
+
+  if (bottomBar) bottomBar.style.display = 'flex';
+  if (searchBox) searchBox.style.display = 'block';
+
+  // Update Action Bar buttons
+  const normActions = document.getElementById('see-all-drafts-normal-actions');
+  const selActions = document.getElementById('see-all-drafts-selection-actions');
+  if (window.draftsSelectionMode) {
+    if (normActions) normActions.style.display = 'none';
+    if (selActions) selActions.style.display = 'flex';
+  } else {
+    if (normActions) normActions.style.display = 'flex';
+    if (selActions) selActions.style.display = 'none';
+  }
+  window.updateDraftsSelectionUI();
 
   const lowerQuery = (query || '').toLowerCase().trim();
   const filtered = drafts.filter(d => {
@@ -1815,9 +2063,9 @@ window.renderSeeAllDrafts = async function (query = '') {
   if (filtered.length === 0) {
     modalList.innerHTML = `
       <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:48px 20px; text-align:center; color:var(--text-muted);">
-        <i data-lucide="archive" style="width:48px; height:48px; color:rgba(255,255,255,0.2); margin-bottom:12px;"></i>
-        <h4 style="margin:0 0 6px 0; color:var(--text-main); font-size:1.1rem;">${query ? 'No matching drafts found' : 'No HUBBs Drafts Yet'}</h4>
-        <p style="margin:0; font-size:0.85rem; opacity:0.7;">${query ? 'Try searching for another keyword.' : 'Save your creative work as drafts to continue anytime.'}</p>
+        <i data-lucide="search" style="width:44px; height:44px; color:rgba(255,255,255,0.2); margin-bottom:12px;"></i>
+        <h4 style="margin:0 0 6px 0; color:var(--text-main); font-size:1.05rem;">No matching drafts found</h4>
+        <p style="margin:0; font-size:0.85rem; opacity:0.7;">Try searching for another keyword.</p>
       </div>
     `;
     if (window.lucide) window.lucide.createIcons();
@@ -1825,20 +2073,35 @@ window.renderSeeAllDrafts = async function (query = '') {
   }
 
   filtered.forEach(d => {
+    const isSelected = window.selectedDraftIds.has(d.id);
     const timeStr = window.formatRelativeTime(d.lastModified || d.createdAt);
     const createdStr = d.createdAt ? new Date(d.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown';
     const title = d.caption || d.title || 'Untitled HUBB';
-    const imgUrl = d.thumbDataUrl || d.mediaThumbUrl || (d.mediaFile ? URL.createObjectURL(d.mediaFile) : '');
+    const thumbInfo = getDraftThumbnailInfo(d);
     const mediaCount = (d.mediaItems && d.mediaItems.length) || (d.mediaCount || 1);
-    const isVideo = (d.mediaType && d.mediaType.startsWith('video')) || (d.mediaItems && d.mediaItems[0] && d.mediaItems[0].type && d.mediaItems[0].type.startsWith('video'));
+    const isVideo = thumbInfo.isVideo;
 
     const card = document.createElement('div');
-    card.className = 'see-all-draft-card';
+    card.className = `see-all-draft-card ${isSelected ? 'selected' : ''}`;
+    card.setAttribute('data-draft-id', d.id);
+
+    // Card click handler
+    card.onclick = (e) => {
+      if (window.draftsSelectionMode) {
+        window.toggleDraftSelection(d.id);
+      } else {
+        if (e.target.closest('button') || e.target.closest('.see-all-draft-checkbox')) return;
+        window.loadDraft(d.id);
+      }
+    };
 
     card.innerHTML = `
-      <div style="display:flex; gap:14px; align-items:center; min-width:0; flex:1; cursor:pointer;" onclick="window.loadDraft('${d.id}')">
+      <div class="see-all-draft-checkbox ${isSelected ? 'checked' : ''}" data-draft-id="${d.id}" onclick="event.stopPropagation(); window.toggleDraftSelection('${d.id}');">
+        <i data-lucide="check"></i>
+      </div>
+      <div style="display:flex; gap:14px; align-items:center; min-width:0; flex:1; cursor:pointer;">
         <div style="position:relative; width:64px; height:64px; flex-shrink:0; border-radius:12px; overflow:hidden; background:#111; border: 1px solid rgba(255,255,255,0.12); box-shadow:0 4px 12px rgba(0,0,0,0.3);">
-          ${imgUrl ? `<img src="${imgUrl}" style="width:100%; height:100%; object-fit:cover;" alt="Thumbnail">` : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:var(--text-muted);"><i data-lucide="image" style="width:24px; height:24px;"></i></div>`}
+          ${renderThumbnailHTML(thumbInfo)}
           ${mediaCount > 1 ? `<div style="position:absolute; bottom:3px; right:3px; background:var(--primary); color:white; font-size:0.65rem; font-weight:700; padding:2px 5px; border-radius:6px; box-shadow:0 2px 6px rgba(0,0,0,0.4);">${mediaCount} items</div>` : ''}
           ${isVideo ? `<div style="position:absolute; top:3px; left:3px; background:rgba(0,0,0,0.7); color:white; font-size:0.6rem; padding:2px 4px; border-radius:4px; backdrop-filter:blur(4px);"><i data-lucide="video" style="width:10px; height:10px;"></i></div>` : ''}
         </div>
@@ -1853,10 +2116,10 @@ window.renderSeeAllDrafts = async function (query = '') {
           </div>
         </div>
       </div>
-      <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
-        <button class="see-all-draft-continue-btn" onclick="window.loadDraft('${d.id}')"><i data-lucide="edit-3" style="width:14px; height:14px;"></i> Continue Editing</button>
-        <button class="see-all-draft-dup-btn" title="Duplicate Draft" onclick="window.duplicateDraft('${d.id}', event)"><i data-lucide="copy" style="width:16px; height:16px;"></i></button>
-        <button class="see-all-draft-del-btn" title="Delete Draft" onclick="window.deleteDraft('${d.id}', event)"><i data-lucide="trash-2" style="width:16px; height:16px;"></i></button>
+      <div class="see-all-draft-actions-group" style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+        <button class="see-all-draft-continue-btn" onclick="if(!window.draftsSelectionMode) { event.stopPropagation(); window.loadDraft('${d.id}'); }"><i data-lucide="edit-3" style="width:14px; height:14px;"></i> Continue Editing</button>
+        <button class="see-all-draft-dup-btn" title="Duplicate Draft" onclick="if(!window.draftsSelectionMode) { window.duplicateDraft('${d.id}', event); }"><i data-lucide="copy" style="width:16px; height:16px;"></i></button>
+        <button class="see-all-draft-del-btn" title="Delete Draft" onclick="if(!window.draftsSelectionMode) { window.deleteDraft('${d.id}', event); }"><i data-lucide="trash-2" style="width:16px; height:16px;"></i></button>
       </div>
     `;
     modalList.appendChild(card);
@@ -1871,6 +2134,8 @@ window.openSeeAllDrafts = function () {
   modal.classList.add('active');
   const searchInput = document.getElementById('see-all-drafts-search');
   if (searchInput) searchInput.value = '';
+  window.draftsSelectionMode = false;
+  window.selectedDraftIds.clear();
   window.renderSeeAllDrafts();
 };
 
@@ -2027,24 +2292,20 @@ window.loadDraft = async function (id) {
 
 window.deleteDraft = async function (id, e) {
   if (e) e.stopPropagation();
-  if (confirm('Delete this story draft?')) {
-    try {
-      await DraftsDB.deleteDraft(id);
-      if (window.currentDraftId === id) {
-        window.currentDraftId = null;
-        window.currentDraftCreatedAt = null;
-      }
-      showToast('Draft deleted!');
-      await window.renderDraftsList();
-      if (document.getElementById('story-drafts-modal')?.classList.contains('active')) {
-        const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
-        await window.renderSeeAllDrafts(searchVal);
-      }
-      window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'delete', draftId: id } }));
-    } catch (err) {
-      console.error('Failed to delete draft:', err);
-      showToast('Error deleting draft.');
+  try {
+    await DraftsDB.deleteDraft(id);
+    if (window.currentDraftId === id) {
+      window.currentDraftId = null;
+      window.currentDraftCreatedAt = null;
     }
+    await window.renderDraftsList();
+    if (document.getElementById('story-drafts-modal')?.classList.contains('active')) {
+      const searchVal = document.getElementById('see-all-drafts-search')?.value || '';
+      await window.renderSeeAllDrafts(searchVal);
+    }
+    window.dispatchEvent(new CustomEvent('hihubble_story_draft_change', { detail: { action: 'delete', draftId: id } }));
+  } catch (err) {
+    // quiet error handling
   }
 };
 
@@ -2133,7 +2394,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
   window.addEventListener('beforeunload', () => {
-    if (state.activeView === 'create-hubbs' && window.chUploads && window.chUploads.length > 0) {
+    const isCreateHubbsActive = (
+      document.body?.getAttribute('data-active-view') === 'create-hubbs' ||
+      document.body?.classList.contains('create-hubbs-view-active') ||
+      document.getElementById('view-create-hubbs')?.classList.contains('active') ||
+      (window.__hubbleAppState && window.__hubbleAppState.activeView === 'create-hubbs')
+    );
+    if (isCreateHubbsActive && window.chUploads && window.chUploads.length > 0) {
       window._silentDraftSave = true;
       if (window.saveCurrentDraft) window.saveCurrentDraft(true);
     }
@@ -2184,7 +2451,7 @@ window.ensureIncomingCallListeners = function () {
     const u = JSON.parse(userStr);
     const userId = u ? (u.id || u._id || '').toString() : '';
     if (userId && callingSubscribedUserId !== userId) {
-      console.warn('[Calling System] Actively subscribing listeners for user:', userId);
+      console.debug('[Calling System] Actively subscribing listeners for user:', userId);
       callingSubscribedUserId = userId;
       listenForIncomingAudioCalls(userId);
       listenForIncomingVideoCalls(userId);
@@ -2233,39 +2500,56 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
-  window.fetchSavedHubbs = async function () {
+  let _savedHubbsInFlightPromise = null;
+  window.fetchSavedHubbs = async function (forceRefresh = false) {
     const token = window.getAuthToken ? window.getAuthToken() : localStorage.getItem('invibe_jwt_token');
     if (!token) return;
-    try {
-      const [postsRes, reelsRes] = await Promise.all([
-        fetch(`${API_URL}/api/posts/saved`, { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch(`${API_URL}/api/reels/saved`, { headers: { 'Authorization': `Bearer ${token}` } })
-      ]);
 
-      let allSaved = [];
-      if (postsRes.ok) {
-        allSaved = allSaved.concat(await postsRes.json());
-      }
-      if (reelsRes.ok) {
-        allSaved = allSaved.concat(await reelsRes.json());
-      }
-      window.savedHubbs = allSaved;
-      window.updateSavedBadgeCount();
-    } catch (e) {
-      console.error("Failed to fetch saved hubbs:", e);
+    if (!forceRefresh && window.savedHubbs && Array.isArray(window.savedHubbs) && !_savedHubbsInFlightPromise) {
+      return window.savedHubbs;
     }
+
+    if (_savedHubbsInFlightPromise) {
+      return _savedHubbsInFlightPromise;
+    }
+
+    _savedHubbsInFlightPromise = (async () => {
+      try {
+        const [postsRes, reelsRes] = await Promise.all([
+          fetch(`${API_URL}/api/posts/saved`, { headers: { 'Authorization': `Bearer ${token}` } }),
+          fetch(`${API_URL}/api/reels/saved`, { headers: { 'Authorization': `Bearer ${token}` } })
+        ]);
+
+        let allSaved = [];
+        if (postsRes.ok) {
+          allSaved = allSaved.concat(await postsRes.json());
+        }
+        if (reelsRes.ok) {
+          allSaved = allSaved.concat(await reelsRes.json());
+        }
+        window.savedHubbs = allSaved;
+        window.updateSavedBadgeCount();
+        return allSaved;
+      } catch (e) {
+        console.error("Failed to fetch saved hubbs:", e);
+        return window.savedHubbs || [];
+      } finally {
+        _savedHubbsInFlightPromise = null;
+      }
+    })();
+
+    return _savedHubbsInFlightPromise;
   };
 
   function getAuthToken() {
     let tok = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || localStorage.getItem('invibeToken') || localStorage.getItem('token');
     if (tok && tok !== 'null' && tok !== 'undefined' && tok.trim() !== '') {
-      return tok;
+      return tok.trim();
     }
     const cu = typeof getCurrentUser === 'function' ? getCurrentUser() : null;
-    if (cu && (cu.id || cu._id)) {
-      tok = (cu.id || cu._id).toString();
-      try { localStorage.setItem('invibe_jwt_token', tok); } catch (_) { }
-      return tok;
+    const cuId = cu ? (cu.id || cu._id) : null;
+    if (cuId && typeof cuId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cuId)) {
+      return cuId.trim();
     }
     return null;
   }
@@ -2279,14 +2563,40 @@ document.addEventListener('DOMContentLoaded', () => {
     window.fetchSavedHubbs();
   });
 
-  // Global Logout Handling (Applies to sidebar logout, mobile logout)
+  function triggerAnimatedLogout() {
+    if (document.getElementById('logout-animated-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'logout-animated-overlay';
+    overlay.innerHTML = `
+      <div class="logout-card-box">
+        <div class="logout-icon-glow">
+          <div class="logout-pulse-ring"></div>
+          <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="logout-icon-svg"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+        </div>
+        <h3 class="logout-title">Logging out...</h3>
+        <p class="logout-subtitle">See you soon on Hi-Hubble ✨</p>
+        <div class="logout-loader-bar"><div class="logout-loader-progress"></div></div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => {
+      overlay.classList.add('active');
+    });
+    setTimeout(() => {
+      overlay.classList.add('fade-out');
+      setTimeout(() => {
+        overlay.remove();
+        handleLogout();
+      }, 200);
+    }, 600);
+  }
+
+  // Global Logout Handling (Applies to sidebar logout, mobile logout, profile logout)
   document.addEventListener('click', (e) => {
-    const logoutBtn = e.target.closest('#logout-btn, .logout-btn, [data-action="logout"]');
+    const logoutBtn = e.target.closest('#logout-btn, .logout-btn, #profile-logout-btn, [data-action="logout"]');
     if (logoutBtn) {
       e.preventDefault();
-      if (confirm('Are you sure you want to log out of Hi-Hubble?')) {
-        handleLogout();
-      }
+      triggerAnimatedLogout();
     }
   });
 
@@ -2466,6 +2776,7 @@ document.addEventListener('DOMContentLoaded', () => {
     isStoryViewsOpen: false,
     isLudoRolling: false
   };
+  window.__hubbleAppState = state;
 
   // Ensure DOM is immediately in sync with state theme
   applyTheme(state.theme, false);
@@ -2564,8 +2875,169 @@ document.addEventListener('DOMContentLoaded', () => {
     );
   }
 
+  function getCanonicalActiveNavSection() {
+    // 1. Notifications panel open
+    const notifPanel = document.getElementById('notifications-panel');
+    if (notifPanel && (notifPanel.style.display === 'flex' || notifPanel.style.display === 'block' || notifPanel.classList.contains('active'))) {
+      return 'notifications';
+    }
+
+    // 2. Modals / overlays mapped to specific sections
+    const reelModal = document.getElementById('explore-create-modal');
+    if (reelModal && (reelModal.classList.contains('active') || reelModal.style.display === 'block' || reelModal.style.display === 'flex')) {
+      return 'explore';
+    }
+
+    const storyModal = document.getElementById('story-viewer-modal');
+    if (storyModal && (storyModal.classList.contains('active') || storyModal.style.display === 'flex' || storyModal.style.display === 'block')) {
+      if (state.activeView === 'explore' || state.activeView === 'reels' || document.body.classList.contains('explore-view-active')) {
+        return 'explore';
+      }
+      return 'home';
+    }
+
+    // 3. Current activeView in application state
+    const cur = (state.activeView || '').toLowerCase();
+
+    // Hubbing / Reels & nested child screens (Story creation, HUBB creation, Review HUBB)
+    if (cur === 'explore' || cur === 'reels' || cur === 'create-hubbs' || cur === 'review-hubbs') {
+      return 'explore';
+    }
+
+    // Messages / Chat Inbox / Personal DM
+    if (cur === 'chats' || cur === 'chat' || cur === 'messages') {
+      return 'chats';
+    }
+
+    // Home / Feed / Create Post
+    if (cur === 'home' || cur === 'feed' || cur === 'create-post') {
+      return 'home';
+    }
+
+    // Search Section
+    if (cur === 'search') {
+      return 'search';
+    }
+
+    // Profile & Settings
+    if (cur === 'profile' || cur === 'profile-settings' || cur === 'settings') {
+      return 'profile';
+    }
+
+    if (cur === 'notifications') {
+      return 'notifications';
+    }
+
+    // 4. Check active DOM view-panel as fallback
+    const activePanel = document.querySelector('.view-panel.active');
+    if (activePanel) {
+      const panelId = activePanel.id;
+      if (panelId === 'view-explore' || panelId === 'view-create-hubbs' || panelId === 'view-review-hubbs') {
+        return 'explore';
+      }
+      if (panelId === 'view-chats') {
+        return 'chats';
+      }
+      if (panelId === 'view-home' || panelId === 'view-create-post') {
+        return 'home';
+      }
+      if (panelId === 'view-search') {
+        return 'search';
+      }
+      if (panelId === 'view-profile' || panelId === 'view-profile-settings' || panelId === 'view-settings') {
+        return 'profile';
+      }
+    }
+
+    // 5. Check URL hash / pathname as secondary fallback
+    try {
+      const hash = (window.location.hash || '').toLowerCase();
+      const pathname = (window.location.pathname || '').toLowerCase();
+      if (hash.includes('explore') || hash.includes('reels') || hash.includes('hubbing') || pathname.includes('hubbing') || pathname.includes('reels')) {
+        return 'explore';
+      }
+      if (hash.includes('chat') || hash.includes('message') || pathname.includes('messages') || pathname.includes('chats')) {
+        return 'chats';
+      }
+      if (hash.includes('search') || pathname.includes('search')) {
+        return 'search';
+      }
+      if (hash.includes('profile') || hash.includes('settings') || pathname.includes('profile')) {
+        return 'profile';
+      }
+      if (hash.includes('notification') || pathname.includes('notification')) {
+        return 'notifications';
+      }
+    } catch (_) { }
+
+    return 'home';
+  }
+
+  function updateHubbleActiveState() {
+    const activeSection = getCanonicalActiveNavSection();
+
+    // 1. Update each radial item bubble
+    const radialBubbles = document.querySelectorAll('#radial-menu-wrapper .radial-item-bubble');
+    let activeBubbleEl = null;
+
+    radialBubbles.forEach(bubble => {
+      let target = bubble.getAttribute('data-target-view');
+      if (!target) {
+        if (bubble.id === 'nav-notifications-btn' || bubble.querySelector('i[data-lucide="bell"]')) {
+          target = 'notifications';
+        } else if (bubble.id === 'radial-search-btn' || bubble.querySelector('i[data-lucide="search"]')) {
+          target = 'search';
+        }
+      }
+
+      const isMatch = (target === activeSection) ||
+                      (activeSection === 'chats' && (target === 'messages' || target === 'chat')) ||
+                      (activeSection === 'explore' && (target === 'reels' || target === 'hubbing')) ||
+                      (activeSection === 'home' && (target === 'feed'));
+
+      if (isMatch) {
+        bubble.classList.add('active-bubble');
+        activeBubbleEl = bubble;
+      } else {
+        bubble.classList.remove('active-bubble');
+      }
+    });
+
+    // 2. Position dynamic radial glow indicator if present
+    const activeGlow = document.getElementById('radial-active-glow');
+    if (activeGlow) {
+      if (activeBubbleEl && navContainer && navContainer.classList.contains('open')) {
+        activeGlow.style.opacity = '1';
+
+        const isVertical = navContainer.classList.contains('orient-vertical-down') ||
+                           navContainer.classList.contains('orient-vertical-up') ||
+                           navContainer.classList.contains('orient-compact-grid');
+
+        if (isVertical) {
+          activeGlow.style.left = '50%';
+          activeGlow.style.transform = 'translate(-50%, -50%)';
+          activeGlow.style.top = (activeBubbleEl.offsetTop + (activeBubbleEl.offsetHeight / 2)) + 'px';
+        } else {
+          activeGlow.style.top = '50%';
+          activeGlow.style.transform = 'translateY(-50%)';
+          activeGlow.style.left = (activeBubbleEl.offsetLeft + (activeBubbleEl.offsetWidth / 2) - 20) + 'px';
+        }
+      } else {
+        activeGlow.style.opacity = '0';
+      }
+    }
+  }
+
+  window.getCanonicalActiveNavSection = getCanonicalActiveNavSection;
+  window.updateHubbleActiveState = updateHubbleActiveState;
+
   function switchView(viewName, userId) {
     if (!viewName) return;
+
+    if (viewName === 'notifications') {
+      toggleNotificationsPanel();
+      return;
+    }
 
     if (typeof window.stopAllPostMusic === 'function') {
       window.stopAllPostMusic();
@@ -2621,6 +3093,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     state.activeView = viewName;
+    document.body.setAttribute('data-active-view', viewName);
+
+    if (viewName === 'home') {
+      document.body.classList.add('home-view-active');
+    } else {
+      document.body.classList.remove('home-view-active');
+    }
+
+    if (viewName === 'explore' || viewName === 'reels') {
+      document.body.classList.add('explore-view-active');
+    } else {
+      document.body.classList.remove('explore-view-active');
+    }
+
+    if (viewName === 'profile' || viewName === 'profile-settings') {
+      document.body.classList.add('profile-view-active');
+    } else {
+      document.body.classList.remove('profile-view-active');
+    }
 
     if (viewName === 'profile') {
       const resolvedTarget = getUserIdentifier(userId);
@@ -2636,8 +3127,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Maintain unified 3-column layout frame across all views
-    document.body.classList.remove('chats-view-active');
     if (viewName === 'chats' || viewName === 'chat' || viewName === 'messages') {
+      document.body.classList.add('chats-view-active');
       const emptyState = document.getElementById('chat-empty-state');
       const chatHeader = document.getElementById('chat-window-header');
       const chatViewport = document.querySelector('.chat-dynamic-viewport');
@@ -2662,6 +3153,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (chatFooter) chatFooter.style.display = 'none';
         loadChatThreads(false);
       }
+    } else {
+      document.body.classList.remove('chats-view-active');
     }
 
     if (viewName === 'search' && typeof initSearchView === 'function') {
@@ -2692,19 +3185,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Update active radial sub-bubbles
-    const activeGlow = document.getElementById('radial-active-glow');
-    radialNavItems.forEach(bubble => {
-      const target = bubble.getAttribute('data-target-view');
-      if (target === viewName) {
-        bubble.classList.add('active-bubble');
-        if (activeGlow) {
-          activeGlow.style.opacity = '1';
-          activeGlow.style.left = (bubble.offsetLeft + (bubble.offsetWidth / 2) - 22) + 'px';
-        }
-      } else {
-        bubble.classList.remove('active-bubble');
-      }
-    });
+    updateHubbleActiveState();
 
     // Update active mobile bottom nav items
     mobileNavItems.forEach(nav => {
@@ -2785,30 +3266,37 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (hubType === 'reel') {
       switchView('explore');
 
+      const targetReelId = (postId || '').toString();
+
       const tryScrollReel = () => {
-        const reelEl = document.querySelector(`.reel-card[data-reel-id="${postId}"]`);
+        const scroller = document.getElementById('explore-reels-container');
+        const reelEl = document.querySelector(`.reel-card[data-reel-id="${targetReelId}"]`) || 
+                       document.querySelector(`.reel-card[data-reel-id="${postId}"]`);
         if (reelEl) {
-          reelEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          reelEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
           // Play the video via central controller
           const video = reelEl.querySelector('.reel-video');
           if (video && window.hubbingPlaybackController) {
-            window.hubbingPlaybackController.activateReel(postId, video, reelEl, true);
+            window.hubbingPlaybackController.activateReel(targetReelId, video, reelEl, true);
           }
           return true;
         }
         return false;
       };
 
-      setTimeout(() => {
-        if (!tryScrollReel()) {
-          if (typeof loadFeedReels === 'function') {
-            loadFeedReels().then(() => {
-              setTimeout(tryScrollReel, 500);
-            });
+      if (!tryScrollReel()) {
+        setTimeout(() => {
+          if (!tryScrollReel()) {
+            if (typeof loadFeedReels === 'function') {
+              loadFeedReels().then(() => {
+                setTimeout(tryScrollReel, 100);
+                setTimeout(tryScrollReel, 400);
+              });
+            }
           }
-        }
-      }, 150);
+        }, 120);
+      }
 
     } else {
       // Switch view to home (feed)
@@ -2856,8 +3344,20 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   radialNavItems.forEach(bubble => {
-    bubble.addEventListener('click', () => {
+    bubble.addEventListener('click', (e) => {
+      if (!navContainer || !navContainer.classList.contains('open')) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       const target = bubble.getAttribute('data-target-view');
+      if (target === 'notifications' || bubble.id === 'nav-notifications-btn') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRadialMenu();
+        toggleNotificationsPanel();
+        return;
+      }
       if (target) {
         switchView(target);
       }
@@ -2886,6 +3386,22 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Profile settings gear button navigation
+  const profileSettingsBtn = document.getElementById('profile-settings-btn');
+  if (profileSettingsBtn) {
+    profileSettingsBtn.addEventListener('click', () => {
+      switchView('profile-settings');
+    });
+  }
+
+  // Profile settings back button navigation
+  const profileSettingsBackBtn = document.getElementById('profile-settings-back-btn');
+  if (profileSettingsBackBtn) {
+    profileSettingsBackBtn.addEventListener('click', () => {
+      switchView('profile');
+    });
+  }
+
   // Messages badge shortcut
   document.getElementById('messages-shortcut-btn').addEventListener('click', () => {
     switchView('chats');
@@ -2898,118 +3414,84 @@ document.addEventListener('DOMContentLoaded', () => {
   const blurOverlay = document.getElementById('radial-menu-blur-overlay');
 
   let isDragging = false;
-  let dragStartX, dragStartY;
-  let bubbleStartX, bubbleStartY;
+  let dragTouchOffsetX = 0;
+  let dragTouchOffsetY = 0;
+  let dragPointerStartX = 0;
+  let dragPointerStartY = 0;
+  let currentTargetX = 0;
+  let currentTargetY = 0;
   let wasOpenOnDragStart = false;
   let lastTouchTime = 0;
+  let activePointerId = null;
 
-  // Prevent default image drag (fixes awkward stretching/ghosting)
+  function getBubbleSize() {
+    const isMobile = window.innerWidth <= 768;
+    return isMobile ? 68 : 80;
+  }
+
+  function getViewportPad() {
+    return 8;
+  }
+
+  function getViewportBounds() {
+    const vw = window.visualViewport ? window.visualViewport.width : window.innerWidth;
+    const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    const bSize = getBubbleSize();
+    const pad = getViewportPad();
+
+    return {
+      minX: pad,
+      maxX: Math.max(pad, vw - bSize - pad),
+      minY: pad,
+      maxY: Math.max(pad, vh - bSize - pad),
+      width: vw,
+      height: vh,
+      bubbleSize: bSize
+    };
+  }
+
+  function applyHubblePosition(x, y) {
+    const bounds = getViewportBounds();
+    const safeX = Math.min(Math.max(x, bounds.minX), bounds.maxX);
+    const safeY = Math.min(Math.max(y, bounds.minY), bounds.maxY);
+
+    navContainer.style.setProperty('left', `${safeX}px`, 'important');
+    navContainer.style.setProperty('top', `${safeY}px`, 'important');
+    navContainer.style.setProperty('right', 'auto', 'important');
+    navContainer.style.setProperty('bottom', 'auto', 'important');
+    navContainer.style.setProperty('margin', '0', 'important');
+    navContainer.style.setProperty('position', 'fixed', 'important');
+    navContainer.style.setProperty('z-index', '999999', 'important');
+    navContainer.style.transform = 'none';
+  }
+
+  // Restore saved Hubble position for current session if available
+  try {
+    const savedX = sessionStorage.getItem('hi_hubble_pos_x');
+    const savedY = sessionStorage.getItem('hi_hubble_pos_y');
+    if (savedX !== null && savedY !== null) {
+      const posX = parseFloat(savedX);
+      const posY = parseFloat(savedY);
+      if (!isNaN(posX) && !isNaN(posY)) {
+        applyHubblePosition(posX, posY);
+      }
+    }
+  } catch (err) {
+    // SessionStorage access may fail in sandboxed iframes
+  }
+
+  // Prevent default native image/element drag
   mainBubble.addEventListener('dragstart', (e) => e.preventDefault());
 
-  // Mouse and Touch Drag Listeners
-  mainBubble.addEventListener('mousedown', dragStart);
-  mainBubble.addEventListener('touchstart', dragStart, { passive: true });
-
-  function dragStart(e) {
-    if (e.type === 'touchstart') {
-      lastTouchTime = Date.now();
-    } else if (e.type === 'mousedown') {
-      // Prevent simulated mouse events on mobile touch devices
-      if (Date.now() - lastTouchTime < 600) {
-        return;
-      }
-      e.preventDefault(); // Prevent accidental text/image selection
-    }
-
-    // Track whether the menu was open when the interaction started
-    wasOpenOnDragStart = navContainer.classList.contains('open');
-
-    isDragging = false;
-    const coords = getDragCoords(e);
-    dragStartX = coords.x;
-    dragStartY = coords.y;
-
-    const rect = navContainer.getBoundingClientRect();
-    bubbleStartX = rect.left;
-    bubbleStartY = rect.top;
-
-    // Disable styling transitions during active drag coordinate movement
-    navContainer.style.transition = 'none';
-    navContainer.classList.add('dragging');
-
-    document.addEventListener('mousemove', dragMove);
-    document.addEventListener('mouseup', dragEnd);
-    document.addEventListener('touchmove', dragMove, { passive: false });
-    document.addEventListener('touchend', dragEnd);
+  // Unified Pointer & Touch Event Listeners on mainBubble
+  if (window.PointerEvent) {
+    mainBubble.addEventListener('pointerdown', dragStart, { passive: false });
+  } else {
+    mainBubble.addEventListener('mousedown', dragStart);
+    mainBubble.addEventListener('touchstart', dragStart, { passive: false });
   }
 
-  let dragMoveTicking = false;
-  function dragMove(e) {
-    const coords = getDragCoords(e);
-    const deltaX = coords.x - dragStartX;
-    const deltaY = coords.y - dragStartY;
-
-    // 5px threshold to separate simple clicks from drags
-    if (Math.abs(deltaX) > 5 || Math.abs(deltaY) > 5) {
-      isDragging = true;
-      if (e.type === 'touchmove') e.preventDefault(); // Prevent double scroll in mobile
-    }
-
-    if (isDragging && !dragMoveTicking) {
-      dragMoveTicking = true;
-      window.requestAnimationFrame(() => {
-        // Only set the initial position once to avoid layout thrashing
-        if (!navContainer.style.left || navContainer.style.left === 'auto') {
-          navContainer.style.bottom = 'auto';
-          navContainer.style.right = 'auto';
-          navContainer.style.margin = '0';
-          navContainer.style.position = 'fixed';
-          navContainer.style.left = `${bubbleStartX}px`;
-          navContainer.style.top = `${bubbleStartY}px`;
-        }
-
-        // Use hardware-accelerated transform for 60FPS smooth dragging
-        navContainer.style.transform = `translate3d(${deltaX}px, ${deltaY}px, 0)`;
-        dragMoveTicking = false;
-      });
-    }
-  }
-
-  function dragEnd() {
-    document.removeEventListener('mousemove', dragMove);
-    document.removeEventListener('mouseup', dragEnd);
-    document.removeEventListener('touchmove', dragMove);
-    document.removeEventListener('touchend', dragEnd);
-
-    navContainer.classList.remove('dragging');
-    navContainer.style.transition = '';
-
-    if (isDragging) {
-      // Commit the translation to left/top to preserve position correctly
-      const rect = navContainer.getBoundingClientRect();
-      navContainer.style.transform = 'none';
-      navContainer.style.left = `${rect.left}px`;
-      navContainer.style.top = `${rect.top}px`;
-    }
-
-    if (!isDragging) {
-      // True toggle: if menu was open when click started, close it; otherwise open it
-      if (wasOpenOnDragStart) {
-        closeRadialMenu();
-      } else {
-        openRadialMenu();
-      }
-    } else {
-      // If dragging while menu was open, close it to prevent glitching
-      if (wasOpenOnDragStart) {
-        closeRadialMenu();
-      }
-      // Clamp boundaries inside screen coordinates with 20px padding
-      clampBubblePosition();
-    }
-  }
-
-  function getDragCoords(e) {
+  function getEventCoords(e) {
     if (e.touches && e.touches.length > 0) {
       return { x: e.touches[0].clientX, y: e.touches[0].clientY };
     }
@@ -3019,30 +3501,182 @@ document.addEventListener('DOMContentLoaded', () => {
     return { x: e.clientX, y: e.clientY };
   }
 
-  function clampBubblePosition() {
+  function dragStart(e) {
+    if (e.type === 'touchstart') {
+      lastTouchTime = Date.now();
+    } else if (e.type === 'mousedown') {
+      if (Date.now() - lastTouchTime < 600) {
+        return;
+      }
+      e.preventDefault();
+    }
+
+    // Set pointer capture if supported so finger stream is never lost
+    if (e.pointerId && mainBubble.setPointerCapture) {
+      try {
+        mainBubble.setPointerCapture(e.pointerId);
+        activePointerId = e.pointerId;
+      } catch (err) {}
+    }
+
+    wasOpenOnDragStart = navContainer.classList.contains('open');
+    isDragging = false;
+
+    const coords = getEventCoords(e);
+    dragPointerStartX = coords.x;
+    dragPointerStartY = coords.y;
+
     const rect = navContainer.getBoundingClientRect();
-    const pad = 20;
-    let targetX = rect.left;
-    let targetY = rect.top;
+    dragTouchOffsetX = coords.x - rect.left;
+    dragTouchOffsetY = coords.y - rect.top;
+    currentTargetX = rect.left;
+    currentTargetY = rect.top;
 
-    if (targetX < pad) targetX = pad;
-    if (targetX > window.innerWidth - rect.width - pad) targetX = window.innerWidth - rect.width - pad;
-    if (targetY < pad) targetY = pad;
-    if (targetY > window.innerHeight - rect.height - pad) targetY = window.innerHeight - rect.height - pad;
-
-    navContainer.style.left = `${targetX}px`;
-    navContainer.style.top = `${targetY}px`;
-    navContainer.style.transform = 'none'; // Lock translate off!
+    if (window.PointerEvent) {
+      document.addEventListener('pointermove', dragMove, { passive: false });
+      document.addEventListener('pointerup', dragEnd);
+      document.addEventListener('pointercancel', dragEnd);
+    } else {
+      document.addEventListener('mousemove', dragMove, { passive: false });
+      document.addEventListener('mouseup', dragEnd);
+      document.addEventListener('touchmove', dragMove, { passive: false });
+      document.addEventListener('touchend', dragEnd);
+      document.addEventListener('touchcancel', dragEnd);
+    }
   }
 
-  // Handle window resizing bounds safety
+  function dragMove(e) {
+    const coords = getEventCoords(e);
+    const deltaX = coords.x - dragPointerStartX;
+    const deltaY = coords.y - dragPointerStartY;
+    const moveDistance = Math.hypot(deltaX, deltaY);
+
+    // 5px threshold to separate simple taps from real dragging
+    if (!isDragging && moveDistance > 5) {
+      isDragging = true;
+      navContainer.style.transition = 'none';
+      navContainer.classList.add('dragging');
+
+      if (wasOpenOnDragStart) {
+        closeRadialMenu();
+      }
+    }
+
+    if (isDragging) {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+
+      const bounds = getViewportBounds();
+      const rawX = coords.x - dragTouchOffsetX;
+      const rawY = coords.y - dragTouchOffsetY;
+
+      // Strictly clamp within viewport boundaries
+      currentTargetX = Math.min(Math.max(rawX, bounds.minX), bounds.maxX);
+      currentTargetY = Math.min(Math.max(rawY, bounds.minY), bounds.maxY);
+
+      // Immediately apply clamped position on every frame
+      applyHubblePosition(currentTargetX, currentTargetY);
+    }
+  }
+
+  function dragEnd(e) {
+    if (window.PointerEvent) {
+      document.removeEventListener('pointermove', dragMove);
+      document.removeEventListener('pointerup', dragEnd);
+      document.removeEventListener('pointercancel', dragEnd);
+      if (activePointerId && mainBubble.releasePointerCapture) {
+        try {
+          mainBubble.releasePointerCapture(activePointerId);
+        } catch (err) {}
+        activePointerId = null;
+      }
+    } else {
+      document.removeEventListener('mousemove', dragMove);
+      document.removeEventListener('mouseup', dragEnd);
+      document.removeEventListener('touchmove', dragMove);
+      document.removeEventListener('touchend', dragEnd);
+      document.removeEventListener('touchcancel', dragEnd);
+    }
+
+    navContainer.classList.remove('dragging');
+    navContainer.style.transition = 'none';
+
+    if (isDragging) {
+      // Final commit of clamped coordinates
+      applyHubblePosition(currentTargetX, currentTargetY);
+
+      try {
+        sessionStorage.setItem('hi_hubble_pos_x', currentTargetX);
+        sessionStorage.setItem('hi_hubble_pos_y', currentTargetY);
+      } catch (err) {}
+
+      isDragging = false;
+    } else {
+      // Pure tap directly on the floating navigation bubble itself
+      triggerHubbleAnimation();
+      if (wasOpenOnDragStart) {
+        closeRadialMenu();
+      } else {
+        openRadialMenu();
+      }
+    }
+  }
+
+  function clampBubblePosition() {
+    const rect = navContainer.getBoundingClientRect();
+    applyHubblePosition(rect.left, rect.top);
+  }
+
+  // Handle window resizing / orientation changes
   window.addEventListener('resize', () => {
-    if (navContainer.style.position === 'fixed') {
+    if (navContainer.style.left && navContainer.style.left !== '50%') {
       clampBubblePosition();
     }
   });
 
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      if (navContainer.style.left && navContainer.style.left !== '50%') {
+        clampBubblePosition();
+      }
+    });
+  }
+
+  window.addEventListener('orientationchange', () => {
+    setTimeout(() => {
+      if (navContainer.style.left && navContainer.style.left !== '50%') {
+        clampBubblePosition();
+      }
+    }, 100);
+  });
+
+  function triggerHubbleAnimation() {
+    if (!mainBubble) return;
+    const logoIcon = mainBubble.querySelector('.orb-logo-icon');
+    const bubbleOrb = mainBubble.querySelector('.bubble-orb-glowing');
+    if (logoIcon) {
+      logoIcon.classList.remove('hubble-spin');
+      void logoIcon.offsetWidth; // Force reflow for smooth re-triggering on rapid taps
+      logoIcon.classList.add('hubble-spin');
+      const onSpinEnd = () => {
+        logoIcon.classList.remove('hubble-spin');
+      };
+      logoIcon.addEventListener('animationend', onSpinEnd, { once: true });
+    }
+    if (bubbleOrb) {
+      bubbleOrb.classList.remove('hubble-pulse');
+      void bubbleOrb.offsetWidth;
+      bubbleOrb.classList.add('hubble-pulse');
+      const onPulseEnd = () => {
+        bubbleOrb.classList.remove('hubble-pulse');
+      };
+      bubbleOrb.addEventListener('animationend', onPulseEnd, { once: true });
+    }
+  }
+
   function toggleRadialMenu() {
+    triggerHubbleAnimation();
     const isOpen = navContainer.classList.contains('open');
     if (isOpen) {
       closeRadialMenu();
@@ -3052,48 +3686,141 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function openRadialMenu() {
-    // Dynamic quadrant orientation calculation
     const rect = navContainer.getBoundingClientRect();
-    const centerY = rect.top + rect.height / 2;
-    const centerX = rect.left + rect.width / 2;
+    const vw = window.visualViewport ? window.visualViewport.width : window.innerWidth;
+    const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    const pad = 12;
 
-    // Vertical flip: if in top half of the screen, pop sub-bubbles downwards
-    if (centerY < window.innerHeight / 2) {
-      navContainer.style.setProperty('--radial-y-dir', '1');
-      navContainer.classList.add('expand-downwards');
-    } else {
-      navContainer.style.setProperty('--radial-y-dir', '-1');
-      navContainer.classList.remove('expand-downwards');
-    }
+    const hubbleCenterX = rect.left + rect.width / 2;
+    const hubbleCenterY = rect.top + rect.height / 2;
 
-    // Horizontal mirror: if too close to left or right edges
-    if (centerX < 180) {
-      navContainer.style.setProperty('--radial-x-dir', '1.2'); // push rightwards
-    } else if (window.innerWidth - centerX < 180) {
-      navContainer.style.setProperty('--radial-x-dir', '-1.2'); // push leftwards
+    // Available space from Hubble edges & center
+    const spaceLeft = rect.left - pad;
+    const spaceRight = vw - rect.right - pad;
+    const spaceTop = rect.top - pad;
+    const spaceBottom = vh - rect.bottom - pad;
+    const spaceCenterLeft = hubbleCenterX - pad;
+    const spaceCenterRight = vw - hubbleCenterX - pad;
+
+    // Required dimensions for each orientation variant:
+    const isMobile = vw <= 768;
+    const horizHalfWidth = isMobile ? 145 : 190;
+    const canFitHorizontal = (spaceCenterLeft >= horizHalfWidth) && (spaceCenterRight >= horizHalfWidth);
+
+    const vertHeight = isMobile ? 210 : 260;
+    const canFitVerticalDown = spaceBottom >= vertHeight;
+    const canFitVerticalUp = spaceTop >= vertHeight;
+
+    // Reset previous orientation state classes
+    navContainer.classList.remove(
+      'orient-vertical-down',
+      'orient-vertical-up',
+      'orient-compact-grid',
+      'align-left',
+      'align-right',
+      'align-top',
+      'align-bottom',
+      'expand-downwards'
+    );
+
+    // Intelligently select best orientation based on available space:
+    if (canFitHorizontal) {
+      // CASE 1: Standard Horizontal Dock (Center / Bottom Center / Top Center)
+      if (hubbleCenterY < vh / 2) {
+        navContainer.classList.add('expand-downwards');
+      }
+    } else if (canFitVerticalDown || canFitVerticalUp) {
+      // CASE 2 / 6 / 7 / 8 / 9: Corners & Edges -> Vertical Column
+      const preferDown = spaceBottom >= spaceTop;
+
+      if (preferDown && canFitVerticalDown) {
+        navContainer.classList.add('orient-vertical-down');
+      } else if (canFitVerticalUp) {
+        navContainer.classList.add('orient-vertical-up');
+      } else {
+        navContainer.classList.add(preferDown ? 'orient-vertical-down' : 'orient-vertical-up');
+      }
+
+      // Horizontal alignment relative to Hubble:
+      if (spaceLeft < 70) {
+        navContainer.classList.add('align-left');
+      } else if (spaceRight < 70) {
+        navContainer.classList.add('align-right');
+      }
     } else {
-      navContainer.style.setProperty('--radial-x-dir', '1');
+      // CASE 3: Tight Dual-Axis Space (e.g. Landscape Mobile) -> Compact Grid
+      navContainer.classList.add('orient-compact-grid');
+      if (spaceTop > spaceBottom) {
+        navContainer.classList.add('align-bottom');
+      } else {
+        navContainer.classList.add('align-top');
+      }
+      if (spaceLeft < spaceRight) {
+        navContainer.classList.add('align-left');
+      } else {
+        navContainer.classList.add('align-right');
+      }
     }
 
     navContainer.classList.add('open');
     blurOverlay.classList.add('active'); // Localized circular blur active
 
-    // Rotate HiHubble logo icon
-    const logoIcon = mainBubble.querySelector('.orb-logo-icon');
-    if (logoIcon) {
-      logoIcon.style.transform = 'rotate(225deg) scale(1.1)';
+    // Enable accessibility and pointer events for menu items
+    setRadialMenuA11y(true);
+
+    // Dynamically derive and synchronize active option to current screen/view
+    updateHubbleActiveState();
+    requestAnimationFrame(() => updateHubbleActiveState());
+  }
+
+  function setRadialMenuA11y(isOpen) {
+    const wrapper = document.getElementById('radial-menu-wrapper');
+    if (wrapper) {
+      wrapper.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
     }
+    const radialButtons = document.querySelectorAll('#radial-menu-wrapper .radial-btn, #radial-menu-wrapper button');
+    radialButtons.forEach(btn => {
+      if (isOpen) {
+        btn.tabIndex = 0;
+        btn.setAttribute('aria-hidden', 'false');
+        btn.removeAttribute('disabled');
+        btn.style.pointerEvents = 'auto';
+      } else {
+        btn.tabIndex = -1;
+        btn.setAttribute('aria-hidden', 'true');
+        btn.setAttribute('disabled', 'true');
+        btn.style.pointerEvents = 'none';
+        if (document.activeElement === btn) {
+          btn.blur();
+        }
+      }
+    });
+    const radialBubbles = document.querySelectorAll('#radial-menu-wrapper .radial-item-bubble');
+    radialBubbles.forEach(b => {
+      b.style.pointerEvents = isOpen ? 'auto' : 'none';
+    });
   }
 
   function closeRadialMenu() {
     navContainer.classList.remove('open');
     blurOverlay.classList.remove('active');
+    const activeGlow = document.getElementById('radial-active-glow');
+    if (activeGlow) activeGlow.style.opacity = '0';
 
-    const logoIcon = mainBubble.querySelector('.orb-logo-icon');
-    if (logoIcon) {
-      logoIcon.style.transform = 'rotate(0deg) scale(1)';
-    }
+    // Disable accessibility and pointer events for menu items
+    setRadialMenuA11y(false);
   }
+
+  // Ensure closed accessibility state on initial load
+  setRadialMenuA11y(false);
+
+  // Synchronize Hubble active state on browser back/forward and URL hash navigation
+  window.addEventListener('popstate', () => {
+    updateHubbleActiveState();
+  });
+  window.addEventListener('hashchange', () => {
+    updateHubbleActiveState();
+  });
 
   // Close radial menu when clicking backdrop overlay
   blurOverlay.addEventListener('click', closeRadialMenu);
@@ -3106,22 +3833,35 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Search bubble opens dedicated search view
-  document.getElementById('radial-search-btn').addEventListener('click', () => {
-    closeRadialMenu();
-    switchView('search');
-    const searchInput = document.getElementById('search-view-input');
-    if (searchInput) {
-      setTimeout(() => {
-        searchInput.focus();
-      }, 80);
-    }
-    showToast('Search page opened 🔍');
-  });
+  const radialSearchBtn = document.getElementById('radial-search-btn');
+  if (radialSearchBtn) {
+    radialSearchBtn.addEventListener('click', (e) => {
+      if (!navContainer || !navContainer.classList.contains('open')) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      closeRadialMenu();
+      switchView('search');
+      const searchInput = document.getElementById('search-view-input');
+      if (searchInput) {
+        setTimeout(() => {
+          searchInput.focus();
+        }, 80);
+      }
+      showToast('Search page opened 🔍');
+    });
+  }
 
   // Logout bubble triggers security logout
   const radialLogoutBtn = document.getElementById('radial-logout-btn');
   if (radialLogoutBtn) {
-    radialLogoutBtn.addEventListener('click', () => {
+    radialLogoutBtn.addEventListener('click', (e) => {
+      if (!navContainer || !navContainer.classList.contains('open')) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       closeRadialMenu();
       const mainLogoutBtn = document.getElementById('logout-btn');
       if (mainLogoutBtn) {
@@ -3851,21 +4591,32 @@ document.addEventListener('DOMContentLoaded', () => {
     const storyFooter = document.querySelector('.story-viewer-footer');
     if (storyFooter) storyFooter.style.display = 'flex';
 
+    const storyReplyContainer = document.getElementById('story-reply-input-container');
+    if (storyReplyContainer) storyReplyContainer.style.display = 'flex';
+
     const storyReplyInput = document.getElementById('story-reply-input');
     const storyLikeBtn = document.getElementById('story-like-btn');
     const storyShareBtn = document.getElementById('story-share-btn');
     const storyReplySend = document.getElementById('story-reply-send');
+    const storyEmojiPopover = document.getElementById('story-emoji-popover');
     const storyLikeCount = document.getElementById('story-like-count');
     const storyInsightsBtn = document.getElementById('story-insights-trigger-btn');
     const storyInsightsViews = document.getElementById('story-insights-views');
     const storyInsightsLikes = document.getElementById('story-insights-likes');
 
+    if (storyEmojiPopover) storyEmojiPopover.classList.remove('active');
+
     if (storyReplyInput) {
       storyReplyInput.style.display = 'block';
       storyReplyInput.value = '';
+      storyReplyInput.disabled = false;
     }
     if (storyLikeBtn) storyLikeBtn.style.display = 'flex';
-    if (storyReplySend) storyReplySend.style.display = 'flex';
+    if (storyReplySend) {
+      storyReplySend.style.display = 'flex';
+      storyReplySend.disabled = true;
+      storyReplySend.innerHTML = '<i data-lucide="send"></i>';
+    }
 
     if (data.authorId === currentUserId) {
       if (storyInsightsBtn) {
@@ -4107,6 +4858,11 @@ document.addEventListener('DOMContentLoaded', () => {
       storyViewsPanel.style.transform = '';
     }
 
+    const storyEmojiPopover = document.getElementById('story-emoji-popover');
+    if (storyEmojiPopover) {
+      storyEmojiPopover.classList.remove('active');
+    }
+
     if (storyViewer) {
       storyViewer.classList.remove('active');
       storyViewer.style.display = 'none';
@@ -4189,22 +4945,280 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // --- HUBBS (STORIES) REPLY & EMOJI SYSTEM ---
+  const emojiLibrary = {
+    All: ['😊', '😂', '😍', '👍', '🔥', '🎉', '❤️', '👏', '😮', '😢', '🙌', '🚀', '🕶️', '☕', '✨', '💯', '🥳', '🤩', '😎', '💪', '🌟', '💖', '🙏', '😇'],
+    Smileys: ['😊', '😂', '😍', '😄', '😅', '😆', '😇', '😉', '😌', '🥹', '😎', '🤩', '😏', '😮', '😢', '😭', '😤', '🤯', '😴', '😋'],
+    People: ['👋', '👍', '👏', '🙌', '🙏', '🤝', '💪', '🫶', '🧑‍💻', '👨‍💻', '👩‍💻', '🧠', '🤗', '🫵', '🫰', '🤟', '🤘', '👀', '🫠', '🤙'],
+    Animals: ['🐶', '🐱', '🐭', '🐹', '🦊', '🐻', '🐼', '🐸', '🐵', '🐔', '🦄', '🦋', '🐙', '🐬', '🦁', '🐢', '🐳', '🦒', '🐟', '🐨'],
+    Food: ['🍕', '🍔', '🍟', '🍣', '🍜', '🍩', '🍪', '🍓', '🍇', '🥑', '🥗', '🍉', '🍍', '🍰', '🍹', '☕', '🍵', '🥐', '🍌', '🍗'],
+    Activities: ['⚽', '🏀', '🏈', '⚡', '🎾', '🎮', '🎨', '🎵', '🎸', '🎧', '🎬', '🎉', '🎊', '🎁', '🎯', '🏆', '🔥', '🚀', '💃', '🧘'],
+    Travel: ['✈️', '🚗', '🚆', '🚲', '🏖️', '🏕️', '🌍', '⛵', '🚢', '🚁', '🗺️', '🏔️', '🌊', '🌞', '🧭', '🛫', '🛴', '🚉', '🛏️', '🏙️'],
+    Objects: ['💡', '📱', '💻', '⌨️', '🖱️', '🎧', '📷', '📚', '🧰', '💼', '🪄', '🎀', '🪴', '🧴', '🪞', '🧺', '💎', '🔑', '🧩', '🛍️']
+  };
+
   const storyReplyInput = document.getElementById('story-reply-input');
+  const storyReplySend = document.getElementById('story-reply-send');
+  const storyEmojiBtn = document.getElementById('story-emoji-btn');
+  const storyEmojiPopover = document.getElementById('story-emoji-popover');
+  const storyEmojiGrid = document.getElementById('story-emoji-picker-grid');
+  const storyEmojiSearchInput = storyEmojiPopover?.querySelector('.emoji-picker-search');
+  const storyEmojiCategoryButtons = storyEmojiPopover?.querySelectorAll('.emoji-category-btn');
+
+  let isSendingStoryReply = false;
+
+  async function handleSendStoryReply() {
+    if (isSendingStoryReply) return;
+
+    if (!storyReplyInput) return;
+    const replyText = storyReplyInput.value.trim();
+    if (!replyText) {
+      if (storyReplySend) storyReplySend.disabled = true;
+      return;
+    }
+
+    const group = state.storyGroups?.[state.activeGroupIndex];
+    const storyData = group?.stories?.[state.activeStoryIndex];
+    if (!group || !storyData) {
+      showToast('HUBB information unavailable.');
+      return;
+    }
+
+    const currentUser = getCurrentUser();
+    const token = getAuthToken();
+    if (!currentUser || !token) {
+      showToast('Please log in to reply to HUBBS.');
+      return;
+    }
+
+    const currentUserId = (currentUser.id || currentUser._id || '').toString();
+    const rawAuthorId = getUserIdentifier(storyData.author) || storyData.authorId || getUserIdentifier(group.user);
+    const authorId = rawAuthorId ? rawAuthorId.toString() : null;
+    const storyId = (storyData._id || storyData.id || '').toString();
+
+    if (!authorId || !storyId) {
+      showToast('Story owner could not be determined.');
+      return;
+    }
+
+    if (authorId === currentUserId) {
+      showToast('You cannot reply to your own HUBB.');
+      return;
+    }
+
+    isSendingStoryReply = true;
+    storyReplyInput.disabled = true;
+    if (storyReplySend) {
+      storyReplySend.disabled = true;
+      storyReplySend.innerHTML = '<i data-lucide="loader" class="animate-spin" style="width: 14px; height: 14px;"></i>';
+      if (window.lucide && typeof window.lucide.createIcons === 'function') {
+        window.lucide.createIcons();
+      }
+    }
+
+    try {
+      const secretKey = getChatSecretKey(currentUserId, authorId);
+      const isVideo = (storyData.mediaType === 'video') || (storyData.img && typeof storyData.img === 'string' && (storyData.img.endsWith('.mp4') || storyData.img.includes('/video/')));
+
+      const hubReplyPayload = {
+        text: replyText,
+        hubType: 'story',
+        hubId: storyId,
+        storyId: storyId,
+        messageType: 'hubbs_reply',
+        thumbnail: storyData.img || storyData.mediaUrl || '',
+        isVideo: !!isVideo,
+        authorName: storyData.name || group.user?.fullName || group.user?.username || 'Hubber',
+        authorAvatar: storyData.avatar || group.user?.profileImage || '',
+        timestamp: storyData.createdAt || storyData.created_at || new Date().toISOString(),
+        isReply: true
+      };
+
+      const encryptedText = encryptMessage(JSON.stringify(hubReplyPayload), secretKey);
+
+      const res = await fetch(`${API_URL}/api/chats/message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          recipient: authorId,
+          content: encryptedText,
+          mediaUrl: `story_${storyId}`,
+          mediaType: 'hub',
+          mediaName: 'HUBB Reply',
+          mediaSize: 'Story',
+          isStoryReply: true
+        })
+      });
+
+      if (!res.ok) {
+        let errData = {};
+        try { errData = await res.json(); } catch (_) {}
+        throw new Error(errData.error || `HTTP ${res.status}: Failed to send reply`);
+      }
+
+      const createdMsg = await res.json();
+
+      showToast('HUBB reply sent! 💬');
+      storyReplyInput.value = '';
+
+      if (storyEmojiPopover) {
+        storyEmojiPopover.classList.remove('active');
+      }
+
+      // Append to in-memory active conversation
+      if (typeof appendSingleMessage === 'function') {
+        appendSingleMessage(authorId, createdMsg);
+      }
+
+      // Update sidebar thread preview in-place
+      if (typeof updateThreadLastMessageInPlace === 'function') {
+        updateThreadLastMessageInPlace(authorId, createdMsg);
+      }
+
+      // Refresh threads list so conversation ordering and list update immediately
+      if (typeof loadChatThreads === 'function') {
+        loadChatThreads(false);
+      }
+
+      // Close story viewer upon successful reply
+      closeStoryViewer();
+
+    } catch (err) {
+      console.error('HUBB reply error:', err);
+      showToast('Failed to send reply: ' + (err.message || 'Please try again.'));
+      // Keep typed message intact for retry
+    } finally {
+      isSendingStoryReply = false;
+      if (storyReplyInput) {
+        storyReplyInput.disabled = false;
+        storyReplyInput.focus();
+      }
+      if (storyReplySend) {
+        storyReplySend.innerHTML = '<i data-lucide="send"></i>';
+        storyReplySend.disabled = !storyReplyInput || !storyReplyInput.value.trim();
+        if (window.lucide && typeof window.lucide.createIcons === 'function') {
+          window.lucide.createIcons();
+        }
+      }
+    }
+  }
+
+  function renderStoryEmojiGrid(category = 'All', search = '') {
+    if (!storyEmojiGrid) return;
+
+    const normalized = search.trim().toLowerCase();
+    const allEmojis = emojiLibrary[category] || emojiLibrary.All;
+    const filtered = allEmojis.filter(emoji => {
+      if (!normalized) return true;
+      return emoji.toLowerCase().includes(normalized) || emoji.includes(search.trim());
+    });
+
+    storyEmojiGrid.innerHTML = '';
+    filtered.forEach(emoji => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'emoji-select-btn';
+      btn.textContent = emoji;
+      btn.setAttribute('title', emoji);
+      storyEmojiGrid.appendChild(btn);
+    });
+  }
+
   if (storyReplyInput) {
+    storyReplyInput.addEventListener('input', () => {
+      const hasContent = !!storyReplyInput.value.trim();
+      if (storyReplySend) {
+        storyReplySend.disabled = !hasContent;
+      }
+    });
+
     storyReplyInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+      if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         const txt = storyReplyInput.value.trim();
         if (txt) {
-          showToast('Hubs reply sent! 💬');
-          storyReplyInput.value = '';
-          closeStoryViewer();
-        } else {
-          showToast('Please type a message before sending.');
+          handleSendStoryReply();
+        }
+      }
+    });
+
+    storyReplyInput.addEventListener('focus', () => {
+      pauseStory();
+    });
+  }
+
+  if (storyReplySend) {
+    storyReplySend.addEventListener('click', (e) => {
+      e.stopPropagation();
+      handleSendStoryReply();
+    });
+  }
+
+  if (storyEmojiBtn && storyEmojiPopover) {
+    storyEmojiBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isActive = storyEmojiPopover.classList.toggle('active');
+      if (isActive) {
+        pauseStory();
+        renderStoryEmojiGrid();
+      }
+    });
+  }
+
+  if (storyEmojiCategoryButtons) {
+    storyEmojiCategoryButtons.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const category = btn.getAttribute('data-emoji-category');
+        storyEmojiCategoryButtons.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderStoryEmojiGrid(category, storyEmojiSearchInput?.value || '');
+      });
+    });
+  }
+
+  if (storyEmojiSearchInput) {
+    storyEmojiSearchInput.addEventListener('input', (e) => {
+      e.stopPropagation();
+      const activeCategory = storyEmojiPopover?.querySelector('.emoji-category-btn.active')?.getAttribute('data-emoji-category') || 'All';
+      renderStoryEmojiGrid(activeCategory, storyEmojiSearchInput.value);
+    });
+    storyEmojiSearchInput.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+    });
+  }
+
+  if (storyEmojiPopover && storyReplyInput) {
+    storyEmojiPopover.addEventListener('click', (e) => {
+      const selectBtn = e.target.closest('.emoji-select-btn');
+      if (selectBtn) {
+        e.stopPropagation();
+        const emoji = selectBtn.textContent.trim();
+        const startPos = storyReplyInput.selectionStart ?? storyReplyInput.value.length;
+        const endPos = storyReplyInput.selectionEnd ?? storyReplyInput.value.length;
+        const textVal = storyReplyInput.value;
+        storyReplyInput.value = textVal.substring(0, startPos) + emoji + textVal.substring(endPos);
+        storyReplyInput.focus();
+        const newCursorPos = startPos + emoji.length;
+        storyReplyInput.setSelectionRange(newCursorPos, newCursorPos);
+
+        if (storyReplySend) {
+          storyReplySend.disabled = !storyReplyInput.value.trim();
         }
       }
     });
   }
+
+  document.addEventListener('click', (e) => {
+    if (storyEmojiPopover && storyEmojiPopover.classList.contains('active')) {
+      if (!storyEmojiPopover.contains(e.target) && (!storyEmojiBtn || !storyEmojiBtn.contains(e.target))) {
+        storyEmojiPopover.classList.remove('active');
+      }
+    }
+  });
 
   // Story Share Button Handler
   const storyShareBtn = document.getElementById('story-share-btn');
@@ -4544,15 +5558,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const group = state.storyGroups[groupIdx];
         if (group && group.stories && group.stories.length > 0) {
           const isSeen = group.stories.every(s => seen.includes(s._id || s.id));
-          const groupAuthorId = (group.authorId || group.author?._id || group.author?.id || '').toString();
-          const isOwnGroup = currentUserIdStr && groupAuthorId === currentUserIdStr;
-
-          // If own story has now been viewed, remove it from the separate story strip
-          if (isOwnGroup && isSeen) {
-            card.remove();
-            return;
-          }
-
           if (isSeen) {
             card.classList.add('story-seen');
           } else {
@@ -4562,13 +5567,17 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
 
-    // Also update current user story button
+    // Update current user story button (#story-btn-current)
     const yourVibeBtn = document.getElementById('story-btn-current');
     if (yourVibeBtn) {
       const myGroup = state.storyGroups ? state.storyGroups.find(g => {
         const gAuthorId = (g.authorId || g.author?._id || g.author?.id || '').toString();
         return currentUserIdStr && gAuthorId === currentUserIdStr;
       }) : null;
+
+      const avatarImg = yourVibeBtn.querySelector('img');
+      const subSpan = yourVibeBtn.querySelector('span:last-child');
+      const userProfileImg = localStorage.getItem('invibeProfileImage') || currentUser?.profileImage || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&h=150&q=80';
 
       if (myGroup && myGroup.stories && myGroup.stories.length > 0) {
         const mySeen = myGroup.stories.every(s => seen.includes(s._id || s.id));
@@ -4577,8 +5586,18 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
           yourVibeBtn.classList.remove('story-seen');
         }
+        if (avatarImg) avatarImg.src = myGroup.avatar || userProfileImg;
+        if (subSpan) {
+          subSpan.textContent = `${myGroup.stories.length} hub${myGroup.stories.length > 1 ? 's' : ''}`;
+          subSpan.style.color = 'var(--text-muted)';
+        }
       } else {
         yourVibeBtn.classList.add('story-seen');
+        if (avatarImg) avatarImg.src = userProfileImg;
+        if (subSpan) {
+          subSpan.textContent = 'Add Hubb';
+          subSpan.style.color = 'transparent';
+        }
       }
     }
   }
@@ -4589,19 +5608,39 @@ document.addEventListener('DOMContentLoaded', () => {
   window.closeStoryViewer = closeStoryViewer;
 
   // Render story rings cleanly from state.storyGroups
-  function renderStoryRings() {
+  let _lastRenderedStoriesFingerprint = '';
+  function renderStoryRings(forceRebuild = false) {
     const storyScroll = document.getElementById('stories-scroll');
     if (!storyScroll) return;
 
-    storyScroll.innerHTML = '';
     if (!state.storyGroups || state.storyGroups.length === 0) {
-      updateStoryRingsUI();
+      if (_lastRenderedStoriesFingerprint !== 'empty' || forceRebuild) {
+        _lastRenderedStoriesFingerprint = 'empty';
+        storyScroll.innerHTML = '';
+        updateStoryRingsUI();
+      }
       return;
     }
 
     const currentUser = getCurrentUser();
     const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
     const currentUserIdStr = currentUserId ? currentUserId.toString() : '';
+    const seen = getSeenStories();
+
+    // Deterministic fingerprint of story groups
+    const storiesFingerprint = state.storyGroups.map(g => {
+      const isSeen = (g.stories || []).every(s => seen.includes(s._id || s.id));
+      const sCount = g.stories ? g.stories.length : 0;
+      return `${g.authorId}_${sCount}_${isSeen ? 1 : 0}`;
+    }).join('|');
+
+    if (!forceRebuild && storiesFingerprint === _lastRenderedStoriesFingerprint && storyScroll.children.length > 0) {
+      updateStoryRingsUI();
+      return;
+    }
+
+    _lastRenderedStoriesFingerprint = storiesFingerprint;
+    storyScroll.innerHTML = '';
 
     state.storyGroups.forEach((group, idx) => {
       if (!group.stories || group.stories.length === 0) return;
@@ -4609,10 +5648,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const groupAuthorId = (group.authorId || group.author?._id || group.author?.id || '').toString();
       const isOwnGroup = currentUserIdStr && groupAuthorId === currentUserIdStr;
 
-      // For the logged-in user's own story:
-      // The user's profile circle (#story-btn-current) represents their story.
-      // Do NOT render the own story as a separate item in the story strip if it is already viewed.
-      if (isOwnGroup && isSeen) return;
+      // The logged-in user's own story is prominently represented on #story-btn-current
+      if (isOwnGroup) return;
 
       const card = document.createElement('div');
       card.className = `story-card active-story ${isSeen ? 'story-seen' : ''}`;
@@ -4621,7 +5658,7 @@ document.addEventListener('DOMContentLoaded', () => {
       card.innerHTML = `
         <div class="story-avatar-container hubbs-user-avatar" style="width: 64px; height: 64px; aspect-ratio: 1/1; margin: 0 auto 4px auto; flex-shrink: 0; border-radius: 50%; overflow: hidden; position: relative; display: flex; justify-content: center; align-items: center; padding: 3px;">
           <div class="story-ring" style="border-radius: 50%; position: absolute; top: 0; left: 0; right: 0; bottom: 0;"></div>
-          <img src="${group.avatar}" alt="${group.name}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 50%; border: 2px solid rgba(0,0,0,0.1);" />
+          <img src="${group.avatar}" alt="${group.name}" loading="lazy" decoding="async" style="width: 100%; height: 100%; object-fit: cover; border-radius: 50%; border: 2px solid rgba(0,0,0,0.1);" />
         </div>
         <div style="display: flex; flex-direction: column; align-items: center; text-align: center; width: 100%; overflow: hidden;">
           <span class="story-username" style="font-weight: 600; color: var(--text-main); font-size: 0.85rem; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${group.name}</span>
@@ -4912,9 +5949,20 @@ document.addEventListener('DOMContentLoaded', () => {
           console.log('⚡ Realtime post change event received from Supabase!');
           if (typeof loadFeedPosts === 'function') loadFeedPosts();
         })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, () => {
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, (payload) => {
           console.log('⚡ Realtime comment change event received from Supabase!');
+          const pId = payload.new?.post_id || payload.old?.post_id;
+          if (pId && typeof window.refreshPostCommentsCount === 'function') {
+            window.refreshPostCommentsCount(pId);
+          }
           if (typeof loadFeedPosts === 'function') loadFeedPosts();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, (payload) => {
+          console.log('⚡ Realtime like change event received from Supabase!');
+          const pId = payload.new?.post_id || payload.old?.post_id;
+          if (pId && typeof window.refreshPostLikesCount === 'function') {
+            window.refreshPostLikesCount(pId);
+          }
         })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'reels' }, (payload) => {
           console.log('⚡ Realtime reel change event received from Supabase!', payload);
@@ -5057,8 +6105,75 @@ document.addEventListener('DOMContentLoaded', () => {
   if (storyDraftsClose) {
     storyDraftsClose.addEventListener('click', () => {
       if (storyDraftsModal) storyDraftsModal.classList.remove('active');
+      if (typeof window.exitDraftsSelectionMode === 'function') window.exitDraftsSelectionMode();
+      if (typeof window.closeDraftsConfirmDialog === 'function') window.closeDraftsConfirmDialog();
     });
   }
+
+  // HUBBs Drafts Bottom Bar & Confirmation Listeners
+  const selectModeBtn = document.getElementById('see-all-drafts-select-btn');
+  const cancelSelectBtn = document.getElementById('see-all-drafts-cancel-select-btn');
+  const deleteSelectedBtn = document.getElementById('see-all-drafts-delete-selected-btn');
+  const deleteAllBtn = document.getElementById('see-all-drafts-delete-all-btn');
+  const confirmCancelBtn = document.getElementById('see-all-drafts-confirm-cancel-btn');
+
+  if (selectModeBtn) {
+    selectModeBtn.addEventListener('click', () => {
+      if (typeof window.enterDraftsSelectionMode === 'function') window.enterDraftsSelectionMode();
+    });
+  }
+  if (cancelSelectBtn) {
+    cancelSelectBtn.addEventListener('click', () => {
+      if (typeof window.exitDraftsSelectionMode === 'function') window.exitDraftsSelectionMode();
+    });
+  }
+  if (deleteSelectedBtn) {
+    deleteSelectedBtn.addEventListener('click', () => {
+      if (typeof window.promptDeleteSelectedDrafts === 'function') window.promptDeleteSelectedDrafts();
+    });
+  }
+  if (deleteAllBtn) {
+    deleteAllBtn.addEventListener('click', () => {
+      if (typeof window.promptDeleteAllDrafts === 'function') window.promptDeleteAllDrafts();
+    });
+  }
+  if (confirmCancelBtn) {
+    confirmCancelBtn.addEventListener('click', () => {
+      if (typeof window.closeDraftsConfirmDialog === 'function') window.closeDraftsConfirmDialog();
+    });
+  }
+
+  // Keyboard Shortcuts for HUBBs Drafts modal
+  window.addEventListener('keydown', (e) => {
+    const draftsModal = document.getElementById('story-drafts-modal');
+    if (!draftsModal || !draftsModal.classList.contains('active')) return;
+
+    // Don't intercept if user is typing in an input or textarea
+    const isTyping = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+
+    if (e.key === 'Escape') {
+      const confirmDialog = document.getElementById('see-all-drafts-confirm-dialog');
+      if (confirmDialog && confirmDialog.style.display === 'flex') {
+        window.closeDraftsConfirmDialog();
+        return;
+      }
+      if (window.draftsSelectionMode) {
+        window.exitDraftsSelectionMode();
+      } else {
+        draftsModal.classList.remove('active');
+      }
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+      if (!isTyping) {
+        e.preventDefault();
+        window.selectAllDrafts();
+      }
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (!isTyping && window.draftsSelectionMode && window.selectedDraftIds && window.selectedDraftIds.size > 0) {
+        e.preventDefault();
+        window.promptDeleteSelectedDrafts();
+      }
+    }
+  });
 
 
   // --- CREATE POST CARD CONTROLLER ---
@@ -5158,16 +6273,19 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  let isSubmittingPost = false;
   if (createPostSubmitBtn) {
     createPostSubmitBtn.addEventListener('click', async () => {
+      if (isSubmittingPost) return;
       const captionText = createPostCaption.value.trim();
-      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
+      const token = getAuthToken();
 
       if (!selectedPostMediaBase64 && !captionText) {
         showToast('Please write a caption or add a photo/video.');
         return;
       }
 
+      isSubmittingPost = true;
       createPostSubmitBtn.disabled = true;
       createPostSubmitBtn.innerHTML = '<i data-lucide="loader" class="animate-spin"></i> Publishing...';
       debouncedCreateIcons();
@@ -5175,71 +6293,56 @@ document.addEventListener('DOMContentLoaded', () => {
       try {
         const currentUserStr = localStorage.getItem('invibeUser');
         const currentUser = currentUserStr ? JSON.parse(currentUserStr) : { username: 'user', fullName: 'User' };
-        const userPhoto = localStorage.getItem('invibeProfileImage') || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=400&q=80';
-        const mediaUrlPayload = selectedPostMediaBase64 || selectedPostMediaBlobUrl || '';
+        const mediaUrlPayload = selectedPostMediaBase64 || '';
         const mediaType = selectedPostMediaType || 'image';
-
-        const newPostObj = {
-          _id: 'post_' + Date.now(),
-          caption: captionText || '',
-          mediaUrl: selectedPostMediaBlobUrl || selectedPostMediaBase64 || '',
-          mediaType: mediaType,
-          createdAt: new Date().toISOString(),
-          likes: [],
-          comments: [],
-          author: {
-            _id: currentUser.id || currentUser._id || 'usr_' + (currentUser.username || 'user'),
-            username: currentUser.username || 'user',
-            fullName: currentUser.fullName || currentUser.username || 'User',
-            profileImage: userPhoto
-          }
-        };
 
         // Send backend network call to store in Supabase public.posts and public.post_media
         const apiRes = await fetch(`${API_URL}/api/posts`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`,
-            'X-User-Token': token
+            'Authorization': `Bearer ${token}`
           },
           body: JSON.stringify({
             caption: captionText,
             mediaUrl: mediaUrlPayload,
-            mediaType: mediaType,
-            userId: currentUser.id || currentUser._id,
-            username: currentUser.username,
-            email: currentUser.email
+            mediaType: mediaType
           })
         });
 
         if (apiRes.ok) {
           const data = await apiRes.json();
+          const durableMediaUrl = (data.media && data.media[0] && data.media[0].media_url) ? data.media[0].media_url : '';
 
-          // Also persist as story in Supabase public.stories table
-          try {
-            await fetch((window.API_URL || '') + '/api/stories', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`
-              },
-              body: JSON.stringify({
-                caption: captionText,
-                mediaUrl: mediaUrlPayload,
-                mediaType: mediaType
-              })
-            });
-          } catch (storyErr) {
-            console.warn("Story database save notice:", storyErr);
+          // Also persist as story in Supabase public.stories table using the durable media URL
+          if (durableMediaUrl) {
+            try {
+              await fetch((window.API_URL || '') + '/api/stories', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${token}`
+                },
+                body: JSON.stringify({
+                  caption: captionText,
+                  mediaUrl: durableMediaUrl,
+                  mediaType: mediaType
+                })
+              });
+            } catch (storyErr) {
+              console.warn("Story database save notice:", storyErr);
+            }
           }
 
           showToast('New hub published successfully! 📸✨');
 
-          // Reset fields
+          // Reset fields and revoke preview URLs
           createPostCaption.value = '';
           if (createPostFileInput) createPostFileInput.value = '';
-          selectedPostMediaBlobUrl = null;
+          if (selectedPostMediaBlobUrl) {
+            try { URL.revokeObjectURL(selectedPostMediaBlobUrl); } catch (_) {}
+            selectedPostMediaBlobUrl = null;
+          }
           selectedPostMediaBase64 = null;
           if (createPostPreviewContainer) createPostPreviewContainer.style.display = 'none';
           if (createPostPreviewImg) createPostPreviewImg.src = '';
@@ -5257,9 +6360,11 @@ document.addEventListener('DOMContentLoaded', () => {
           showToast(`Failed to publish post: ${errMsg} ❌`);
         }
       } catch (err) {
-        console.error("Publish post handler:", err);
-        showToast(`Failed to publish post: ${err.message || err} ❌`);
+        console.error("Post submit error:", err);
+        showToast(`Failed to publish post: ${err.message} ❌`);
       } finally {
+        isSubmittingPost = false;
+        createPostSubmitBtn.disabled = false;
         createPostSubmitBtn.innerHTML = '<i data-lucide="send" style="width:14px; height:14px;"></i> Share Your Hubs';
         debouncedCreateIcons();
       }
@@ -5416,13 +6521,34 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function decryptMessage(base64str, secretKey) {
+  function decryptMessage(contentStr, secretKey) {
+    if (!contentStr || typeof contentStr !== 'string') return '';
+    const trimmed = contentStr.trim();
+    if (!trimmed) return '';
+
+    // Plaintext indicators: JSON objects/arrays, strings with whitespace/linebreaks/HTML tags
+    if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('<') || /\s/.test(trimmed)) {
+      return trimmed;
+    }
+
+    // Strict Base64 ciphertext candidate check
+    const isBase64 = /^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && (trimmed.length % 4 === 0);
+    if (!isBase64) {
+      return trimmed;
+    }
+
+    if (!secretKey) {
+      return '[Unable to decrypt message]';
+    }
+
     try {
-      const decrypted = rc4Cipher(atob(base64str), secretKey);
-      return decodeURIComponent(escape(decrypted));
-    } catch (e) {
-      console.error('Decryption error:', e);
-      return '[Decryption Failed]';
+      const binary = atob(trimmed);
+      const decrypted = rc4Cipher(binary, secretKey);
+      const utf8Result = decodeURIComponent(escape(decrypted));
+      return utf8Result;
+    } catch (_) {
+      // Failed decryption of ciphertext: do NOT present raw ciphertext as decrypted text
+      return '[Unable to decrypt message]';
     }
   }
 
@@ -5438,11 +6564,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // --- DYNAMIC CHAT LOGS AND FEEDS ---
-  // --- CLEAN DIRECT MESSAGING STATE MODEL (Phase 1) ---
+  // --- CLEAN DIRECT MESSAGING STATE MODEL (Phase 1 & Phase 8) ---
+  let lastRenderedThreadsFingerprint = ''; // Module-scoped threads rendering fingerprint
   const dmState = {
-    activeConversationId: null, // stores targetUserId (key for messagesByConversation)
+    activeConversationId: null, // ALWAYS stores the real conversation UUID
+    activePartnerId: null, // stores targetUserId (e.g. for DM header & thread selection)
     conversationIdByUser: new Map(), // targetUserId -> actual conversations.id from DB
-    messagesByConversation: new Map(), // targetUserId -> array of msg objects
+    messagesByConversation: new Map(), // targetUserId or conversationId -> array of msg objects
     loadingConversations: new Set(),
     loadedConversations: new Set(),
     realtimeChannel: null,
@@ -5550,7 +6678,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       // 2. Sync active DM Conversation Header
-      const activeChatUserId = dmState.activeConversationId || state.currentChatThread;
+      const activeChatUserId = dmState.activePartnerId || state.currentChatThread;
       if (activeChatUserId) {
         this.updateDMHeader(activeChatUserId);
       }
@@ -5566,11 +6694,17 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         });
       }
+
+      // 4. Sync Active Hubbers widget from single presence source
+      if (typeof window.renderActiveVibersWidget === 'function') {
+        window.renderActiveVibersWidget(this.activeUsersList, this.onlineCount);
+      }
     },
 
     async fetchOnlineUsers() {
       const token = getAuthToken();
-      if (!token) return;
+      const isLoggedIn = localStorage.getItem('invibeIsLoggedIn') === 'true';
+      if (!token || !isLoggedIn) return;
       try {
         const res = await fetch(`${API_URL}/api/online-users`, {
           headers: { 'Authorization': `Bearer ${token}` }
@@ -5590,14 +6724,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     sendHeartbeat() {
       const token = getAuthToken();
-      if (!token) return;
+      const isLoggedIn = localStorage.getItem('invibeIsLoggedIn') === 'true';
+      if (!token || !isLoggedIn) return;
       fetch(`${API_URL}/api/presence/heartbeat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         }
-      }).then(() => {
+      }).then((res) => {
+        if (!res.ok) return;
         const currentUser = getCurrentUser();
         const myId = currentUser ? (currentUser.id || currentUser._id) : null;
         if (myId) {
@@ -5646,6 +6782,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
   window.presenceManager = presenceManager;
+  window.PresenceManager = presenceManager;
 
   // Helper to sync unread message badges globally
   function updateGlobalUnreadBadges(count) {
@@ -5668,6 +6805,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  let _chatThreadsInFlightPromise = null;
   async function loadChatThreads(autoSelectFirst = false) {
     const token = getAuthToken();
     if (!token) return;
@@ -5678,43 +6816,63 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    try {
-      const res = await fetch(`${API_URL}/api/chats/threads`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error('Failed to load chat threads');
-      chatThreads = await res.json();
+    if (_chatThreadsInFlightPromise) {
+      return _chatThreadsInFlightPromise;
+    }
 
-      renderChatThreadsList();
+    _chatThreadsInFlightPromise = (async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/chats/threads`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error('Failed to load chat threads');
+        chatThreads = await res.json();
 
-      const emptyState = document.getElementById('chat-empty-state');
-      const chatHeader = document.getElementById('chat-window-header');
-      const chatViewport = document.querySelector('.chat-dynamic-viewport');
-      const chatFooter = document.getElementById('chat-global-footer');
+        if (Array.isArray(chatThreads)) {
+          chatThreads.forEach(thread => {
+            if (thread.conversationId && thread.user) {
+              const uId = getUserIdentifier(thread.user);
+              if (uId) dmState.conversationIdByUser.set(uId, thread.conversationId);
+            }
+          });
+        }
 
-      if (!Array.isArray(chatThreads) || chatThreads.length === 0) {
-        // Zero conversations: show empty placeholder
-        state.currentChatThread = null;
-        dmState.activeConversationId = null;
-        if (emptyState) emptyState.style.display = 'flex';
-        if (chatHeader) chatHeader.style.display = 'none';
-        if (chatViewport) chatViewport.style.display = 'none';
-        if (chatFooter) chatFooter.style.display = 'none';
-      } else {
-        // Conversations exist: only keep active conversation if already explicitly selected
-        const activeUserId = dmState.activeConversationId || state.currentChatThread;
-        if (activeUserId) {
-          selectConversation(activeUserId);
-        } else {
+        renderChatThreadsList();
+
+        const emptyState = document.getElementById('chat-empty-state');
+        const chatHeader = document.getElementById('chat-window-header');
+        const chatViewport = document.querySelector('.chat-dynamic-viewport');
+        const chatFooter = document.getElementById('chat-global-footer');
+
+        if (!Array.isArray(chatThreads) || chatThreads.length === 0) {
+          // Zero conversations: show empty placeholder
+          state.currentChatThread = null;
+          dmState.activeConversationId = null;
+          dmState.activePartnerId = null;
           if (emptyState) emptyState.style.display = 'flex';
           if (chatHeader) chatHeader.style.display = 'none';
           if (chatViewport) chatViewport.style.display = 'none';
           if (chatFooter) chatFooter.style.display = 'none';
+        } else {
+          // Conversations exist: only keep active conversation if already explicitly selected
+          const activeUserId = dmState.activePartnerId || state.currentChatThread;
+          if (activeUserId) {
+            selectConversation(activeUserId);
+          } else {
+            if (emptyState) emptyState.style.display = 'flex';
+            if (chatHeader) chatHeader.style.display = 'none';
+            if (chatViewport) chatViewport.style.display = 'none';
+            if (chatFooter) chatFooter.style.display = 'none';
+          }
         }
+      } catch (err) {
+        console.error('Error loading chat threads:', err);
+      } finally {
+        _chatThreadsInFlightPromise = null;
       }
-    } catch (err) {
-      console.error('Error loading chat threads:', err);
-    }
+    })();
+
+    return _chatThreadsInFlightPromise;
   }
 
   function formatConversationPreviewText(lastMsg, secretKey) {
@@ -5739,7 +6897,11 @@ document.addEventListener('DOMContentLoaded', () => {
       return 'Start chatting...';
     }
 
-    let decrypted = secretKey ? decryptMessage(lastMsg.content, secretKey) : lastMsg.content;
+    const sId = lastMsg.sender_id || (typeof lastMsg.sender === 'object' ? (lastMsg.sender._id || lastMsg.sender.id) : lastMsg.sender);
+    const rId = lastMsg.recipient_id || (typeof lastMsg.recipient === 'object' ? (lastMsg.recipient._id || lastMsg.recipient.id) : lastMsg.recipient);
+    const effectiveKey = (sId && rId) ? getChatSecretKey(sId, rId) : secretKey;
+
+    let decrypted = effectiveKey ? decryptMessage(lastMsg.content, effectiveKey) : lastMsg.content;
     if (!decrypted) return 'Start chatting...';
 
     // Check if decrypted string contains media tags or base64 data URLs
@@ -5761,6 +6923,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (parsed.type === 'audio') return '🎙️ Voice Note';
         if (parsed.hubType === 'story') {
           const isStoryStillActive = isStoryActive(parsed.hubId, parsed.timestamp || lastMsg.createdAt || lastMsg.created_at);
+          if (parsed.messageType === 'hubbs_reply' || parsed.isReply) {
+            return parsed.text ? `Replied: ${parsed.text}` : 'Replied to HUBB';
+          }
           return isStoryStillActive ? (parsed.text || 'Shared a Hub Story') : 'Shared a Story · Expired';
         }
         if (parsed.hubType === 'post' || parsed.hubType === 'reel') {
@@ -5794,11 +6959,12 @@ document.addEventListener('DOMContentLoaded', () => {
     updateGlobalUnreadBadges(totalUnread);
 
     if (chatThreads.length === 0) {
-      chatThreadsList.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted); font-size:12px;">No active chats. Search users above to start.</div>';
+      chatThreadsList.innerHTML = '<div class="empty-inbox-placeholder" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; min-height:120px; padding:24px 16px; text-align:center; color:var(--text-muted);"><i data-lucide="message-square" style="width:28px; height:28px; margin-bottom:8px; opacity:0.4;"></i><span style="font-size:13px; font-weight:600; color:var(--text-main); margin-bottom:4px;">No conversations yet</span><span style="font-size:11.5px; opacity:0.75;">Search users above to start chatting with your hub.</span></div>';
+      if (window.lucide) lucide.createIcons();
       return;
     }
 
-    const activeUserId = dmState.activeConversationId || state.currentChatThread;
+    const activeUserId = dmState.activePartnerId || state.currentChatThread;
 
     chatThreads.forEach(thread => {
       const u = thread.user;
@@ -5876,7 +7042,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const timeSpan = threadEl.querySelector('.thread-time');
       if (timeSpan) timeSpan.textContent = timeText;
 
-      const isActive = dmState.activeConversationId && dmState.activeConversationId.toString() === targetUserId.toString();
+      const isActive = (dmState.activePartnerId && dmState.activePartnerId.toString() === targetUserId.toString()) || (state.currentChatThread && state.currentChatThread.toString() === targetUserId.toString());
       if (!isActive) {
         const threadObj = chatThreads.find(t => t.user && (getUserIdentifier(t.user) === targetUserId.toString()));
         if (threadObj) {
@@ -5896,7 +7062,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Unified conversation selection handler
-  function selectConversation(targetUserOrId) {
+  async function selectConversation(targetUserOrId) {
     const targetUserId = getUserIdentifier(targetUserOrId);
     if (!targetUserId) return;
 
@@ -5905,13 +7071,49 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     state.currentChatThread = targetUserId;
-    dmState.activeConversationId = targetUserId;
+    dmState.activePartnerId = targetUserId;
 
-    const selectedConversationId = dmState.conversationIdByUser.get(targetUserId) || null;
-    console.warn('[DM DEBUG] selectedUserId:', targetUserId);
-    console.warn('[DM DEBUG] selectedConversationId:', selectedConversationId);
-    console.warn('[DM DEBUG] activeConversationId:', dmState.activeConversationId);
-    console.warn('[DM-RUNTIME] conversation selected:', targetUserId, Date.now());
+    const isConvUuid = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id || '');
+
+    // Check if targetUserOrId was already a conversation UUID or if we have it in conversationIdByUser
+    let selectedConversationId = dmState.conversationIdByUser.get(targetUserId) || null;
+    if (!selectedConversationId && isConvUuid(targetUserId)) {
+      selectedConversationId = targetUserId;
+    }
+
+    // If not resolved to a UUID yet, resolve/create canonical direct conversation via POST /api/chats/direct/:targetId
+    if (!selectedConversationId || !isConvUuid(selectedConversationId)) {
+      const token = getAuthToken();
+      if (token) {
+        try {
+          const resDirect = await fetch(`${API_URL}/api/chats/direct/${encodeURIComponent(targetUserId)}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            }
+          });
+          if (resDirect.ok) {
+            const directData = await resDirect.json();
+            const resolvedId = directData.conversationId || directData.id || directData._id;
+            if (resolvedId && isConvUuid(resolvedId)) {
+              selectedConversationId = resolvedId;
+              dmState.conversationIdByUser.set(targetUserId, resolvedId);
+            }
+          }
+        } catch (err) {
+          console.error('[DM Direct Resolution Error]:', err);
+        }
+      }
+    }
+
+    // activeConversationId is ALWAYS the real conversation UUID (never username, 'caller', or arbitrary string)
+    dmState.activeConversationId = selectedConversationId || null;
+
+    console.debug('[DM DEBUG] selectedUserId:', targetUserId);
+    console.debug('[DM DEBUG] selectedConversationId:', selectedConversationId);
+    console.debug('[DM DEBUG] activeConversationId:', dmState.activeConversationId);
+    console.debug('[DM-RUNTIME] conversation selected:', targetUserId, Date.now());
 
     // Highlight active thread item in sidebar without wiping the list
     if (chatThreadsList) {
@@ -5967,8 +7169,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (dmState.messagesByConversation.has(targetUserId)) {
       renderChatMessages(targetUserId);
     }
-    // 2. Always sync latest messages in background (shows skeleton only on very first fetch if not cached)
-    loadMessages(targetUserId);
+    // 2. Always sync latest messages in background using the real conversation UUID
+    if (selectedConversationId) {
+      loadMessages(selectedConversationId, targetUserId);
+    }
 
     markMessagesAsRead(targetUserId);
 
@@ -5978,24 +7182,25 @@ document.addEventListener('DOMContentLoaded', () => {
     document.body.classList.add('chat-active-mobile');
   }
 
-  // Load messages from backend into dmState
-  async function loadMessages(targetUserId) {
+  // Load messages from backend into dmState using conversation UUID
+  async function loadMessages(convId, targetUserId) {
     const token = getAuthToken();
-    if (!token || !targetUserId) return;
+    if (!token || !convId) return;
 
-    if (dmState.loadingConversations.has(targetUserId)) return;
+    const partnerId = targetUserId || state.currentChatThread || dmState.activePartnerId;
+    if (dmState.loadingConversations.has(convId)) return;
 
     // Request token to prevent stale async responses overwriting active conversation
     const requestToken = Date.now() + '_' + Math.random();
     dmState._activeLoadToken = dmState._activeLoadToken || {};
-    dmState._activeLoadToken[targetUserId] = requestToken;
+    dmState._activeLoadToken[convId] = requestToken;
 
     window.__dmLoadMessagesCount = (window.__dmLoadMessagesCount || 0) + 1;
-    console.warn('[DM-RUNTIME] loadMessages:', window.__dmLoadMessagesCount, targetUserId, Date.now());
+    console.debug('[DM-RUNTIME] loadMessages:', window.__dmLoadMessagesCount, convId, Date.now());
 
     // Show skeleton loading state ONLY if this conversation has never been loaded
-    if (!dmState.loadedConversations.has(targetUserId) && messagesScroll) {
-      console.warn('[DM-RUNTIME] loading ON:', targetUserId, Date.now());
+    if (!dmState.loadedConversations.has(convId) && (!partnerId || !dmState.loadedConversations.has(partnerId)) && messagesScroll) {
+      console.debug('[DM-RUNTIME] loading ON:', convId, Date.now());
       messagesScroll.innerHTML = `
         <div class="chat-messages-skeleton" style="display:flex; flex-direction:column; gap:12px; padding:20px;">
           <div style="width:40%; height:36px; background:rgba(255,255,255,0.06); border-radius:16px; align-self:flex-start; animation:pulse 1.5s infinite;"></div>
@@ -6005,56 +7210,59 @@ document.addEventListener('DOMContentLoaded', () => {
       `;
     }
 
-    dmState.loadingConversations.add(targetUserId);
+    dmState.loadingConversations.add(convId);
 
     let querySucceeded = false;
     let queryError = null;
 
     try {
-      const res = await fetch(`${API_URL}/api/chats/messages/${targetUserId}`, {
+      const res = await fetch(`${API_URL}/api/chats/messages/${convId}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
 
       // Race condition guard: if user switched away, discard this response
-      if (dmState._activeLoadToken?.[targetUserId] !== requestToken) {
-        console.warn('[DM-RUNTIME] stale response discarded for:', targetUserId);
+      if (dmState._activeLoadToken?.[convId] !== requestToken) {
+        console.debug('[DM-RUNTIME] stale response discarded for:', convId);
         return;
       }
 
       if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch messages`);
 
       // Capture the resolved conversationId from the server header
-      const resolvedConvId = res.headers.get('X-Conversation-Id') || targetUserId;
-      dmState.conversationIdByUser.set(targetUserId, resolvedConvId);
+      const resolvedConvId = res.headers.get('X-Conversation-Id') || convId;
+      if (partnerId) {
+        dmState.conversationIdByUser.set(partnerId, resolvedConvId);
+      }
 
       const messages = await res.json();
       querySucceeded = true;
 
-      console.warn('[DM DEBUG] messagesQueryConversationId:', resolvedConvId);
-      console.warn('[DM DEBUG] messagesReturned:', Array.isArray(messages) ? messages.length : 'not-array');
-      console.warn('[DM DEBUG] messagesQueryError:', null);
-      console.warn('[DM DEBUG] activeConversationId:', dmState.activeConversationId);
+      console.debug('[DM DEBUG] messagesQueryConversationId:', resolvedConvId);
+      console.debug('[DM DEBUG] messagesReturned:', Array.isArray(messages) ? messages.length : 'not-array');
+      console.debug('[DM DEBUG] messagesQueryError:', null);
+      console.debug('[DM DEBUG] activeConversationId:', dmState.activeConversationId);
 
-      dmState.messagesByConversation.set(targetUserId, Array.isArray(messages) ? messages : []);
-      dmState.loadedConversations.add(targetUserId);
+      const msgList = Array.isArray(messages) ? messages : [];
+      if (partnerId) {
+        dmState.messagesByConversation.set(partnerId, msgList);
+        dmState.loadedConversations.add(partnerId);
+      }
+      dmState.messagesByConversation.set(resolvedConvId, msgList);
+      dmState.loadedConversations.add(resolvedConvId);
     } catch (err) {
       queryError = err;
       console.error('[DM DEBUG] messagesQueryError:', err.message);
-      console.warn('[DM DEBUG] messagesQueryConversationId:', targetUserId);
-      console.warn('[DM DEBUG] messagesReturned:', 0);
+      console.debug('[DM DEBUG] messagesQueryConversationId:', convId);
+      console.debug('[DM DEBUG] messagesReturned:', 0);
       console.error('Error loading messages:', err);
-      // On error, do NOT set empty array — preserve existing messages if any
-      if (!dmState.messagesByConversation.has(targetUserId)) {
-        // Leave unset so UI shows error state, not false empty state
-      }
     } finally {
-      dmState.loadingConversations.delete(targetUserId);
-      console.warn('[DM-RUNTIME] loading OFF:', targetUserId, Date.now());
+      dmState.loadingConversations.delete(convId);
+      console.debug('[DM-RUNTIME] loading OFF:', convId, Date.now());
 
       // Only render if user is still looking at this conversation
-      if (dmState.activeConversationId === targetUserId) {
+      if (dmState.activeConversationId === convId || (partnerId && dmState.activePartnerId === partnerId)) {
         if (querySucceeded) {
-          renderChatMessages(targetUserId);
+          renderChatMessages(partnerId || convId);
         } else if (queryError) {
           // Show error state — NOT the empty conversation placeholder
           if (messagesScroll) {
@@ -6072,8 +7280,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Helper alias for backward compatibility across other handlers
-  async function fetchMessages(targetUserId) {
-    await loadMessages(targetUserId);
+  async function fetchMessages(convOrUserId) {
+    const isConvUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(convOrUserId || '');
+    if (isConvUuid) {
+      await loadMessages(convOrUserId);
+    } else {
+      await selectConversation(convOrUserId);
+    }
   }
 
   function getChatDateSeparatorText(dateInput) {
@@ -6204,7 +7417,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const msgDate = rawDate ? new Date(rawDate) : new Date();
     const validDate = isNaN(msgDate.getTime()) ? new Date() : msgDate;
 
-    let decryptedText = decryptMessage(msg.content, secretKey);
+    // Robust sender & recipient ID resolution for message-level canonical secret key
+    const msgSenderId = typeof msg.sender === 'object'
+      ? (msg.sender._id || msg.sender.id || '')
+      : (msg.sender || msg.sender_id || '');
+    const msgRecipientId = typeof msg.recipient === 'object'
+      ? (msg.recipient._id || msg.recipient.id || '')
+      : (msg.recipient || msg.recipient_id || '');
+
+    const effectiveKey = (msgSenderId && msgRecipientId)
+      ? getChatSecretKey(msgSenderId, msgRecipientId)
+      : (secretKey || ((currentUserId && targetUserId) ? getChatSecretKey(currentUserId, targetUserId) : ''));
+
+    let decryptedText = decryptMessage(msg.content, effectiveKey);
 
     let hubInfo = null;
     let parsedMediaType = null;
@@ -6242,12 +7467,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const time = validDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-    // Robust sender ID resolution
-    const msgSenderId = typeof msg.sender === 'object'
-      ? (msg.sender._id || msg.sender.id || '')
-      : (msg.sender || msg.sender_id || '');
-
     const isSent = msgSenderId.toString() === currentUserId.toString();
 
     // Linkify standard text content
@@ -6552,24 +7771,25 @@ document.addEventListener('DOMContentLoaded', () => {
     return wrapper;
   }
 
-  // Renders the messages from state for targetUserId (NO FETCHING ALLOWED HERE)
-  function renderChatMessages(targetUserId) {
+  // Renders the messages from state for targetUserOrConvId (NO FETCHING ALLOWED HERE)
+  function renderChatMessages(targetUserOrConvId) {
     if (!messagesScroll) return;
 
     window.__dmRenderMessagesCount = (window.__dmRenderMessagesCount || 0) + 1;
-    console.warn('[DM-RUNTIME] renderMessages:', window.__dmRenderMessagesCount, targetUserId, Date.now());
+    console.debug('[DM-RUNTIME] renderMessages:', window.__dmRenderMessagesCount, targetUserOrConvId, Date.now());
 
     messagesScroll.innerHTML = '';
 
-    const messages = dmState.messagesByConversation.get(targetUserId) || [];
+    const partnerId = dmState.activePartnerId || (getUserIdentifier(targetUserOrConvId) !== targetUserOrConvId ? getUserIdentifier(targetUserOrConvId) : targetUserOrConvId);
+    const messages = dmState.messagesByConversation.get(partnerId) || dmState.messagesByConversation.get(targetUserOrConvId) || [];
     const currentUser = getCurrentUser();
     if (!currentUser) return;
     const currentUserId = (currentUser.id || currentUser._id || '').toString();
-    const secretKey = getChatSecretKey(currentUserId, targetUserId);
+    const secretKey = (currentUserId && partnerId) ? getChatSecretKey(currentUserId, partnerId) : '';
 
     // Only show "No messages yet" if we know the query completed successfully AND returned 0 messages
     if (messages.length === 0) {
-      if (!dmState.loadedConversations.has(targetUserId)) {
+      if (!dmState.loadedConversations.has(partnerId) && !dmState.loadedConversations.has(targetUserOrConvId)) {
         // Query hasn't completed yet — leave skeleton/loading state in place
         return;
       }
@@ -6599,7 +7819,7 @@ document.addEventListener('DOMContentLoaded', () => {
         messagesScroll.appendChild(separator);
       }
 
-      const wrapper = createMessageBubbleElement(msg, currentUserId, targetUserId, secretKey);
+      const wrapper = createMessageBubbleElement(msg, currentUserId, partnerId, secretKey);
       messagesScroll.appendChild(wrapper);
     });
 
@@ -6616,6 +7836,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function appendSingleMessage(targetUserId, msg) {
     if (!msg || !targetUserId) return;
     const msgId = msg._id || msg.id;
+    const convId = msg.conversationId || msg.conversation_id || dmState.conversationIdByUser.get(targetUserId);
 
     // Check if message is already stored in state
     let convList = dmState.messagesByConversation.get(targetUserId);
@@ -6627,16 +7848,29 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!alreadyStored) {
       convList.push(msg);
     }
+    if (convId) {
+      let byConvList = dmState.messagesByConversation.get(convId);
+      if (!byConvList) {
+        byConvList = [];
+        dmState.messagesByConversation.set(convId, byConvList);
+      }
+      if (!byConvList.some(m => (m._id || m.id) === msgId)) {
+        byConvList.push(msg);
+      }
+    }
 
-    // Only update DOM if this conversation is currently open
-    if (dmState.activeConversationId !== targetUserId || !messagesScroll) return;
+    // Only update DOM if this conversation/partner is currently open
+    const isCurrentlyOpen = (dmState.activePartnerId && dmState.activePartnerId.toString() === targetUserId.toString()) ||
+                            (convId && dmState.activeConversationId && dmState.activeConversationId.toString() === convId.toString()) ||
+                            (state.currentChatThread && state.currentChatThread.toString() === targetUserId.toString());
+    if (!isCurrentlyOpen || !messagesScroll) return;
 
     // Deduplicate in DOM
     if (msgId && messagesScroll.querySelector(`[data-msg-id="${msgId}"]`)) {
       return;
     }
 
-    console.warn('[DM-RUNTIME] renderSingleMessage:', msgId, Date.now());
+    console.debug('[DM-RUNTIME] renderSingleMessage:', msgId, Date.now());
 
     // Remove empty placeholder if present
     const emptyEl = messagesScroll.querySelector('.chat-empty-messages');
@@ -6782,17 +8016,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const chatCameraInput = document.getElementById('chat-camera-file-input');
   const chatImgPickerBtn = document.getElementById('chat-img-picker-btn');
   const cameraClickSim = document.getElementById('camera-click-sim');
-
-  const emojiLibrary = {
-    All: ['😊', '😂', '😍', '👍', '🔥', '🎉', '❤️', '👏', '😮', '😢', '🙌', '🚀', '🕶️', '☕', '✨', '💯', '🥳', '🤩', '😎', '💪', '🌟', '💖', '🙏', '😇'],
-    Smileys: ['😊', '😂', '😍', '😄', '😅', '😆', '😇', '😉', '😌', '🥹', '😎', '🤩', '😏', '😮', '😢', '😭', '😤', '🤯', '😴', '😋'],
-    People: ['👋', '👍', '👏', '🙌', '🙏', '🤝', '💪', '🫶', '🧑‍💻', '👨‍💻', '👩‍💻', '🧠', '🤗', '🫵', '🫰', '🤟', '🤘', '👀', '🫠', '🤙'],
-    Animals: ['🐶', '🐱', '🐭', '🐹', '🦊', '🐻', '🐼', '🐸', '🐵', '🐔', '🦄', '🦋', '🐙', '🐬', '🦁', '🐢', '🐳', '🦒', '🐟', '🐨'],
-    Food: ['🍕', '🍔', '🍟', '🍣', '🍜', '🍩', '🍪', '🍓', '🍇', '🥑', '🥗', '🍉', '🍍', '🍰', '🍹', '☕', '🍵', '🥐', '🍌', '🍗'],
-    Activities: ['⚽', '🏀', '🏈', '⚡', '🎾', '🎮', '🎨', '🎵', '🎸', '🎧', '🎬', '🎉', '🎊', '🎁', '🎯', '🏆', '🔥', '🚀', '💃', '🧘'],
-    Travel: ['✈️', '🚗', '🚆', '🚲', '🏖️', '🏕️', '🌍', '⛵', '🚢', '🚁', '🗺️', '🏔️', '🌊', '🌞', '🧭', '🛫', '🛴', '🚉', '🛏️', '🏙️'],
-    Objects: ['💡', '📱', '💻', '⌨️', '🖱️', '🎧', '📷', '📚', '🧰', '💼', '🪄', '🎀', '🪴', '🧴', '🪞', '🧺', '💎', '🔑', '🧩', '🛍️']
-  };
 
   function renderEmojiGrid(category = 'All', search = '') {
     if (!emojiGrid) return;
@@ -9231,7 +10454,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
       feedCards.forEach(card => {
         if (card.id === 'feed-empty-state') return;
-        const tags = (card.getAttribute('data-tags') || '').toLowerCase();
+        
+        let tags = (card.getAttribute('data-tags') || '').toLowerCase();
+        
+        // --- MOBILE ENHANCED HASHTAG FILTERING ---
+        if (window.innerWidth <= 768 && typeof window.renderHomeFeed === 'function') {
+          // Break out of the loop and handle filtering below
+          return;
+        }
+        // -----------------------------------------
 
         if (filter === 'all' || tags.split(' ').includes(filter.toLowerCase())) {
           card.style.display = 'flex';
@@ -9240,6 +10471,64 @@ document.addEventListener('DOMContentLoaded', () => {
           card.style.display = 'none';
         }
       });
+      
+      // Mobile-only true re-rendering
+      if (window.innerWidth <= 768 && typeof window.renderHomeFeed === 'function') {
+        const allPosts = window.feedPosts || [];
+        if (filter === 'all') {
+          window.renderHomeFeed(allPosts);
+        } else {
+          const filterNorm = filter.toLowerCase().trim();
+          const filtered = allPosts.filter(post => {
+            let matches = false;
+            const postTagsArr = post.topics || post.tags || post.hashtags || [];
+            
+            const checkTag = (t) => {
+              if (t && String(t).toLowerCase().replace('#', '').trim() === filterNorm) matches = true;
+            };
+            
+            if (Array.isArray(postTagsArr)) {
+              postTagsArr.forEach(checkTag);
+            } else if (typeof postTagsArr === 'string') {
+              postTagsArr.split(',').forEach(checkTag);
+            }
+            
+            if (post.caption) {
+              // Exact hashtag match
+              const hashMatches = post.caption.match(/#\w+/g);
+              if (hashMatches) {
+                hashMatches.forEach(m => {
+                  if (m.toLowerCase().replace('#', '') === filterNorm) matches = true;
+                });
+              }
+              // Word match (e.g. caption containing "love" without #)
+              const wordRegex = new RegExp(`\\b${filterNorm}\\b`, 'i');
+              if (wordRegex.test(post.caption)) matches = true;
+            }
+            
+            if (post.content) {
+              const wordRegex = new RegExp(`\\b${filterNorm}\\b`, 'i');
+              if (wordRegex.test(post.content)) matches = true;
+            }
+            
+            return matches;
+          });
+          
+          if (filtered.length === 0) {
+            const container = document.getElementById('home-feed-posts');
+            if (container) {
+              container.innerHTML = `
+                <div id="feed-empty-state" style="text-align: center; padding: 48px 20px; background: var(--card-bg); border: var(--card-border); border-radius: var(--radius-lg); margin-top: 10px;">
+                  <h3 style="font-family: var(--font-display); font-size: 16px; font-weight: 600; color: var(--text-main); margin-bottom: 6px;">No posts found for #${filter.toUpperCase()}</h3>
+                </div>
+              `;
+            }
+          } else {
+            window.renderHomeFeed(filtered);
+          }
+        }
+        return;
+      }
 
       let emptyStateCard = document.getElementById('feed-empty-state');
       if (matchCount === 0) {
@@ -9402,9 +10691,17 @@ document.addEventListener('DOMContentLoaded', () => {
         avatarPreview.src = profileLargeAvatar.src;
         currentAvatarUrl = profileLargeAvatar.src;
       }
-      if (bannerPreview && profileBannerImg) {
-        bannerPreview.src = profileBannerImg.src;
-        currentBannerUrl = profileBannerImg.src;
+      
+      const savedBanner = localStorage.getItem('invibeBannerImage') || currentUser?.bannerImage || currentUser?.cover_image_url || (profileBannerImg && profileBannerImg.src && !profileBannerImg.src.endsWith('/') && !profileBannerImg.src.includes('data:image/gif') ? profileBannerImg.src : '');
+      currentBannerUrl = savedBanner || '';
+      if (bannerPreview) {
+        if (savedBanner) {
+          bannerPreview.src = savedBanner;
+          bannerPreview.style.opacity = '1';
+        } else {
+          bannerPreview.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40" viewBox="0 0 100 40"><rect width="100" height="40" fill="%231e1e2d"/></svg>';
+          bannerPreview.style.opacity = '0.5';
+        }
       }
 
       // Show modal
@@ -9455,7 +10752,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const file = bannerFileInput.files[0];
         const reader = new FileReader();
         reader.onload = (e) => {
-          if (bannerPreview) bannerPreview.src = e.target.result;
+          if (bannerPreview) {
+            bannerPreview.src = e.target.result;
+            bannerPreview.style.opacity = '1';
+          }
           currentBannerUrl = e.target.result;
         };
         reader.readAsDataURL(file);
@@ -9491,6 +10791,20 @@ document.addEventListener('DOMContentLoaded', () => {
       const userStr = localStorage.getItem('invibeUser');
       const currentUser = userStr ? JSON.parse(userStr) : {};
       let resolvedAvatarUrl = currentAvatarUrl;
+      let resolvedBannerUrl = currentBannerUrl;
+
+      if (bannerFileInput && bannerFileInput.files && bannerFileInput.files.length > 0) {
+        const file = bannerFileInput.files[0];
+        if (!currentBannerUrl || !currentBannerUrl.startsWith('data:image')) {
+          currentBannerUrl = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (e) => resolve(e.target.result);
+            reader.onerror = () => resolve(currentBannerUrl || '');
+            reader.readAsDataURL(file);
+          });
+          resolvedBannerUrl = currentBannerUrl;
+        }
+      }
 
       // 2. Perform backend & Supabase sync
       try {
@@ -9513,8 +10827,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (res.ok) {
           const data = await res.json();
-          if (data && data.user && data.user.profileImage) {
-            resolvedAvatarUrl = data.user.profileImage;
+          if (data && data.user) {
+            if (data.user.profileImage) resolvedAvatarUrl = data.user.profileImage;
+            if (data.user.bannerImage) resolvedBannerUrl = data.user.bannerImage;
           }
         } else {
           const errData = await res.json().catch(() => ({}));
@@ -9537,15 +10852,18 @@ document.addEventListener('DOMContentLoaded', () => {
         bio: newBio,
         phoneNumber: newPhone,
         preferred2faMethod: new2faMethod,
-        profileImage: resolvedAvatarUrl || currentUser.profileImage
+        profileImage: resolvedAvatarUrl || currentUser.profileImage,
+        bannerImage: resolvedBannerUrl || currentUser.bannerImage || currentUser.cover_image_url
       };
 
       localStorage.setItem('invibeUser', JSON.stringify(updatedUser));
       if (resolvedAvatarUrl && !resolvedAvatarUrl.startsWith('data:image/gif;base64')) {
         localStorage.setItem('invibeProfileImage', resolvedAvatarUrl);
       }
-      if (currentBannerUrl && !currentBannerUrl.startsWith('data:image/gif;base64')) {
-        localStorage.setItem('invibeBannerImage', currentBannerUrl);
+      if (resolvedBannerUrl && !resolvedBannerUrl.startsWith('data:image/gif;base64')) {
+        localStorage.setItem('invibeBannerImage', resolvedBannerUrl);
+      } else {
+        localStorage.removeItem('invibeBannerImage');
       }
       localStorage.setItem('invibeBio', newBio);
 
@@ -9598,8 +10916,19 @@ document.addEventListener('DOMContentLoaded', () => {
         const storyViewerAvatar = document.getElementById('story-viewer-avatar');
         if (storyViewerAvatar) storyViewerAvatar.src = resolvedAvatarUrl;
       }
-      if (currentBannerUrl && profileBannerImg) {
-        profileBannerImg.src = currentBannerUrl;
+
+      const finalBannerUrl = resolvedBannerUrl || currentBannerUrl;
+      if (finalBannerUrl) {
+        if (profileBannerImg) {
+          profileBannerImg.src = finalBannerUrl;
+          profileBannerImg.style.display = 'block';
+        }
+        const sidebarBanner = document.querySelector('.sidebar-left .card-cover-bg');
+        if (sidebarBanner) {
+          sidebarBanner.style.backgroundImage = `url(${finalBannerUrl})`;
+          sidebarBanner.style.backgroundSize = 'cover';
+          sidebarBanner.style.backgroundPosition = 'center';
+        }
       }
 
       updateAppUI();
@@ -10266,11 +11595,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const isStory = key.startsWith('story_');
         const isReel = key.startsWith('reel_') || key.startsWith('reel');
         const isPost = key.startsWith('post_');
-        const rawId = key.replace(/^(story_|reel_|post_)/, '');
+        const isForward = key.startsWith('forward_');
+        const rawId = key.replace(/^(story_|reel_|post_|forward_)/, '');
 
         let hubPayload = {
-          text: isStory ? 'Shared a Hub Story' : (isReel ? 'Shared a Reel' : 'Shared a Post'),
-          hubType: isStory ? 'story' : (isReel ? 'reel' : 'post'),
+          text: isStory ? 'Shared a Hub Story' : (isReel ? 'Shared a Reel' : (isForward ? 'Forwarded Message' : 'Shared a Post')),
+          hubType: isStory ? 'story' : (isReel ? 'reel' : (isForward ? 'forward' : 'post')),
           hubId: rawId,
           thumbnail: '',
           isVideo: false,
@@ -10278,6 +11608,21 @@ document.addEventListener('DOMContentLoaded', () => {
           authorAvatar: currentUser.profileImage || '',
           timestamp: new Date().toISOString()
         };
+
+        if (isForward) {
+           const bubble = document.querySelector(`.chat-bubble[data-msg-id="${rawId}"]`);
+           if (bubble) {
+               let forwardText = bubble.getAttribute('data-raw-text') || '';
+               forwardText = forwardText.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+               if (!forwardText || forwardText === '[Decryption Failed]') {
+                  if (bubble.querySelector('a[download]')) forwardText = bubble.querySelector('a[download]').href;
+                  else if (bubble.querySelector('img')) forwardText = bubble.querySelector('img').src;
+                  else if (bubble.querySelector('video')) forwardText = bubble.querySelector('video').src;
+                  else forwardText = 'Forwarded Message';
+               }
+               hubPayload.text = forwardText;
+           }
+        }
 
         if (isStory && state.storyGroups) {
           state.storyGroups.forEach(g => {
@@ -10342,7 +11687,7 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }
 
-        const payloadString = JSON.stringify(hubPayload);
+        const payloadString = isForward ? hubPayload.text : JSON.stringify(hubPayload);
         let successCount = 0;
         const promises = Array.from(currentShareSelection.values()).map(async (u) => {
           const secretKey = getChatSecretKey(currentUserId, u._id);
@@ -10357,10 +11702,10 @@ document.addEventListener('DOMContentLoaded', () => {
             body: JSON.stringify({
               recipient: u._id,
               content: encryptedText,
-              mediaUrl: key,
-              mediaType: 'hub',
-              mediaName: isStory ? 'Shared Hub Story' : (isReel ? 'Shared Reel' : 'Shared Post'),
-              mediaSize: 'Link'
+              mediaUrl: isForward ? '' : key,
+              mediaType: isForward ? 'text' : 'hub',
+              mediaName: isForward ? '' : (isStory ? 'Shared Hub Story' : (isReel ? 'Shared Reel' : 'Shared Post')),
+              mediaSize: isForward ? '' : 'Link'
             })
           });
 
@@ -10409,40 +11754,68 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // ─── LIVE DATABASE & FEED POSTS INTEGRATION ───
+  // ─── LIVE DATABASE & FEED POSTS INTEGRATION WITH SWR CACHING ───
+  let _cachedFeedPosts = null;
+  let _lastFeedFetchTime = 0;
+  let _feedPostsInFlightPromise = null;
+  const FEED_CACHE_TTL = 60 * 1000; // 60 seconds
 
-  async function loadFeedPosts() {
+  async function loadFeedPosts(forceRefresh = false) {
     const feedContainer = document.getElementById('home-feed-posts');
     if (!feedContainer) return;
 
-    // Clear legacy local post caches from previous schemas
-    try {
-      localStorage.removeItem('invibe_custom_posts');
-      localStorage.removeItem('invibe_posts');
-      window.invibe_memory_posts = [];
-    } catch (_) { }
+    const now = Date.now();
+    const isCacheFresh = _cachedFeedPosts && (now - _lastFeedFetchTime < FEED_CACHE_TTL);
 
-    let posts = [];
-    try {
-      const res = await fetch(`${API_URL}/api/posts`);
-      if (res.ok) {
-        posts = await res.json();
-        window.feedPosts = posts;
+    // If cache exists, render from memory immediately without blanking or flickering
+    if (_cachedFeedPosts && _cachedFeedPosts.length > 0) {
+      if (feedContainer.children.length === 0 || forceRefresh) {
+        window.renderHomeFeed(_cachedFeedPosts);
       }
-    } catch (err) {
-      console.warn("API loadFeedPosts notice:", err.message);
+      if (!forceRefresh && isCacheFresh) {
+        return;
+      }
     }
 
-    feedContainer.innerHTML = '';
+    if (_feedPostsInFlightPromise) {
+      return _feedPostsInFlightPromise;
+    }
 
-    if (!posts || posts.length === 0) {
-      feedContainer.innerHTML = `
-        <div id="feed-empty-state" style="text-align: center; padding: 48px 20px; background: var(--card-bg); border: var(--card-border); border-radius: var(--radius-lg); margin-top: 10px;">
-          <div style="font-size: 32px; margin-bottom: 10px;">✨</div>
-          <h3 style="font-family: var(--font-display); font-size: 18px; font-weight: 700; color: var(--text-main); margin-bottom: 6px;">No posts published yet</h3>
-          <p style="font-size: 13px; color: var(--text-muted); margin: 0;">Be the first to share a hub with the world using the form above!</p>
-        </div>
-      `;
+    _feedPostsInFlightPromise = (async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/posts`);
+        if (res.ok) {
+          const posts = await res.json();
+          _cachedFeedPosts = posts;
+          _lastFeedFetchTime = Date.now();
+          window.feedPosts = posts;
+          window.renderHomeFeed(posts);
+        }
+      } catch (err) {
+        console.warn("API loadFeedPosts notice:", err.message);
+      } finally {
+        _feedPostsInFlightPromise = null;
+      }
+    })();
+
+    return _feedPostsInFlightPromise;
+  }
+
+  window.renderHomeFeed = function(postsToRender, forceRebuild = false) {
+    const feedContainer = document.getElementById('home-feed-posts');
+    if (!feedContainer) return;
+
+    if (!postsToRender || postsToRender.length === 0) {
+      if (_lastRenderedFeedFingerprint !== 'empty' || forceRebuild) {
+        _lastRenderedFeedFingerprint = 'empty';
+        feedContainer.innerHTML = `
+          <div id="feed-empty-state" style="text-align: center; padding: 48px 20px; background: var(--card-bg); border: var(--card-border); border-radius: var(--radius-lg); margin-top: 10px;">
+            <div style="font-size: 32px; margin-bottom: 10px;">✨</div>
+            <h3 style="font-family: var(--font-display); font-size: 18px; font-weight: 700; color: var(--text-main); margin-bottom: 6px;">No posts published yet</h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin: 0;">Be the first to share a hub with the world using the form above!</p>
+          </div>
+        `;
+      }
       return;
     }
 
@@ -10450,12 +11823,29 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentUser = currentUserStr ? JSON.parse(currentUserStr) : null;
     const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
 
+    // Generate deterministic fingerprint of feed state
+    const currentFingerprint = postsToRender.map(p => {
+      const pid = p._id || p.id;
+      const likesCount = Array.isArray(p.likes) ? p.likes.length : (p.likesCount || 0);
+      const isLiked = currentUser ? (p.likes || []).includes(currentUserId) : false;
+      const isSaved = window.savedHubbs && window.savedHubbs.some(s => (s.id || s._id) === pid);
+      const commentsCount = Array.isArray(p.comments) ? p.comments.length : (p.commentCount || 0);
+      return `${pid}_${likesCount}_${isLiked ? 1 : 0}_${isSaved ? 1 : 0}_${commentsCount}`;
+    }).join('|');
+
+    if (!forceRebuild && currentFingerprint === _lastRenderedFeedFingerprint && feedContainer.children.length > 0) {
+      return; // 100% Identical feed already in DOM — skip destructive DOM wipe!
+    }
+
+    _lastRenderedFeedFingerprint = currentFingerprint;
+    feedContainer.innerHTML = '';
+
     const storedFollowing = JSON.parse(localStorage.getItem('invibe_following_users') || '[]');
     const storedPending = JSON.parse(localStorage.getItem('invibe_pending_users') || '[]');
     const followingSet = new Set(storedFollowing);
     const pendingSet = new Set(storedPending);
 
-    posts.forEach(post => {
+    postsToRender.forEach(post => {
       const isLikedByMe = currentUser ? (post.likes || []).includes(currentUserId) : false;
       const isSavedByMe = window.savedHubbs && window.savedHubbs.some(s => s.id === post._id);
       const authorObj = post.author || {};
@@ -10486,52 +11876,34 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       card.setAttribute('data-tags', hashtags.join(' '));
 
-      let commentsHTML = '';
-      (post.comments || []).forEach(comment => {
-        const commentAuthorId = getUserIdentifier(comment.author) || comment.author_id || '';
-        const commentUsername = (comment.author?.username || '').toLowerCase();
-        const isCommentMe = !!(currentUserId && (currentUserId.toString() === commentAuthorId.toString() || (currentUser?.username && currentUser.username.toLowerCase() === commentUsername)));
-        const resolvedCommentAvatar = (isCommentMe && localUserAvatar)
-          ? localUserAvatar
-          : (comment.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
-
-        commentsHTML += `
-          <div class="comment-item" style="display: flex; gap: 8px; margin-bottom: 8px; font-size: 13px;">
-            <img src="${resolvedCommentAvatar}" alt="" class="comment-author-avatar" data-user-id="${commentAuthorId}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; cursor: pointer;" />
-            <div>
-              <strong class="comment-author-name" data-user-id="${commentAuthorId}" style="color: var(--text-color); margin-right: 4px; cursor: pointer;">${comment.author?.username || 'user'}</strong>
-              <span style="color: var(--text-muted);">${comment.text}</span>
-            </div>
-          </div>
-        `;
-      });
+      const shouldRenderComments = window.innerWidth > 768 || window.activeCommentPostId === post._id;
 
       card.innerHTML = `
-        <div class="post-header" style="display: flex; align-items: center; justify-content: space-between;">
-          <div class="post-author-info" style="display: flex; align-items: center; gap: 10px;">
-            <img src="${resolvedAuthorAvatar}" alt="${authorName}" class="author-avatar" style="cursor: pointer;" data-user-id="${authorId}" />
-            <div>
-              <div style="display: flex; align-items: center; gap: 6px;">
+        <div class="post-header">
+          <div class="post-author-info">
+            <img src="${resolvedAuthorAvatar}" alt="${authorName}" loading="lazy" decoding="async" class="author-avatar" style="cursor: pointer;" data-user-id="${authorId}" />
+            <div class="post-author-text">
+              <div class="post-author-title-row">
                 <h4 class="author-name" style="margin: 0; cursor: pointer;" data-user-id="${authorId}">${authorName}</h4>
-                <span class="author-handle" style="font-size: 12px; color: var(--text-muted, #94a3b8);">@${authorUsername}</span>
+                <span class="author-handle">@${authorUsername}</span>
               </div>
-              <div class="post-meta" style="margin-top: 2px; display: flex; align-items: center; gap: 6px;">
+              <div class="post-meta">
                 <span class="post-time">${new Date(post.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 <span class="dot-separator">•</span>
                 <i data-lucide="globe" class="meta-icon"></i>
                 ${post.location ? `
                   <span class="dot-separator">•</span>
-                  <span class="post-location" style="display: inline-flex; align-items: center; gap: 3px; color: var(--primary, #a855f7); font-size: 11px; font-weight: 600; max-width: 140px; overflow: hidden;">
+                  <span class="post-location">
                     <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block; flex-shrink: 0;"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${post.location}</span>
+                    <span class="post-location-text">${post.location}</span>
                   </span>
                 ` : ''}
               </div>
             </div>
           </div>
-          <div style="display: flex; align-items: center; gap: 10px;">
+          <div class="post-header-actions">
             ${!isMe ? `
-              <button type="button" class="btn-follow-user ${isFollowing ? 'following' : (isPending ? 'pending' : '')}" data-user-id="${authorId}" data-username="${authorUsername}" style="padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; border: none; cursor: pointer; transition: all 0.2s; background: ${isFollowing ? 'rgba(255,255,255,0.1)' : (isPending ? 'rgba(234, 179, 8, 0.2)' : 'var(--primary, #a855f7)')}; color: ${isPending ? '#eab308' : '#ffffff'};">
+              <button type="button" class="btn-follow-user ${isFollowing ? 'following' : (isPending ? 'pending' : '')}" data-user-id="${authorId}" data-username="${authorUsername}">
                 ${isFollowing ? 'Following' : (isPending ? 'Requested' : '+ Follow')}
               </button>
             ` : ''}
@@ -10539,52 +11911,63 @@ document.addEventListener('DOMContentLoaded', () => {
           </div>
         </div>
 
-        <div class="post-media-container" style="position:relative; overflow:hidden; border-radius: 12px; margin: 12px 0;">
-          ${(post.mediaItems && post.mediaItems.length > 1)
-          ? `
-            <div class="post-carousel-wrapper" style="position: relative; width: 100%; max-height: 480px; overflow: hidden; display: flex; flex-direction: column;">
-              <div class="post-carousel-slides" onscroll="((container) => {
-                const index = Math.round(container.scrollLeft / container.clientWidth);
-                const dots = container.parentNode.querySelectorAll('.carousel-dot');
-                dots.forEach((dot, idx) => {
-                  dot.style.background = idx === index ? '#6C3BFF' : 'rgba(255, 255, 255, 0.5)';
-                  dot.style.transform = idx === index ? 'scale(1.2)' : 'scale(1)';
-                });
-              })(this)" style="display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; -ms-overflow-style: none; width: 100%; height: 100%;">
-                ${post.mediaItems.map((item, idx) => `
-                  <div class="carousel-slide-item" style="flex: 0 0 100%; width: 100%; height: 100%; scroll-snap-align: start; display: flex; justify-content: center; align-items: center; background: #000; position: relative; overflow: hidden;">
-                    ${item.type === 'video'
-              ? `<video src="${item.url}" controls loop muted playsinline style="width: 100%; max-height: 100%; object-fit: contain; display: block;" class="post-media-video"></video>`
-              : `<img src="${item.url}" alt="Post Media ${idx + 1}" class="post-media-img" style="max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; display: block;" />`
-            }
+        ${(() => {
+          const rawMediaItems = Array.isArray(post.mediaItems) ? post.mediaItems : [];
+          const validItems = rawMediaItems.filter(item => item && item.url && !item.url.trim().toLowerCase().startsWith('blob:'));
+          const singleMediaUrl = (post.mediaUrl && !post.mediaUrl.trim().toLowerCase().startsWith('blob:')) ? post.mediaUrl : (validItems[0]?.url || '');
+          const hasMedia = validItems.length > 0 || !!singleMediaUrl;
+
+          if (!hasMedia) return '';
+
+          return `
+            <div class="post-media-container" style="position:relative; overflow:hidden; border-radius: 12px; margin: 12px 0;">
+              ${(validItems.length > 1)
+              ? `
+                <div class="post-carousel-wrapper" style="position: relative; width: 100%; max-height: 480px; overflow: hidden; display: flex; flex-direction: column;">
+                  <div class="post-carousel-slides" onscroll="((container) => {
+                    const index = Math.round(container.scrollLeft / container.clientWidth);
+                    const dots = container.parentNode.querySelectorAll('.carousel-dot');
+                    dots.forEach((dot, idx) => {
+                      dot.style.background = idx === index ? '#6C3BFF' : 'rgba(255, 255, 255, 0.5)';
+                      dot.style.transform = idx === index ? 'scale(1.2)' : 'scale(1)';
+                    });
+                  })(this)" style="display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; -ms-overflow-style: none; width: 100%; height: 100%;">
+                    ${validItems.map((item, idx) => `
+                      <div class="carousel-slide-item" style="flex: 0 0 100%; width: 100%; height: 100%; scroll-snap-align: start; display: flex; justify-content: center; align-items: center; background: #000; position: relative; overflow: hidden;">
+                        ${item.type === 'video'
+                  ? `<video src="${item.url}" controls loop muted playsinline style="width: 100%; max-height: 100%; object-fit: contain; display: block;" class="post-media-video"></video>`
+                  : `<img src="${item.url}" alt="Post Media ${idx + 1}" loading="lazy" decoding="async" class="post-media-img" style="max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; display: block;" />`
+                }
+                      </div>
+                    `).join('')}
                   </div>
-                `).join('')}
-              </div>
-              
-              <!-- Bottom Controls with chevrons beside the dots -->
-              <div class="carousel-controls-bottom" style="position: absolute; bottom: 12px; left: 0; right: 0; display: flex; justify-content: center; align-items: center; gap: 12px; z-index: 5;">
-                <button class="carousel-nav-btn prev-btn" onclick="this.parentNode.parentNode.querySelector('.post-carousel-slides').scrollBy({left: -this.parentNode.parentNode.clientWidth, behavior: 'smooth'})" style="background: rgba(0,0,0,0.5); border: none; border-radius: 50%; width: 22px; height: 22px; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; font-weight: bold; outline: none; transition: all 0.2s ease;">‹</button>
-                
-                <div class="carousel-dots-container" style="display: flex; gap: 6px; pointer-events: none; align-items: center;">
-                  ${post.mediaItems.map((_, idx) => `
-                    <span class="carousel-dot ${idx === 0 ? 'active' : ''}" style="width: 6px; height: 6px; border-radius: 50%; background: ${idx === 0 ? '#6C3BFF' : 'rgba(255, 255, 255, 0.5)'}; transition: all 0.2s ease;"></span>
-                  `).join('')}
+                  
+                  <!-- Bottom Controls with chevrons beside the dots -->
+                  <div class="carousel-controls-bottom" style="position: absolute; bottom: 12px; left: 0; right: 0; display: flex; justify-content: center; align-items: center; gap: 12px; z-index: 5;">
+                    <button class="carousel-nav-btn prev-btn" onclick="this.parentNode.parentNode.querySelector('.post-carousel-slides').scrollBy({left: -this.parentNode.parentNode.clientWidth, behavior: 'smooth'})" style="background: rgba(0,0,0,0.5); border: none; border-radius: 50%; width: 22px; height: 22px; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; font-weight: bold; outline: none; transition: all 0.2s ease;">‹</button>
+                    
+                    <div class="carousel-dots-container" style="display: flex; gap: 6px; pointer-events: none; align-items: center;">
+                      ${validItems.map((_, idx) => `
+                        <span class="carousel-dot ${idx === 0 ? 'active' : ''}" style="width: 6px; height: 6px; border-radius: 50%; background: ${idx === 0 ? '#6C3BFF' : 'rgba(255, 255, 255, 0.5)'}; transition: all 0.2s ease;"></span>
+                      `).join('')}
+                    </div>
+                    
+                    <button class="carousel-nav-btn next-btn" onclick="this.parentNode.parentNode.querySelector('.post-carousel-slides').scrollBy({left: this.parentNode.parentNode.clientWidth, behavior: 'smooth'})" style="background: rgba(0,0,0,0.5); border: none; border-radius: 50%; width: 22px; height: 22px; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; font-weight: bold; outline: none; transition: all 0.2s ease;">›</button>
+                  </div>
                 </div>
-                
-                <button class="carousel-nav-btn next-btn" onclick="this.parentNode.parentNode.querySelector('.post-carousel-slides').scrollBy({left: this.parentNode.parentNode.clientWidth, behavior: 'smooth'})" style="background: rgba(0,0,0,0.5); border: none; border-radius: 50%; width: 22px; height: 22px; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; font-weight: bold; outline: none; transition: all 0.2s ease;">›</button>
-              </div>
+                `
+              : (post.mediaType === 'video'
+                ? `<video src="${singleMediaUrl}" controls loop muted playsinline style="border-radius:12px; display:block;" class="post-media-video"></video>
+                   <div class="video-mute-container" style="position: absolute; left: 16px; bottom: 48px; z-index: 12;">
+                     <button class="action-circle-btn mute-btn-action" data-post-id="${post._id}">
+                       <i data-lucide="volume-2"></i>
+                     </button>
+                   </div>`
+                : `<img src="${singleMediaUrl}" alt="Post Media" loading="lazy" decoding="async" class="post-media-img" style="border-radius:12px; display:block;" />`
+              )}
             </div>
-            `
-          : (post.mediaType === 'video'
-            ? `<video src="${post.mediaUrl}" controls loop muted playsinline style="border-radius:12px; display:block;" class="post-media-video"></video>
-                 <div class="video-mute-container" style="position: absolute; left: 16px; bottom: 48px; z-index: 12;">
-                   <button class="action-circle-btn mute-btn-action" data-post-id="${post._id}">
-                     <i data-lucide="volume-2"></i>
-                   </button>
-                 </div>`
-            : `<img src="${post.mediaUrl}" alt="Post Media" class="post-media-img" style="border-radius:12px; display:block;" />`
-          )
-        }
+          `;
+        })()}
 
           <!-- Speaker Overlay Button (if musicUrl is present) -->
           ${(() => {
@@ -10618,16 +12001,7 @@ document.addEventListener('DOMContentLoaded', () => {
           <div class="post-details">
             <p class="post-caption"><strong class="author-username" style="margin-right: 8px; cursor: pointer;">${authorUsername}</strong>${post.caption}</p>
             
-            <div class="comments-section" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
-              <div class="comments-list" id="comments-list-${post._id}">
-                ${commentsHTML}
-              </div>
-              
-              <div class="post-comment-input-area" style="display: flex; align-items: center; gap: 8px; margin-top: 12px; position: relative;">
-                <input type="text" placeholder="Write a comment..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 40px 8px 16px; color: var(--text-color); font-size: 13px;" />
-                <button class="comment-post-btn" data-post-id="${post._id}" style="position: absolute; right: 8px; background: none; border: none; color: var(--primary, #a855f7); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 6px; transition: transform 0.2s;"><i data-lucide="send" style="width: 16px; height: 16px;"></i></button>
-              </div>
-            </div>
+            ${shouldRenderComments ? window.getCommentsSectionHTML(post, currentUserId, currentUser, localUserAvatar) : `<div class="comments-section-placeholder" id="comments-placeholder-${post._id}"></div>`}
           </div>
         `;
 
@@ -10751,7 +12125,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
     });
-  }
+  };
 
   function triggerBtnHeartExplosion(anchorElement) {
     if (!anchorElement) return;
@@ -11020,33 +12394,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // --- SUPABASE REALTIME FEED SYNCHRONIZATION ---
-  function initRealtimeFeedSubscriptions() {
-    if (!supabase) return;
-
-    try {
-      supabase
-        .channel('public:feed_realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, payload => {
-          if (payload.new && payload.new.post_id) {
-            refreshPostCommentsCount(payload.new.post_id);
-          } else if (payload.old && payload.old.post_id) {
-            refreshPostCommentsCount(payload.old.post_id);
-          }
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, payload => {
-          if (payload.new && payload.new.post_id) {
-            refreshPostLikesCount(payload.new.post_id);
-          } else if (payload.old && payload.old.post_id) {
-            refreshPostLikesCount(payload.old.post_id);
-          }
-        })
-        .subscribe();
-    } catch (rtErr) {
-      console.warn("Realtime subscription notice:", rtErr.message);
-    }
-  }
-
   async function refreshPostCommentsCount(postId) {
     const card = document.getElementById(`post-${postId}`);
     if (!card) return;
@@ -11061,6 +12408,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (_) { }
   }
+  window.refreshPostCommentsCount = refreshPostCommentsCount;
 
   async function refreshPostLikesCount(postId) {
     const card = document.getElementById(`post-${postId}`);
@@ -11077,42 +12425,62 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (_) { }
   }
+  window.refreshPostLikesCount = refreshPostLikesCount;
 
   window.loadFeedPosts = loadFeedPosts;
   window.loadFeed = loadFeedPosts;
 
-  initRealtimeFeedSubscriptions();
+  let _cachedReels = null;
+  let _lastReelsFetchTime = 0;
+  let _reelsInFlightPromise = null;
+  const REELS_CACHE_TTL = 120 * 1000; // 2 minutes
 
-  async function loadFeedReels() {
+  async function loadFeedReels(forceRefresh = false) {
     const scroller = document.querySelector('#explore-reels-container .reels-scroller');
     if (!scroller) return;
 
-    try {
-      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
-      const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+    const now = Date.now();
+    const isCacheFresh = _cachedReels && (now - _lastReelsFetchTime < REELS_CACHE_TTL);
 
-      console.log('[HUBB FEED] Fetching reels from API...');
-      const res = await fetch(`${API_URL}/api/reels`, { headers });
-      console.log('[HUBB FEED] API response status:', res.status);
+    // If reels are already rendered in DOM and cache is fresh, skip destructive reload
+    if (!forceRefresh && isCacheFresh && scroller.children.length > 0) {
+      return;
+    }
 
-      if (!res.ok) throw new Error('Failed to fetch reels (HTTP ' + res.status + ')');
-      const rawData = await res.json();
+    if (_reelsInFlightPromise) {
+      return _reelsInFlightPromise;
+    }
 
-      let reels = [];
-      if (Array.isArray(rawData)) reels = rawData;
-      else if (Array.isArray(rawData?.reels)) reels = rawData.reels;
-      else if (Array.isArray(rawData?.data)) reels = rawData.data;
+    _reelsInFlightPromise = (async () => {
+      try {
+        const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
+        const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
 
-      // Skip DOM rebuild if the same reel IDs are already rendered
-      const newIds = reels.map(r => r._id || r.id).join(',');
-      const existingIds = Array.from(scroller.querySelectorAll('.reel-card')).map(c => c.getAttribute('data-reel-id')).join(',');
-      if (newIds && newIds === existingIds && scroller.children.length > 0) {
-        console.log('[HUBB FEED] Reels unchanged, skipping DOM rebuild.');
+        console.log('[HUBB FEED] Fetching reels from API...');
+        const res = await fetch(`${API_URL}/api/reels`, { headers });
+        console.log('[HUBB FEED] API response status:', res.status);
+
+        if (!res.ok) throw new Error('Failed to fetch reels (HTTP ' + res.status + ')');
+        const rawData = await res.json();
+
+        let reels = [];
+        if (Array.isArray(rawData)) reels = rawData;
+        else if (Array.isArray(rawData?.reels)) reels = rawData.reels;
+        else if (Array.isArray(rawData?.data)) reels = rawData.data;
+
+        _cachedReels = reels;
+        _lastReelsFetchTime = Date.now();
+
+        // Skip DOM rebuild if the same reel IDs are already rendered
+        const newIds = reels.map(r => r._id || r.id).join(',');
+        const existingIds = Array.from(scroller.querySelectorAll('.reel-card')).map(c => c.getAttribute('data-reel-id')).join(',');
+        if (newIds && newIds === existingIds && scroller.children.length > 0) {
+          console.log('[HUBB FEED] Reels unchanged, skipping DOM rebuild.');
+          window.feedReels = reels;
+          return;
+        }
+
         window.feedReels = reels;
-        return;
-      }
-
-      window.feedReels = reels;
 
       console.log('[HUBB FEED] reel count:', reels.length);
       if (reels.length > 0) {
@@ -11268,14 +12636,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
           <!-- Comments Modal -->
           <div class="story-viewer-overlay reel-comments-modal" data-reel-id="${reel._id || reel.id}">
-            <div class="comments-card glass-panel" style="background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border-radius: 20px; border: 1px solid rgba(255,255,255,0.15); width: 90%; max-width: 380px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;">
-              <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid rgba(255,255,255,0.1);">
-                <h3 style="margin:0; font-size:16px; color:white; font-weight:600;">Comments</h3>
-                <button class="modal-close-btn" style="background:none; border:none; color:white; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
+            <div class="comments-card glass-panel" style="backdrop-filter: blur(20px); border-radius: 20px; width: 90%; max-width: 380px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;">
+              <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px;">
+                <h3 style="margin:0; font-size:16px; font-weight:600;">Comments</h3>
+                <button class="modal-close-btn" style="background:none; border:none; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
               </div>
               <div class="comments-list" style="flex:1; overflow-y:auto; padding:16px; min-height:180px; max-height:360px;"></div>
-              <div class="comments-footer" style="display:flex; gap:10px; padding:12px 16px; border-top:1px solid rgba(255,255,255,0.1); background:rgba(0,0,0,0.3);">
-                <input type="text" placeholder="Add a comment..." style="flex:1; background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); border-radius:20px; padding:8px 16px; color:white; font-size:13px; outline:none;" />
+              <div class="comments-footer" style="display:flex; gap:10px; padding:12px 16px;">
+                <input type="text" placeholder="Add a comment..." style="flex:1; border-radius:20px; padding:8px 16px; font-size:13px; outline:none;" />
                 <button class="comment-send-btn" style="width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg, #a855f7 0%, #d946ef 100%); border:none; color:white; display:flex; align-items:center; justify-content:center; cursor:pointer;"><i data-lucide="send" style="width:16px; height:16px;"></i></button>
               </div>
             </div>
@@ -11303,8 +12671,8 @@ document.addEventListener('DOMContentLoaded', () => {
           video.addEventListener('play', () => console.log('[HUBBING PLAYER] event=play reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
           video.addEventListener('playing', () => console.log('[HUBBING PLAYER] event=playing reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2) + ' paused=' + video.paused + ' readyState=' + video.readyState));
           video.addEventListener('pause', () => console.log('[HUBBING PLAYER] event=pause reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
-          video.addEventListener('waiting', () => console.warn('[HUBBING PLAYER] event=waiting reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2) + ' readyState=' + video.readyState + ' networkState=' + video.networkState));
-          video.addEventListener('stalled', () => console.warn('[HUBBING PLAYER] event=stalled reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
+          video.addEventListener('waiting', () => console.debug('[HUBBING PLAYER] event=waiting reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2) + ' readyState=' + video.readyState + ' networkState=' + video.networkState));
+          video.addEventListener('stalled', () => console.debug('[HUBBING PLAYER] event=stalled reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
           video.addEventListener('seeking', () => console.log('[HUBBING PLAYER] event=seeking reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
           video.addEventListener('seeked', () => console.log('[HUBBING PLAYER] event=seeked reelId=' + (reel._id || reel.id) + ' currentTime=' + video.currentTime.toFixed(2)));
           video.addEventListener('ended', () => console.log('[HUBBING PLAYER] event=ended reelId=' + (reel._id || reel.id)));
@@ -11330,8 +12698,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     } catch (err) {
       console.error('[HUBB FEED] Error loading reels:', err);
+    } finally {
+      _reelsInFlightPromise = null;
     }
-  }
+  })();
+
+  return _reelsInFlightPromise;
+}
 
   window.loadFeedReels = loadFeedReels;
 
@@ -11430,17 +12803,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function formatReelCommentTime(dateStr) {
+    if (!dateStr) return '';
+    try {
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return '';
+      const now = new Date();
+      const diffSec = Math.floor((now - d) / 1000);
+      if (diffSec < 60) return 'Just now';
+      const diffMin = Math.floor(diffSec / 60);
+      if (diffMin < 60) return `${diffMin}m`;
+      const diffHr = Math.floor(diffMin / 60);
+      if (diffHr < 24) return `${diffHr}h`;
+      const diffDays = Math.floor(diffHr / 24);
+      if (diffDays < 7) return `${diffDays}d`;
+      const diffWeeks = Math.floor(diffDays / 7);
+      if (diffWeeks < 4) return `${diffWeeks}w`;
+      return `${Math.floor(diffDays / 30)}mo`;
+    } catch (_) {
+      return '';
+    }
+  }
+
   async function loadReelComments(reelId, modalElement) {
     const listElem = modalElement.querySelector('.comments-list');
     if (!listElem) return;
-    listElem.innerHTML = '<div style="padding: 20px; text-align: center; color: rgba(255,255,255,0.6); font-size: 13px;">Loading comments...</div>';
+    listElem.innerHTML = '<div class="reel-comments-status" style="padding: 20px; text-align: center; color: var(--text-muted, #94a3b8); font-size: 13px;">Loading comments...</div>';
 
     try {
       const res = await fetch(`${API_URL}/api/reels/${reelId}/comments`);
       const comments = await res.json();
       listElem.innerHTML = '';
       if (!Array.isArray(comments) || comments.length === 0) {
-        listElem.innerHTML = '<div style="padding: 20px; text-align: center; color: rgba(255,255,255,0.5); font-size: 13px;">No comments yet. Be the first to comment!</div>';
+        listElem.innerHTML = '<div class="reel-comments-status" style="padding: 20px; text-align: center; color: var(--text-muted, #94a3b8); font-size: 13px;">No comments yet. Be the first to comment!</div>';
         return;
       }
       comments.forEach(c => {
@@ -11449,11 +12844,18 @@ document.addEventListener('DOMContentLoaded', () => {
         item.style.cssText = 'display: flex; gap: 10px; margin-bottom: 12px; align-items: flex-start;';
         const avatar = c.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
         const cAuthorId = getUserIdentifier(c.author);
+        const timeAgoStr = formatReelCommentTime(c.createdAt || c.created_at);
+        const rawContent = c.content || c.text || '';
+        const formattedContent = rawContent.replace(/@(\w+)/g, '<span class="comment-mention" style="color:var(--primary, #8b5cf6); font-weight:600; cursor:pointer;">@$1</span>');
+
         item.innerHTML = `
-          <img src="${avatar}" class="comment-author-avatar" style="width:30px; height:30px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.2); cursor:pointer;" />
-          <div style="flex:1; background: rgba(255,255,255,0.06); padding: 8px 12px; border-radius: 12px;">
-            <div class="comment-author-name" style="font-size:12px; font-weight:700; color:white; cursor:pointer;">@${c.author?.username || 'user'}</div>
-            <div style="font-size:12.5px; color:rgba(255,255,255,0.9); margin-top:3px; line-height: 1.4;">${c.content}</div>
+          <img src="${avatar}" class="comment-author-avatar" style="width:30px; height:30px; border-radius:50%; object-fit:cover; border:1px solid var(--border-color, rgba(255,255,255,0.2)); cursor:pointer;" />
+          <div class="comment-bubble" style="flex:1; background: var(--surface-hover, rgba(255,255,255,0.06)); border: 1px solid var(--border-color, rgba(255,255,255,0.1)); padding: 8px 12px; border-radius: 12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:2px;">
+              <div class="comment-author-name" style="font-size:12px; font-weight:700; color:var(--text-main, #ffffff); cursor:pointer;">@${c.author?.username || 'user'}</div>
+              ${timeAgoStr ? `<span class="comment-time" style="font-size:10.5px; color:var(--text-muted, #94a3b8);">${timeAgoStr}</span>` : ''}
+            </div>
+            <div class="comment-text" style="font-size:12.5px; color:var(--text-main, #ffffff); line-height: 1.4; word-break: break-word;">${formattedContent}</div>
           </div>
         `;
 
@@ -11468,10 +12870,22 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         });
 
+        const mentionEls = item.querySelectorAll('.comment-mention');
+        mentionEls.forEach(mEl => {
+          mEl.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const username = mEl.textContent.replace('@', '').trim();
+            if (username) {
+              modalElement.classList.remove('active');
+              switchView('profile', username);
+            }
+          });
+        });
+
         listElem.appendChild(item);
       });
     } catch (err) {
-      listElem.innerHTML = '<div style="padding: 20px; text-align: center; color: #ef4444; font-size: 13px;">Failed to load comments</div>';
+      listElem.innerHTML = '<div class="reel-comments-status error" style="padding: 20px; text-align: center; color: #ef4444; font-size: 13px;">Failed to load comments</div>';
     }
   }
 
@@ -11568,12 +12982,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function loadActiveVibers() {
-    if (typeof presenceManager !== 'undefined') {
-      return presenceManager.fetchOnlineUsers();
-    }
-  }
-
   if (typeof presenceManager !== 'undefined') {
     presenceManager.init();
   }
@@ -11611,23 +13019,51 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // --- UNIFIED SUGGESTED HUBBERS SERVICE ---
-  async function getSuggestedHubbers(limit = 50) {
+  // --- UNIFIED SUGGESTED HUBBERS SERVICE WITH 5-MINUTE CACHE & IN-FLIGHT DEDUPLICATION ---
+  let _cachedSuggestedHubbers = null;
+  let _lastSuggestedFetchTime = 0;
+  let _suggestedHubbersInFlightPromise = null;
+  const SUGGESTIONS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+  function invalidateSuggestedHubbersCache() {
+    _cachedSuggestedHubbers = null;
+    _lastSuggestedFetchTime = 0;
+  }
+  window.invalidateSuggestedHubbersCache = invalidateSuggestedHubbersCache;
+
+  async function getSuggestedHubbers(limit = 50, forceRefresh = false) {
     const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
     if (!token) return [];
 
-    try {
-      const res = await fetch(`${API_URL}/api/users/suggestions?limit=${limit}`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch suggestions`);
-      const suggestions = await res.json();
-      console.log(`[Suggested Hubbers Service] Fetched ${suggestions ? suggestions.length : 0} suggestions (limit: ${limit})`);
-      return suggestions || [];
-    } catch (err) {
-      console.error('[Suggested Hubbers Service Error]:', err);
-      return [];
+    const now = Date.now();
+    if (!forceRefresh && _cachedSuggestedHubbers && (now - _lastSuggestedFetchTime < SUGGESTIONS_CACHE_TTL)) {
+      return _cachedSuggestedHubbers;
     }
+
+    if (_suggestedHubbersInFlightPromise) {
+      return _suggestedHubbersInFlightPromise;
+    }
+
+    _suggestedHubbersInFlightPromise = (async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/users/suggestions?limit=${limit}`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch suggestions`);
+        const suggestions = await res.json();
+        _cachedSuggestedHubbers = suggestions || [];
+        _lastSuggestedFetchTime = Date.now();
+        console.log(`[Suggested Hubbers Service] Fetched ${_cachedSuggestedHubbers.length} suggestions (limit: ${limit})`);
+        return _cachedSuggestedHubbers;
+      } catch (err) {
+        console.error('[Suggested Hubbers Service Error]:', err);
+        return _cachedSuggestedHubbers || [];
+      } finally {
+        _suggestedHubbersInFlightPromise = null;
+      }
+    })();
+
+    return _suggestedHubbersInFlightPromise;
   }
 
   // --- SUGGESTED HUBBERS HOME WIDGET ---
@@ -12005,56 +13441,48 @@ document.addEventListener('DOMContentLoaded', () => {
   const activeVibersCount = document.getElementById('active-vibers-count');
   const activeVibersList = document.getElementById('active-vibers-list');
 
-  async function loadActiveVibers() {
+  function renderActiveVibersWidget(activeUsers = [], onlineCount = 0) {
     if (!activeVibersList) return;
-    const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
-    if (!token) return;
+    if (activeVibersCount) {
+      activeVibersCount.textContent = `${onlineCount} online`;
+    }
 
-    try {
-      const res = await fetch(`${API_URL}/api/online-users`, {
-        headers: { 'Authorization': `Bearer ${token}` }
+    activeVibersList.innerHTML = '';
+    if (!activeUsers || activeUsers.length === 0) {
+      activeVibersList.innerHTML = '<p style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; width: 100%;">No hubbers online</p>';
+      return;
+    }
+
+    activeUsers.slice(0, 5).forEach(user => {
+      const circle = document.createElement('div');
+      circle.className = 'face-circle online';
+      circle.style.position = 'relative';
+      circle.style.cursor = 'pointer';
+      circle.title = `${user.fullName} (@${user.username})`;
+      circle.innerHTML = `
+        <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${user.fullName}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover;" />
+        <span class="online-indicator-dot" style="position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #22c55e; border: 2px solid #1a1a24; border-radius: 50%;"></span>
+      `;
+
+      circle.addEventListener('click', () => {
+        switchView('profile', getUserIdentifier(user));
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch online users`);
-      const data = await res.json();
-      console.log('[Active Hubbers Widget Debug] API Response:', data);
 
-      const onlineCount = data.onlineCount !== undefined ? data.onlineCount : (Array.isArray(data) ? data.length : 0);
-      const activeUsers = data.users || (Array.isArray(data) ? data : []);
+      activeVibersList.appendChild(circle);
+    });
+  }
+  window.renderActiveVibersWidget = renderActiveVibersWidget;
 
-      activeVibersList.innerHTML = '';
-      if (activeVibersCount) {
-        activeVibersCount.textContent = `${onlineCount} online`;
-      }
-
-      if (activeUsers.length === 0) {
-        activeVibersList.innerHTML = '<p style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; width: 100%;">No hubbers online</p>';
-        return;
-      }
-
-      activeUsers.slice(0, 5).forEach(user => {
-        const circle = document.createElement('div');
-        circle.className = 'face-circle online';
-        circle.style.position = 'relative';
-        circle.style.cursor = 'pointer';
-        circle.title = `${user.fullName} (@${user.username})`;
-        circle.innerHTML = `
-          <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'}" alt="${user.fullName}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover;" />
-          <span class="online-indicator-dot" style="position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #22c55e; border: 2px solid #1a1a24; border-radius: 50%;"></span>
-        `;
-
-        circle.addEventListener('click', () => {
-          switchView('profile', getUserIdentifier(user));
-        });
-
-        activeVibersList.appendChild(circle);
-      });
-    } catch (err) {
-      console.error('[Active Hubbers Widget Error]:', err);
+  async function loadActiveVibers() {
+    const pm = (typeof presenceManager !== 'undefined' ? presenceManager : null) || window.presenceManager || window.PresenceManager;
+    if (!pm) return;
+    if (pm.isInitialized) {
+      renderActiveVibersWidget(pm.activeUsersList, pm.onlineCount);
+    } else {
+      await pm.fetchOnlineUsers();
     }
   }
-
-  // Poll active users as fallback
-  setInterval(loadActiveVibers, 30000);
+  window.loadActiveVibers = loadActiveVibers;
 
   async function loadProfileStats() {
     const currentUserStr = localStorage.getItem('invibeUser');
@@ -12078,19 +13506,11 @@ document.addEventListener('DOMContentLoaded', () => {
       if (isViewingSelf) {
         const profileFollowers = document.getElementById('profile-followers-count');
         const profileFollowing = document.getElementById('profile-following-count');
+        const profileVibes = document.getElementById('profile-vibes-count');
+
         if (profileFollowers) profileFollowers.textContent = formatCount(data.followersCount);
         if (profileFollowing) profileFollowing.textContent = formatCount(data.followingCount);
-
-        const postsRes = await fetch(`${API_URL}/api/posts`);
-        if (postsRes.ok) {
-          const posts = await postsRes.json();
-          const userPostsCount = posts.filter(p => {
-            const authorId = (p.author?._id || p.author?.id || p.author || '').toString();
-            return authorId === currentUserId;
-          }).length;
-          const profileVibes = document.getElementById('profile-vibes-count');
-          if (profileVibes) profileVibes.textContent = userPostsCount;
-        }
+        if (profileVibes && data.postsCount !== undefined) profileVibes.textContent = formatCount(data.postsCount);
       }
     } catch (err) {
       console.error('Error loading profile stats:', err);
@@ -12424,6 +13844,10 @@ document.addEventListener('DOMContentLoaded', () => {
         let startX, startY;
         let posX = 0;
         let posY = 0;
+        let minX = -Infinity, maxX = Infinity, minY = -Infinity, maxY = Infinity;
+        let currentRAF = null;
+        let pendingTargetX = 0;
+        let pendingTargetY = 0;
 
         capsule.addEventListener('mousedown', dragStart);
         capsule.addEventListener('touchstart', dragStart, { passive: false });
@@ -12435,7 +13859,14 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }, true);
 
+        function getDragCoords(e) {
+          if (e.touches && e.touches.length > 0) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+          if (e.changedTouches && e.changedTouches.length > 0) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+          return { x: e.clientX, y: e.clientY };
+        }
+
         function dragStart(e) {
+          if (window.innerWidth > 768) return;
           if (e.type === 'mousedown' && e.button !== 0) return;
           isDraggingCapsule = false;
           wasDragging = false;
@@ -12444,12 +13875,30 @@ document.addEventListener('DOMContentLoaded', () => {
           startY = coords.y;
           posX = parseFloat(capsule.getAttribute('data-x')) || 0;
           posY = parseFloat(capsule.getAttribute('data-y')) || 0;
+          
+          const cardRect = card.getBoundingClientRect();
+          const capsuleRect = capsule.getBoundingClientRect();
+          const initialLeft = capsuleRect.left - posX;
+          const initialTop = capsuleRect.top - posY;
+          
+          minX = cardRect.left - initialLeft + 12;
+          maxX = cardRect.right - capsuleRect.width - initialLeft - 12;
+          minY = cardRect.top - initialTop + 12;
+          maxY = cardRect.bottom - capsuleRect.height - initialTop - 12;
+
           capsule.style.transition = 'none';
           capsule.classList.add('dragging-capsule');
           document.addEventListener('mousemove', dragMove);
           document.addEventListener('mouseup', dragEnd);
           document.addEventListener('touchmove', dragMove, { passive: false });
           document.addEventListener('touchend', dragEnd);
+        }
+
+        function updatePosition() {
+          currentRAF = null;
+          capsule.style.transform = `translate3d(${pendingTargetX}px, ${pendingTargetY}px, 0) scale(1.05)`;
+          capsule.setAttribute('data-target-x', pendingTargetX.toString());
+          capsule.setAttribute('data-target-y', pendingTargetY.toString());
         }
 
         function dragMove(e) {
@@ -12468,24 +13917,16 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.cancelable) e.preventDefault();
             let targetX = posX + deltaX;
             let targetY = posY + deltaY;
-            const cardRect = card.getBoundingClientRect();
-            const capsuleRect = capsule.getBoundingClientRect();
-            const curX = parseFloat(capsule.getAttribute('data-x')) || 0;
-            const curY = parseFloat(capsule.getAttribute('data-y')) || 0;
-            const initialLeft = capsuleRect.left - curX;
-            const initialTop = capsuleRect.top - curY;
-
-            const minX = cardRect.left - initialLeft + 12;
-            const maxX = cardRect.right - capsuleRect.width - initialLeft - 12;
-            const minY = cardRect.top - initialTop + 12;
-            const maxY = cardRect.bottom - capsuleRect.height - initialTop - 12;
 
             targetX = Math.max(minX, Math.min(maxX, targetX));
             targetY = Math.max(minY, Math.min(maxY, targetY));
 
-            capsule.style.transform = `translate3d(${targetX}px, ${targetY}px, 0) scale(1.05)`;
-            capsule.setAttribute('data-target-x', targetX.toString());
-            capsule.setAttribute('data-target-y', targetY.toString());
+            pendingTargetX = targetX;
+            pendingTargetY = targetY;
+
+            if (!currentRAF) {
+              currentRAF = requestAnimationFrame(updatePosition);
+            }
           }
         }
 
@@ -12494,6 +13935,12 @@ document.addEventListener('DOMContentLoaded', () => {
           document.removeEventListener('mouseup', dragEnd);
           document.removeEventListener('touchmove', dragMove);
           document.removeEventListener('touchend', dragEnd);
+
+          if (currentRAF) {
+            cancelAnimationFrame(currentRAF);
+            currentRAF = null;
+            updatePosition();
+          }
 
           capsule.style.transition = '';
           capsule.classList.remove('dragging-capsule');
@@ -12679,7 +14126,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const savedGrid = document.getElementById('profile-saved-grid');
 
     // Handle Own Profile vs Other User UI Elements Visibility
+    const profileSettingsBtn = document.getElementById('profile-settings-btn');
     if (isMe) {
+      if (profileSettingsBtn) profileSettingsBtn.style.visibility = 'visible';
       if (followBtn) followBtn.style.display = 'none';
       if (optionsList) optionsList.style.display = 'grid';
       if (logoutBtn) logoutBtn.style.display = 'block';
@@ -12690,7 +14139,20 @@ document.addEventListener('DOMContentLoaded', () => {
       if (profileName) profileName.innerHTML = escapeHtml(currentUser.fullName || currentUser.username || 'User');
       if (profileHandle) profileHandle.textContent = '@' + (currentUser.username || 'user');
       if (profileBio) profileBio.textContent = currentUser.bio || 'Hubber creator on Hi-Hubble 🚀';
+
+      const savedBannerUrl = localStorage.getItem('invibeBannerImage') || currentUser.bannerImage || currentUser.cover_image_url;
+      const profileBannerImg = document.querySelector('.profile-banner img');
+      if (profileBannerImg) {
+        if (savedBannerUrl) {
+          profileBannerImg.src = savedBannerUrl;
+          profileBannerImg.style.display = 'block';
+          profileBannerImg.style.opacity = '1';
+        } else {
+          profileBannerImg.src = '';
+        }
+      }
     } else {
+      if (profileSettingsBtn) profileSettingsBtn.style.visibility = 'hidden';
       if (optionsList) optionsList.style.display = 'none';
       if (logoutBtn) logoutBtn.style.display = 'none';
       if (savedTabBtn) savedTabBtn.style.display = 'none';
@@ -12715,6 +14177,11 @@ document.addEventListener('DOMContentLoaded', () => {
       if (profileHandle) profileHandle.textContent = '@' + (cleanInputId && cleanInputId.startsWith('@') ? cleanInputId.slice(1) : (cleanInputId || 'user'));
       if (profileBio) profileBio.textContent = '';
       if (profileAvatar) profileAvatar.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+      const profileBannerImg = document.querySelector('.profile-banner img');
+      if (profileBannerImg) {
+        profileBannerImg.src = '';
+        profileBannerImg.style.display = 'none';
+      }
     }
 
     // Set initial loading placeholders for grids
@@ -12767,6 +14234,28 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (profileBio) {
         profileBio.textContent = u.bio || 'Hubber creator on Hi-Hubble 🚀';
+      }
+
+      const targetUserBannerUrl = isMe ? (localStorage.getItem('invibeBannerImage') || u.bannerImage || u.cover_image_url || '') : (u.bannerImage || u.cover_image_url || '');
+      const profileBannerImg = document.querySelector('.profile-banner img');
+      if (profileBannerImg) {
+        if (targetUserBannerUrl) {
+          profileBannerImg.src = targetUserBannerUrl;
+          profileBannerImg.style.display = 'block';
+          profileBannerImg.style.opacity = '1';
+        } else {
+          profileBannerImg.src = '';
+          profileBannerImg.style.display = 'none';
+        }
+      }
+      if (isMe && targetUserBannerUrl) {
+        localStorage.setItem('invibeBannerImage', targetUserBannerUrl);
+        const sidebarBanner = document.querySelector('.sidebar-left .card-cover-bg');
+        if (sidebarBanner) {
+          sidebarBanner.style.backgroundImage = `url(${targetUserBannerUrl})`;
+          sidebarBanner.style.backgroundSize = 'cover';
+          sidebarBanner.style.backgroundPosition = 'center';
+        }
       }
 
       // Render stats
@@ -12834,6 +14323,9 @@ document.addEventListener('DOMContentLoaded', () => {
               item.addEventListener('mouseenter', () => video.play().catch(() => { }));
               item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
             }
+            item.addEventListener('click', () => {
+              openProfileReelViewer(reel);
+            });
             reelsGrid.appendChild(item);
           });
         }
@@ -12861,6 +14353,9 @@ document.addEventListener('DOMContentLoaded', () => {
               item.addEventListener('mouseenter', () => video.play().catch(() => { }));
               item.addEventListener('mouseleave', () => { video.pause(); video.currentTime = 0; });
             }
+            item.addEventListener('click', () => {
+              openProfileReelViewer(reel);
+            });
             taggedGrid.appendChild(item);
           });
         }
@@ -12898,48 +14393,35 @@ document.addEventListener('DOMContentLoaded', () => {
       ? localUserAvatar
       : (post.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
 
-    let commentsHTML = '';
-    (post.comments || []).forEach(comment => {
-      const commentAuthorId = getUserIdentifier(comment.author) || comment.author_id || '';
-      const commentUsername = (comment.author?.username || '').toLowerCase();
-      const isCommentMe = !!(currentUserId && (currentUserId.toString() === commentAuthorId.toString() || (currentUser?.username && currentUser.username.toLowerCase() === commentUsername)));
-      const resolvedCommentAvatar = (isCommentMe && localUserAvatar)
-        ? localUserAvatar
-        : (comment.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
-
-      commentsHTML += `
-        <div class="comment-item" style="display: flex; gap: 8px; margin-bottom: 8px; font-size: 13px;">
-          <img src="${resolvedCommentAvatar}" alt="" class="comment-author-avatar" data-user-id="${commentAuthorId}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; cursor: pointer;" />
-          <div>
-            <strong class="comment-author-name" data-user-id="${commentAuthorId}" style="color: var(--text-color); margin-right: 4px; cursor: pointer;">${comment.author?.username || 'user'}</strong>
-            <span style="color: var(--text-muted);">${comment.text}</span>
-          </div>
-        </div>
-      `;
-    });
+    const shouldRenderComments = window.innerWidth > 768 || window.activeCommentPostId === post._id;
 
     const cardHTML = `
       <article class="feed-card" id="post-${post._id}">
         <div class="post-header">
-          <div class="post-author-info" style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+          <div class="post-author-info" style="cursor: pointer;">
             <img src="${resolvedAuthorAvatar}" alt="${post.author?.fullName || 'User'}" class="author-avatar" />
-            <div>
-              <h4 class="author-name">${post.author?.fullName || post.author?.username || 'User'}</h4>
-              <div class="post-meta" style="display: flex; align-items: center; gap: 6px;">
+            <div class="post-author-text">
+              <div class="post-author-title-row">
+                <h4 class="author-name">${post.author?.fullName || post.author?.username || 'User'}</h4>
+                <span class="author-handle">@${post.author?.username || 'user'}</span>
+              </div>
+              <div class="post-meta">
                 <span class="post-time">${new Date(post.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 <span class="dot-separator">•</span>
                 <i data-lucide="globe" class="meta-icon"></i>
                 ${post.location ? `
                   <span class="dot-separator">•</span>
-                  <span class="post-location" style="display: inline-flex; align-items: center; gap: 3px; color: var(--primary, #a855f7); font-size: 11px; font-weight: 600; max-width: 140px; overflow: hidden;">
+                  <span class="post-location">
                     <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block; flex-shrink: 0;"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${post.location}</span>
+                    <span class="post-location-text">${post.location}</span>
                   </span>
                 ` : ''}
               </div>
             </div>
           </div>
-          <button class="post-options-btn" data-post-id="${post._id}" data-author-id="${postAuthorId || ''}"><i data-lucide="more-horizontal"></i></button>
+          <div class="post-header-actions">
+            <button class="post-options-btn" data-post-id="${post._id}" data-author-id="${postAuthorId || ''}"><i data-lucide="more-horizontal"></i></button>
+          </div>
         </div>
 
         <div class="post-media-container" style="position:relative; overflow:hidden; border-radius: 12px; margin: 12px 0;">
@@ -13021,16 +14503,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="post-details">
           <p class="post-caption"><strong class="author-username" style="margin-right: 8px; cursor: pointer;">${post.author?.username || 'user'}</strong>${post.caption}</p>
           
-          <div class="comments-section" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
-            <div class="comments-list" id="comments-list-${post._id}">
-              ${commentsHTML}
-            </div>
-            
-            <div class="post-comment-input-area" style="display: flex; align-items: center; gap: 8px; margin-top: 12px; position: relative;">
-              <input type="text" placeholder="Write a comment..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 40px 8px 16px; color: var(--text-color); font-size: 13px;" />
-              <button class="comment-post-btn" data-post-id="${post._id}" style="position: absolute; right: 8px; background: none; border: none; color: var(--primary, #a855f7); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 6px; transition: transform 0.2s;"><i data-lucide="send" style="width: 16px; height: 16px;"></i></button>
-            </div>
-          </div>
+          ${shouldRenderComments ? window.getCommentsSectionHTML(post, currentUserId, currentUser, localUserAvatar) : `<div class="comments-section-placeholder" id="comments-placeholder-${post._id}"></div>`}
         </div>
       </article>
     `;
@@ -13196,6 +14669,182 @@ document.addEventListener('DOMContentLoaded', () => {
         profilePostViewerModal.classList.remove('active');
         const video = profilePostViewerContent.querySelector('video');
         if (video) video.pause();
+      }
+    });
+  }
+
+  // --- PROFILE REEL VIEWER MODAL SYSTEM ---
+  const profileReelViewerModal = document.getElementById('profile-reel-viewer-modal');
+  const profileReelViewerCloseBtn = document.getElementById('profile-reel-viewer-close-btn');
+  const profileReelViewerContent = document.getElementById('profile-reel-viewer-content');
+
+  function openProfileReelViewer(reel) {
+    if (!profileReelViewerModal || !profileReelViewerContent || !reel) return;
+
+    const authorName = reel.author ? (reel.author.fullName || reel.author.username || 'Hubble User') : 'Hubble User';
+    const authorUser = reel.author ? (reel.author.username || 'hubble_user') : 'hubble_user';
+    const authorAvatar = reel.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80';
+    const authorId = reel.author?._id || reel.author?.id || '';
+    const reelId = reel._id || reel.id;
+
+    const captionText = reel.caption || '';
+    const captionHtml = captionText.replace(/#(\w+)/g, '<span style="color:#c084fc; font-weight:600;">#$1</span>');
+    const isReelSaved = !!reel.isSaved || (window.savedHubbs && window.savedHubbs.some(s => (s._id || s.id) === reelId));
+    const isLiked = !!reel.isLiked;
+    const formattedLikes = reel.formattedLikes || reel.likeCount || (reel.likes || []).length || '0';
+    const formattedComments = reel.formattedComments || reel.commentCount || '0';
+    const formattedShares = reel.formattedShares || reel.shareCount || '0';
+
+    const card = document.createElement('div');
+    card.className = 'reel-card';
+    card.setAttribute('data-reel-id', reelId);
+    card.style.cssText = 'position: relative; width: 100%; height: 100%; margin: 0; border-radius: 0; overflow: hidden; background: #000; box-sizing: border-box;';
+
+    card.innerHTML = `
+      <video src="${reel.videoUrl}" loop ${window.reelsMuted !== false ? 'muted' : ''} playsinline preload="auto" class="reel-video" style="width:100%; height:100%; object-fit:cover; display:block;"></video>
+      
+      <div class="reel-play-icon-overlay" style="cursor: pointer; z-index: 4;">
+        <i data-lucide="play" style="width:30px; height:30px; color:white; opacity:0.9;"></i>
+      </div>
+      
+      <div class="double-tap-heart"><i data-lucide="heart"></i></div>
+
+      <div class="reel-overlay" style="position:absolute; inset:0; background: linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.15) 50%, rgba(0,0,0,0.3) 100%); display:flex; justify-content:space-between; align-items:flex-end; padding:18px; box-sizing:border-box; z-index:5;">
+        <div class="reel-left-info" style="display:flex; flex-direction:column; gap:8px; max-width:70%; position:relative; z-index:7;">
+          <div class="reel-user" style="display:flex; align-items:center; gap:8px; cursor: pointer;">
+            <img src="${authorAvatar}" alt="${authorName}" style="width:34px; height:34px; border-radius:50%; object-fit:cover; border:2px solid #a855f7;" />
+            <div style="display:flex; flex-direction:column; gap:2px;">
+              <span style="color:white; font-size:13px; font-weight:600;">@${authorUser}</span>
+              ${reel.location ? `
+                <div class="reel-location-badge" style="display:flex; align-items:center; gap:4px; color:rgba(255,255,255,0.7); font-size:10.5px;">
+                  <i data-lucide="map-pin" style="width:10px; height:10px; color:#ec4899;"></i>
+                  <span>${reel.location}</span>
+                </div>
+              ` : ''}
+            </div>
+          </div>
+          <p class="reel-caption" style="color:white; font-size:13px; margin:0; line-height:1.4;">${captionHtml}</p>
+          <div class="reel-music" style="display:flex; align-items:center; gap:6px; color:rgba(255,255,255,0.8); font-size:11px;">
+            <i data-lucide="music" style="width:12px; height:12px;" class="music-icon-spin"></i> <span>${reel.audioTrackName || ('Original Audio - ' + authorUser)}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Actions Block -->
+      <div class="reel-right-actions" style="position: absolute; bottom: 20px; right: 16px; display:flex; flex-direction:column; gap:12px; align-items:center; z-index:10 !important;">
+        <div class="reel-actions-capsule" style="background: rgba(15, 23, 42, 0.5); backdrop-filter: blur(12px); border-radius: 36px; padding: 16px 8px; border: 1px solid rgba(255,255,255,0.15); display: flex; flex-direction: column; gap: 16px; align-items: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+          
+          <!-- 1. Like -->
+          <div class="reel-action-btn reel-like-action" data-reel-id="${reelId}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+            <button class="action-circle-btn heart-btn ${isLiked ? 'liked' : ''}" style="background:none; border:none; color:white; width:38px; height:38px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+              <i data-lucide="heart" style="${isLiked ? 'fill:#8b5cf6; stroke:#8b5cf6;' : ''}"></i>
+            </button>
+            <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${formattedLikes}</span>
+          </div>
+
+          <!-- 2. Comment -->
+          <div class="reel-action-btn reel-comment-sim" data-reel-id="${reelId}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+            <button class="action-circle-btn" style="background:none; border:none; color:white; width:38px; height:38px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+              <i data-lucide="message-circle"></i>
+            </button>
+            <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${formattedComments}</span>
+          </div>
+
+          <!-- 3. Share -->
+          <div class="reel-action-btn reel-share-sim" data-reel-id="${reelId}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+            <button class="action-circle-btn" style="background:none; border:none; color:white; width:38px; height:38px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+              <i data-lucide="send"></i>
+            </button>
+            <span class="action-count" style="color:white; font-size:11px; font-weight:700;">${formattedShares}</span>
+          </div>
+
+          <!-- 4. Save/Bookmark -->
+          <div class="reel-action-btn reel-save-action" data-reel-id="${reelId}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;">
+            <button class="action-circle-btn star-btn ${isReelSaved ? 'saved' : ''}" style="background:none; border:none; color:white; width:38px; height:38px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+              <i data-lucide="bookmark" style="${isReelSaved ? 'fill:#FBBF24; stroke:#FBBF24;' : ''}"></i>
+            </button>
+          </div>
+
+          <!-- 5. Sound / Audio Mute Toggle -->
+          <div class="reel-action-btn reel-audio-action" data-reel-id="${reelId}" style="display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer;" title="Toggle Audio">
+            <button class="action-circle-btn reel-audio-toggle-btn" style="background:none; border:none; color:white; width:38px; height:38px; display:flex; align-items:center; justify-content:center; cursor:pointer;">
+              <i data-lucide="${window.reelsMuted === false ? 'volume-2' : 'volume-x'}"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Comments Modal -->
+      <div class="story-viewer-overlay reel-comments-modal" data-reel-id="${reelId}">
+        <div class="comments-card glass-panel" style="backdrop-filter: blur(20px); border-radius: 20px; width: 90%; max-width: 380px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;">
+          <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px;">
+            <h3 style="margin:0; font-size:16px; font-weight:600;">Comments</h3>
+            <button class="modal-close-btn" style="background:none; border:none; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
+          </div>
+          <div class="comments-list" style="flex:1; overflow-y:auto; padding:16px; min-height:180px; max-height:360px;"></div>
+          <div class="comments-footer" style="display:flex; gap:10px; padding:12px 16px;">
+            <input type="text" placeholder="Add a comment..." style="flex:1; border-radius:20px; padding:8px 16px; font-size:13px; outline:none;" />
+            <button class="comment-send-btn" style="width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg, #a855f7 0%, #d946ef 100%); border:none; color:white; display:flex; align-items:center; justify-content:center; cursor:pointer;"><i data-lucide="send" style="width:16px; height:16px;"></i></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Share Modal -->
+      <div class="story-viewer-overlay reel-share-modal" data-reel-id="${reelId}">
+        <div class="share-card glass-panel" style="background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border-radius: 20px; border: 1px solid rgba(255,255,255,0.15); width: 90%; max-width: 360px; display: flex; flex-direction: column; overflow: hidden;">
+          <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid rgba(255,255,255,0.1);">
+            <h3 style="margin:0; font-size:16px; color:white; font-weight:600;">Share Reel</h3>
+            <button class="modal-close-btn" style="background:none; border:none; color:white; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
+          </div>
+          <div class="share-options" style="padding: 20px; display: flex; flex-direction: column; gap: 12px;">
+            <button class="copy-link-btn" style="padding: 12px; border-radius: 12px; background: linear-gradient(135deg, #a855f7 0%, #d946ef 100%); color: white; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-weight: 600; font-size: 13.5px;"><i data-lucide="copy" style="width:18px; height:18px;"></i> Copy Reel Link</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    profileReelViewerContent.innerHTML = '';
+    profileReelViewerContent.appendChild(card);
+    profileReelViewerModal.classList.add('active');
+
+    debouncedCreateIcons();
+    wireReelInteractions(profileReelViewerContent);
+
+    // Auto-play the reel in modal
+    const video = card.querySelector('.reel-video');
+    if (video) {
+      video.muted = window.reelsMuted !== false;
+      video.play().catch(err => {
+        console.log('[Profile Reel Viewer] Autoplay blocked, trying muted playback:', err.message);
+        video.muted = true;
+        video.play().catch(() => {});
+      });
+    }
+  }
+
+  function closeProfileReelViewer() {
+    if (!profileReelViewerModal) return;
+    profileReelViewerModal.classList.remove('active');
+    if (profileReelViewerContent) {
+      const video = profileReelViewerContent.querySelector('video');
+      if (video) {
+        try {
+          video.pause();
+          video.removeAttribute('src');
+          video.load();
+        } catch (_) {}
+      }
+      profileReelViewerContent.innerHTML = '';
+    }
+  }
+
+  if (profileReelViewerCloseBtn) {
+    profileReelViewerCloseBtn.addEventListener('click', closeProfileReelViewer);
+  }
+  if (profileReelViewerModal) {
+    profileReelViewerModal.addEventListener('click', (e) => {
+      if (e.target === profileReelViewerModal) {
+        closeProfileReelViewer();
       }
     });
   }
@@ -13445,14 +15094,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
               <!-- Comments Modal -->
               <div class="story-viewer-overlay reel-comments-modal" data-reel-id="${reel._id || reel.id}">
-                <div class="comments-card glass-panel" style="background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(20px); border-radius: 20px; border: 1px solid rgba(255,255,255,0.15); width: 90%; max-width: 380px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;">
-                  <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid rgba(255,255,255,0.1);">
-                    <h3 style="margin:0; font-size:16px; color:white; font-weight:600;">Comments</h3>
-                    <button class="modal-close-btn" style="background:none; border:none; color:white; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
+                <div class="comments-card glass-panel" style="backdrop-filter: blur(20px); border-radius: 20px; width: 90%; max-width: 380px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;">
+                  <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px;">
+                    <h3 style="margin:0; font-size:16px; font-weight:600;">Comments</h3>
+                    <button class="modal-close-btn" style="background:none; border:none; cursor:pointer; font-size:18px;"><i data-lucide="x"></i></button>
                   </div>
                   <div class="comments-list" style="flex:1; overflow-y:auto; padding:16px; min-height:180px; max-height:360px;"></div>
-                  <div class="comments-footer" style="display:flex; gap:10px; padding:12px 16px; border-top:1px solid rgba(255,255,255,0.1); background:rgba(0,0,0,0.3);">
-                    <input type="text" placeholder="Add a comment..." style="flex:1; background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); border-radius:20px; padding:8px 16px; color:white; font-size:13px; outline:none;" />
+                  <div class="comments-footer" style="display:flex; gap:10px; padding:12px 16px;">
+                    <input type="text" placeholder="Add a comment..." style="flex:1; border-radius:20px; padding:8px 16px; font-size:13px; outline:none;" />
                     <button class="comment-send-btn" style="width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg, #a855f7 0%, #d946ef 100%); border:none; color:white; display:flex; align-items:center; justify-content:center; cursor:pointer;"><i data-lucide="send" style="width:16px; height:16px;"></i></button>
                   </div>
                 </div>
@@ -13549,8 +15198,22 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  if (relationsModal) {
+    relationsModal.addEventListener('click', (e) => {
+      if (e.target === relationsModal) {
+        relationsModal.classList.remove('active');
+      }
+    });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && relationsModal && relationsModal.classList.contains('active')) {
+      relationsModal.classList.remove('active');
+    }
+  });
+
   async function openRelationsModal(type) {
-    const token = localStorage.getItem('invibe_jwt_token');
+    const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token');
     if (!token) return;
 
     const followBtn = document.getElementById('profile-follow-btn');
@@ -13563,43 +15226,101 @@ document.addEventListener('DOMContentLoaded', () => {
     const targetUserId = isMe ? currentUserId : (state.viewingProfileUserId || followBtn?.getAttribute('data-user-id') || currentUserId);
     if (!targetUserId) return;
 
-    relationsTitle.textContent = type === 'followers' ? 'HUBBERS' : 'HUBBIES';
-    relationsContent.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-muted);">Loading...</div>';
-    relationsModal.setAttribute('data-relation-type', type);
-    relationsModal.classList.add('active');
+    if (relationsTitle) {
+      relationsTitle.textContent = type === 'followers' ? 'HUBBERS' : 'HUBBIES';
+    }
+    if (relationsContent) {
+      relationsContent.innerHTML = `
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; color: var(--text-muted); text-align: center; gap: 10px;">
+          <i data-lucide="loader" class="animate-spin" style="width: 28px; height: 28px; color: var(--primary);"></i>
+          <span style="font-size: 13.5px; font-weight: 500;">Loading ${type === 'followers' ? 'Hubbers' : 'Hubbies'}...</span>
+        </div>
+      `;
+    }
+    if (relationsModal) {
+      relationsModal.setAttribute('data-relation-type', type);
+      relationsModal.setAttribute('data-target-user', targetUserId);
+      relationsModal.classList.add('active');
+    }
+    debouncedCreateIcons();
 
     try {
-      const res = await fetch(`${API_URL}/api/users/${targetUserId}/${type}-list`, {
+      const res = await fetch(`${API_URL}/api/users/${encodeURIComponent(targetUserId)}/${type}-list?t=${Date.now()}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       if (!res.ok) throw new Error('Failed to load list');
       const users = await res.json();
 
+      // Deduplicate users by ID to guarantee unique display
+      const userMap = new Map();
+      (Array.isArray(users) ? users : []).forEach(u => {
+        const uid = (u._id || u.id || '').toString();
+        if (uid && !userMap.has(uid)) {
+          userMap.set(uid, u);
+        }
+      });
+      const uniqueUsers = Array.from(userMap.values());
+
+      // Synchronize profile stats directly with the real-time list length
+      const realCount = uniqueUsers.length;
+      if (type === 'followers') {
+        if (followersCountEl) followersCountEl.textContent = formatCount(realCount);
+        if (isMe) {
+          const sidebarFollowers = document.getElementById('user-followers-count');
+          if (sidebarFollowers) sidebarFollowers.textContent = formatCount(realCount);
+        }
+      } else if (type === 'following') {
+        if (followingCountEl) followingCountEl.textContent = formatCount(realCount);
+        if (isMe) {
+          const sidebarFollowing = document.getElementById('user-following-count');
+          if (sidebarFollowing) sidebarFollowing.textContent = formatCount(realCount);
+        }
+      }
+
+      if (!relationsContent) return;
       relationsContent.innerHTML = '';
-      if (users.length === 0) {
-        relationsContent.innerHTML = `<div style="text-align: center; padding: 20px; color: var(--text-muted);">No users found</div>`;
+
+      if (uniqueUsers.length === 0) {
+        if (type === 'followers') {
+          relationsContent.innerHTML = `
+            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; color: var(--text-muted); text-align: center; gap: 8px;">
+              <i data-lucide="users" style="width: 38px; height: 38px; opacity: 0.45; margin-bottom: 4px;"></i>
+              <span style="font-size: 14.5px; font-weight: 600; color: var(--text-main, #fff);">No Hubbers yet</span>
+              <span style="font-size: 12.5px; color: var(--text-muted);">Users following this profile will show up here.</span>
+            </div>
+          `;
+        } else {
+          relationsContent.innerHTML = `
+            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; color: var(--text-muted); text-align: center; gap: 8px;">
+              <i data-lucide="user-plus" style="width: 38px; height: 38px; opacity: 0.45; margin-bottom: 4px;"></i>
+              <span style="font-size: 14.5px; font-weight: 600; color: var(--text-main, #fff);">No Hubbies yet</span>
+              <span style="font-size: 12.5px; color: var(--text-muted);">Users followed by this profile will show up here.</span>
+            </div>
+          `;
+        }
+        debouncedCreateIcons();
         return;
       }
 
-      users.forEach(user => {
+      uniqueUsers.forEach(user => {
         const row = document.createElement('div');
-        row.className = 'search-person-row';
-        row.style.margin = '10px 0';
-        row.style.display = 'flex';
-        row.style.justifyContent = 'space-between';
-        row.style.alignItems = 'center';
+        row.className = 'relation-user-item';
+
+        const avatarSrc = user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80';
+        const userDisplayName = user.fullName || user.username || 'Hubber';
+        const userUsername = user.username || 'user';
 
         row.innerHTML = `
-          <div class="person-info" style="display: flex; align-items: center; cursor: pointer;">
-            <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80'}" alt="${user.fullName}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; margin-right: 10px;" />
-            <div style="display: flex; flex-direction: column;">
-              <strong class="relations-user-name" style="font-size: 14px; color: var(--text-color);">${user.fullName}</strong>
-              <span style="font-size: 12px; color: var(--text-muted);">@${user.username}</span>
+          <div class="person-info">
+            <img src="${avatarSrc}" alt="${escapeHtml(userDisplayName)}" class="relation-avatar" onerror="this.src='https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80';" />
+            <div class="relation-text-col">
+              <strong class="relation-name">${escapeHtml(userDisplayName)}</strong>
+              <span class="relation-username">@${escapeHtml(userUsername)}</span>
             </div>
           </div>
           ${user.isMe ? '' : `
-            <button class="search-follow-btn relations-follow-btn ${user.isFollowing ? 'followed' : ''}" data-user-id="${user._id}">
-              ${user.isFollowing ? 'Hubbies' : 'Follow'}
+            <button class="search-follow-btn relations-follow-btn ${user.isFollowing ? 'followed' : (user.isPending ? 'requested' : '')}" data-user-id="${user._id || user.id}">
+              ${user.isFollowing ? 'Hubbies' : (user.isPending ? 'Requested' : 'Follow')}
             </button>
           `}
         `;
@@ -13617,34 +15338,41 @@ document.addEventListener('DOMContentLoaded', () => {
             const isFollowing = rFollowBtn.classList.contains('followed');
             const endpoint = isFollowing ? 'unfollow' : 'follow';
 
+            rFollowBtn.disabled = true;
+
             try {
-              const res = await fetch(`${API_URL}/api/users/${uid}/${endpoint}`, {
+              const actionRes = await fetch(`${API_URL}/api/users/${uid}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}` }
               });
-              const data = await res.json();
-              if (!res.ok) throw new Error(data.error);
+              const data = await actionRes.json();
+              if (!actionRes.ok) throw new Error(data.error || 'Action failed');
 
               if (endpoint === 'follow') {
                 if (data.status === 'pending') {
-                  rFollowBtn.classList.add('followed');
+                  rFollowBtn.classList.add('requested');
+                  rFollowBtn.classList.remove('followed');
                   rFollowBtn.textContent = 'Requested';
                   showToast(data.message || 'Follow request sent. ⏳');
                 } else {
                   rFollowBtn.classList.add('followed');
+                  rFollowBtn.classList.remove('requested');
                   rFollowBtn.textContent = 'Hubbies';
                   showToast(data.message || 'Followed successfully!');
                 }
               } else {
                 rFollowBtn.classList.remove('followed');
+                rFollowBtn.classList.remove('requested');
                 rFollowBtn.textContent = 'Follow';
                 showToast('Unfollowed successfully.');
               }
 
-              loadProfileStats();
-              loadUserProfile(targetUserId);
+              if (typeof loadProfileStats === 'function') loadProfileStats();
+              if (typeof loadUserProfile === 'function') loadUserProfile(targetUserId);
             } catch (err) {
-              showToast(err.message);
+              showToast(err.message || 'Error updating status');
+            } finally {
+              rFollowBtn.disabled = false;
             }
           });
         }
@@ -13654,8 +15382,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
       debouncedCreateIcons();
     } catch (err) {
-      console.error(err);
-      relationsContent.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--error-color);">Error loading data</div>';
+      console.error('[Relations Modal Error]:', err);
+      if (relationsContent) {
+        relationsContent.innerHTML = `
+          <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; color: var(--error-color, #ef4444); text-align: center; gap: 8px;">
+            <i data-lucide="alert-circle" style="width: 32px; height: 32px;"></i>
+            <span style="font-size: 14px; font-weight: 600;">Unable to load ${type === 'followers' ? 'Hubbers' : 'Hubbies'}</span>
+            <span style="font-size: 12px; opacity: 0.8;">Please check your connection and try again.</span>
+          </div>
+        `;
+        debouncedCreateIcons();
+      }
     }
   }
 
@@ -13666,6 +15403,23 @@ document.addEventListener('DOMContentLoaded', () => {
   if (followingCountEl) {
     followingCountEl.parentElement.style.cursor = 'pointer';
     followingCountEl.parentElement.addEventListener('click', () => openRelationsModal('following'));
+  }
+
+  const sidebarFollowersEl = document.getElementById('user-followers-count');
+  const sidebarFollowingEl = document.getElementById('user-following-count');
+  if (sidebarFollowersEl) {
+    const parent = sidebarFollowersEl.closest('.stat-item') || sidebarFollowersEl.parentElement;
+    if (parent) {
+      parent.style.cursor = 'pointer';
+      parent.addEventListener('click', () => openRelationsModal('followers'));
+    }
+  }
+  if (sidebarFollowingEl) {
+    const parent = sidebarFollowingEl.closest('.stat-item') || sidebarFollowingEl.parentElement;
+    if (parent) {
+      parent.style.cursor = 'pointer';
+      parent.addEventListener('click', () => openRelationsModal('following'));
+    }
   }
 
   // --- GLOBAL USER SEARCH LOGIC ---
@@ -13984,20 +15738,25 @@ document.addEventListener('DOMContentLoaded', () => {
           row.style.display = 'flex';
           row.style.alignItems = 'center';
           row.style.justifyContent = 'space-between';
+          row.style.gap = '12px';
           row.style.padding = '8px 12px';
           row.style.borderRadius = 'var(--radius-lg)';
           row.style.background = 'rgba(255, 255, 255, 0.02)';
           row.style.margin = '6px 0';
+          row.style.minWidth = '0';
+          row.style.maxWidth = '100%';
+          row.style.boxSizing = 'border-box';
+          row.style.overflow = 'hidden';
 
           row.innerHTML = `
-            <div class="person-info" style="display: flex; align-items: center; cursor: pointer; flex-grow: 1;">
-              <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80'}" alt="${escapeHtml(user.fullName)}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; margin-right: 12px;" />
-              <div style="display: flex; flex-direction: column;">
-                <strong style="font-size: 14px; color: var(--text-color);">${escapeHtml(user.fullName)}</strong>
-                <span style="font-size: 12px; color: var(--text-muted);">@${escapeHtml(user.username)}</span>
+            <div class="person-info" style="display: flex; align-items: center; cursor: pointer; flex: 1; min-width: 0; overflow: hidden;">
+              <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80'}" alt="${escapeHtml(user.fullName)}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; margin-right: 12px; flex-shrink: 0;" />
+              <div style="display: flex; flex-direction: column; min-width: 0; flex: 1; overflow: hidden;">
+                <strong style="font-size: 14px; color: var(--text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;">${escapeHtml(user.fullName)}</strong>
+                <span style="font-size: 12px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;">@${escapeHtml(user.username)}</span>
               </div>
             </div>
-            <button class="connect-btn search-follow-btn ${user.isFollowing ? 'followed' : ''}" data-user-id="${user._id}" style="padding: 6px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; border: none;">
+            <button class="connect-btn search-follow-btn ${user.isFollowing ? 'followed' : ''}" data-user-id="${user._id}" style="padding: 6px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; border: none; flex-shrink: 0;">
               ${user.isFollowing ? 'Hubbies' : (user.isRequested ? 'Requested' : 'Connect')}
             </button>
           `;
@@ -14241,21 +16000,26 @@ document.addEventListener('DOMContentLoaded', () => {
         row.style.display = 'flex';
         row.style.alignItems = 'center';
         row.style.justifyContent = 'space-between';
+        row.style.gap = '12px';
         row.style.padding = '10px 14px';
         row.style.borderRadius = 'var(--radius-lg)';
         row.style.background = 'rgba(255, 255, 255, 0.02)';
         row.style.margin = '8px 0';
         row.style.border = '1px solid rgba(255, 255, 255, 0.04)';
+        row.style.minWidth = '0';
+        row.style.maxWidth = '100%';
+        row.style.boxSizing = 'border-box';
+        row.style.overflow = 'hidden';
 
         row.innerHTML = `
-          <div class="person-info" style="display: flex; align-items: center; cursor: pointer; flex-grow: 1;">
-            <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80'}" alt="${escapeHtml(user.fullName)}" style="width: 44px; height: 44px; border-radius: 50%; object-fit: cover; margin-right: 12px;" />
-            <div style="display: flex; flex-direction: column;">
-              <strong style="font-size: 14px; color: var(--text-color);">${escapeHtml(user.fullName)}</strong>
-              <span style="font-size: 12px; color: var(--text-muted);">@${escapeHtml(user.username)} ${user.followersCount ? `• ${user.followersCount} followers` : ''}</span>
+          <div class="person-info" style="display: flex; align-items: center; cursor: pointer; flex: 1; min-width: 0; overflow: hidden;">
+            <img src="${user.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&h=100&q=80'}" alt="${escapeHtml(user.fullName)}" style="width: 44px; height: 44px; border-radius: 50%; object-fit: cover; margin-right: 12px; flex-shrink: 0;" />
+            <div style="display: flex; flex-direction: column; min-width: 0; flex: 1; overflow: hidden;">
+              <strong style="font-size: 14px; color: var(--text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;">${escapeHtml(user.fullName)}</strong>
+              <span style="font-size: 12px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;">@${escapeHtml(user.username)} ${user.followersCount ? `• ${user.followersCount} followers` : ''}</span>
             </div>
           </div>
-          <button class="connect-btn search-follow-btn ${user.isFollowing ? 'followed' : ''}" data-user-id="${user._id}" style="padding: 6px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; border: none;">
+          <button class="connect-btn search-follow-btn ${user.isFollowing ? 'followed' : ''}" data-user-id="${user._id}" style="padding: 6px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; border: none; flex-shrink: 0;">
             ${user.isFollowing ? 'Hubbies' : (user.isRequested ? 'Requested' : 'Connect')}
           </button>
         `;
@@ -14457,43 +16221,49 @@ document.addEventListener('DOMContentLoaded', () => {
   let isStoriesLoading = false;
   let isActiveVibersLoading = false;
   let isNotificationsLoading = false;
+  let _backgroundLoadersTimer = null;
 
   function scheduleBackgroundLoaders() {
-    // Stagger non-critical background data loading progressively so initial app shell render is instant (< 20ms)
-    setTimeout(() => {
+    if (_backgroundLoadersTimer) {
+      clearTimeout(_backgroundLoadersTimer);
+    }
+    _backgroundLoadersTimer = setTimeout(() => {
+      _backgroundLoadersTimer = null;
+
+      // Stagger non-critical background data loading progressively so initial app shell render is instant (< 20ms)
       if (!isProfileStatsLoading && typeof loadProfileStats === 'function') {
         isProfileStatsLoading = true;
         Promise.resolve(loadProfileStats()).finally(() => { isProfileStatsLoading = false; });
       }
-    }, 150);
 
-    setTimeout(() => {
-      if (!isFollowSuggestionsLoading && typeof loadFollowSuggestions === 'function') {
-        isFollowSuggestionsLoading = true;
-        Promise.resolve(loadFollowSuggestions()).finally(() => { isFollowSuggestionsLoading = false; });
-      }
-    }, 320);
+      setTimeout(() => {
+        if (!isFollowSuggestionsLoading && typeof loadFollowSuggestions === 'function') {
+          isFollowSuggestionsLoading = true;
+          Promise.resolve(loadFollowSuggestions()).finally(() => { isFollowSuggestionsLoading = false; });
+        }
+      }, 150);
 
-    setTimeout(() => {
-      if (!isStoriesLoading && typeof loadStories === 'function') {
-        isStoriesLoading = true;
-        Promise.resolve(loadStories()).finally(() => { isStoriesLoading = false; });
-      }
-    }, 500);
+      setTimeout(() => {
+        if (!isStoriesLoading && typeof loadStories === 'function') {
+          isStoriesLoading = true;
+          Promise.resolve(loadStories()).finally(() => { isStoriesLoading = false; });
+        }
+      }, 300);
 
-    setTimeout(() => {
-      if (!isActiveVibersLoading && typeof loadActiveVibers === 'function') {
-        isActiveVibersLoading = true;
-        Promise.resolve(loadActiveVibers()).finally(() => { isActiveVibersLoading = false; });
-      }
-    }, 700);
+      setTimeout(() => {
+        if (!isActiveVibersLoading && typeof loadActiveVibers === 'function') {
+          isActiveVibersLoading = true;
+          Promise.resolve(loadActiveVibers()).finally(() => { isActiveVibersLoading = false; });
+        }
+      }, 450);
 
-    setTimeout(() => {
-      if (!isNotificationsLoading && typeof loadNotifications === 'function') {
-        isNotificationsLoading = true;
-        Promise.resolve(loadNotifications()).finally(() => { isNotificationsLoading = false; });
-      }
-    }, 900);
+      setTimeout(() => {
+        if (!isNotificationsLoading && typeof loadNotifications === 'function') {
+          isNotificationsLoading = true;
+          Promise.resolve(loadNotifications()).finally(() => { isNotificationsLoading = false; });
+        }
+      }, 600);
+    }, 100);
   }
 
   // Schedule background loading after home feed starts rendering
@@ -14553,12 +16323,31 @@ document.addEventListener('DOMContentLoaded', () => {
         });
       }
 
-      const bannerImage = localStorage.getItem('invibeBannerImage');
-      const sidebarBanner = document.querySelector('.sidebar-left .card-cover-bg');
-      if (sidebarBanner && bannerImage) {
-        sidebarBanner.style.backgroundImage = `url(${bannerImage})`;
-        sidebarBanner.style.backgroundSize = 'cover';
-        sidebarBanner.style.backgroundPosition = 'center';
+      const bannerImage = localStorage.getItem('invibeBannerImage') || user.bannerImage || user.cover_image_url || '';
+      if (bannerImage) {
+        const sidebarBanner = document.querySelector('.sidebar-left .card-cover-bg');
+        if (sidebarBanner) {
+          sidebarBanner.style.backgroundImage = `url(${bannerImage})`;
+          sidebarBanner.style.backgroundSize = 'cover';
+          sidebarBanner.style.backgroundPosition = 'center';
+        }
+      }
+
+      // Only update profile header banner if viewing own profile
+      const activeFollowBtn = document.getElementById('profile-follow-btn');
+      const isViewingOtherUser = activeFollowBtn && activeFollowBtn.style.display !== 'none';
+      if (!isViewingOtherUser) {
+        const profileBannerImg = document.querySelector('.profile-banner img');
+        if (profileBannerImg) {
+          if (bannerImage) {
+            profileBannerImg.src = bannerImage;
+            profileBannerImg.style.display = 'block';
+            profileBannerImg.style.opacity = '1';
+          } else {
+            profileBannerImg.src = '';
+            profileBannerImg.style.display = 'none';
+          }
+        }
       }
 
       // Schedule background updates progressively without blocking render
@@ -14576,15 +16365,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentUserId = (currentUser.id || currentUser._id || '').toString();
     if (!currentUserId) return;
 
+    if (dmState.realtimeChannel && dmState._subscribedUserId === currentUserId) {
+      return; // Already healthy and subscribed for this active user
+    }
+
     if (dmState.realtimeChannel) {
-      console.warn('[DM-RUNTIME] realtime unsubscribe:', Date.now());
+      console.debug('[DM-RUNTIME] realtime unsubscribe:', Date.now());
       try {
         window.supabase.removeChannel(dmState.realtimeChannel);
       } catch (_) { }
       dmState.realtimeChannel = null;
     }
 
-    console.warn('[DM-RUNTIME] realtime subscribe:', currentUserId, Date.now());
+    dmState._subscribedUserId = currentUserId;
+    console.debug('[DM-RUNTIME] realtime subscribe:', currentUserId, Date.now());
 
     try {
       const channel = window.supabase
@@ -14597,7 +16391,7 @@ document.addEventListener('DOMContentLoaded', () => {
           const newMsg = payload.new;
           if (!newMsg) return;
 
-          console.warn('[DM-RUNTIME] realtime INSERT:', newMsg.id, newMsg.conversation_id, Date.now());
+          console.debug('[DM-RUNTIME] realtime INSERT:', newMsg.id, newMsg.conversation_id, Date.now());
 
           const isFromMe = (newMsg.sender_id || '').toString() === currentUserId;
           const partnerId = isFromMe ? newMsg.recipient_id : newMsg.sender_id;
@@ -14630,8 +16424,15 @@ document.addEventListener('DOMContentLoaded', () => {
           // Update sidebar thread preview in-place
           updateThreadLastMessageInPlace(partnerId, formattedMsg);
 
+          // If thread does not exist in sidebar yet, reload threads
+          const threadEl = chatThreadsList?.querySelector(`.thread-item[data-thread="${partnerId}"]`);
+          if (!threadEl && typeof loadChatThreads === 'function') {
+            loadChatThreads(false);
+          }
+
           // If currently in conversation with this partner, mark as read immediately
-          if (dmState.activeConversationId && dmState.activeConversationId.toString() === partnerId.toString()) {
+          if ((dmState.activePartnerId && dmState.activePartnerId.toString() === partnerId.toString()) ||
+              (newMsg.conversation_id && dmState.activeConversationId && dmState.activeConversationId.toString() === newMsg.conversation_id.toString())) {
             markMessagesAsRead(partnerId);
           }
         })
@@ -14648,6 +16449,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ─── SCOPED REALTIME NOTIFICATIONS SUBSCRIBER ────────────────────────
   let notificationsRealtimeChannel = null;
+  let notificationsSubscribedUserId = null;
   function setupNotificationsRealtime() {
     if (!window.supabase) return;
     const currentUser = getCurrentUser();
@@ -14655,12 +16457,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentUserId = (currentUser.id || currentUser._id || '').toString();
     if (!currentUserId) return;
 
+    if (notificationsRealtimeChannel && notificationsSubscribedUserId === currentUserId) {
+      return; // Already healthy and subscribed for this active user
+    }
+
     if (notificationsRealtimeChannel) {
       try {
         window.supabase.removeChannel(notificationsRealtimeChannel);
       } catch (_) { }
       notificationsRealtimeChannel = null;
     }
+
+    notificationsSubscribedUserId = currentUserId;
 
     try {
       notificationsRealtimeChannel = window.supabase
@@ -14711,6 +16519,12 @@ document.addEventListener('DOMContentLoaded', () => {
           if (suggestedVibersModal && suggestedVibersModal.classList.contains('active')) {
             openSuggestedVibersModal();
           }
+          if (relationsModal && relationsModal.classList.contains('active')) {
+            const relType = relationsModal.getAttribute('data-relation-type');
+            if (relType && typeof openRelationsModal === 'function') {
+              openRelationsModal(relType);
+            }
+          }
         })
         .on('postgres_changes', {
           event: '*',
@@ -14719,6 +16533,12 @@ document.addEventListener('DOMContentLoaded', () => {
         }, (payload) => {
           if (typeof loadProfileStats === 'function') loadProfileStats();
           if (typeof loadFollowSuggestions === 'function') loadFollowSuggestions();
+          if (relationsModal && relationsModal.classList.contains('active')) {
+            const relType = relationsModal.getAttribute('data-relation-type');
+            if (relType && typeof openRelationsModal === 'function') {
+              openRelationsModal(relType);
+            }
+          }
         })
         .subscribe();
     } catch (rtErr) {
@@ -14732,10 +16552,54 @@ document.addEventListener('DOMContentLoaded', () => {
   // ─── NOTIFICATIONS DROPDOWN AND BADGES INTERACTION SYSTEM ────────────────────
   const notifBtn = document.getElementById('notif-btn');
   const notifPanel = document.getElementById('notifications-panel');
+  const notifCloseBtn = document.getElementById('notifications-panel-close-btn');
   const notifBadge = document.getElementById('header-notif-badge');
   const radialNotifBadge = document.getElementById('radial-notif-badge');
 
-  async function loadNotifications() {
+  function isNotificationsPanelOpen() {
+    if (!notifPanel) return false;
+    return notifPanel.style.display === 'flex' || notifPanel.style.display === 'block';
+  }
+
+  function openNotificationsPanel() {
+    if (!notifPanel) return;
+
+    const searchDropdown = document.getElementById('search-results-dropdown');
+    if (searchDropdown) searchDropdown.style.display = 'none';
+
+    notifPanel.style.display = 'flex';
+
+    loadNotifications();
+
+    if (typeof updateHubbleActiveState === 'function') {
+      updateHubbleActiveState();
+    }
+  }
+
+  function closeNotificationsPanel() {
+    if (!notifPanel) return;
+
+    notifPanel.style.display = 'none';
+
+    if (typeof updateHubbleActiveState === 'function') {
+      updateHubbleActiveState();
+    }
+  }
+
+  function toggleNotificationsPanel() {
+    if (isNotificationsPanelOpen()) {
+      closeNotificationsPanel();
+    } else {
+      openNotificationsPanel();
+    }
+  }
+
+  window.openNotificationsPanel = openNotificationsPanel;
+  window.closeNotificationsPanel = closeNotificationsPanel;
+  window.toggleNotificationsPanel = toggleNotificationsPanel;
+
+  let _notificationsInFlightPromise = null;
+  async function loadNotifications(forceRefresh = false) {
     const token = localStorage.getItem('invibe_jwt_token');
     if (!token) {
       if (notifBadge) notifBadge.style.display = 'none';
@@ -14743,46 +16607,35 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    try {
-      const res = await fetch(`${API_URL}/api/notifications`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error('Failed to fetch notifications');
-      const notifications = await res.json();
-
-      // Update badges (blue diamond for unread notifications)
-      const unreadCount = notifications.filter(n => n.isRead === false || n.read === false).length;
-      if (unreadCount > 0) {
-        if (notifBadge) {
-          notifBadge.className = 'badge blue-diamond';
-          notifBadge.style.display = 'block';
-        }
-        if (radialNotifBadge) {
-          radialNotifBadge.className = 'nav-icon-badge blue-diamond';
-          radialNotifBadge.style.display = 'flex';
-          radialNotifBadge.textContent = '';
-        }
-      } else {
-        if (notifBadge) {
-          notifBadge.className = 'badge';
-          notifBadge.style.display = 'none';
-        }
-        if (radialNotifBadge) {
-          radialNotifBadge.className = 'nav-icon-badge';
-          radialNotifBadge.style.display = 'none';
-        }
-      }
-
-      // Render notification items in panel
-      renderNotificationsPanel(notifications);
-    } catch (err) {
-      console.error('Error loading notifications:', err);
+    if (_notificationsInFlightPromise && !forceRefresh) {
+      return _notificationsInFlightPromise;
     }
+
+    _notificationsInFlightPromise = (async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/notifications`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error('Failed to fetch notifications');
+        const notifications = await res.json();
+
+        // Update badges (blue diamond for unread notifications)
+        const unreadCount = notifications.filter(n => n.isRead === false || n.read === false).length;
+        updateNotificationBadgesUI(unreadCount);
+
+        // Render notification items in panel
+        renderNotificationsPanel(notifications);
+      } catch (err) {
+        console.error('Error loading notifications:', err);
+      } finally {
+        _notificationsInFlightPromise = null;
+      }
+    })();
+
+    return _notificationsInFlightPromise;
   }
 
-  function recalcNotificationBadges() {
-    if (!notifPanel) return;
-    const unreadCount = notifPanel.querySelectorAll('.notification-item.unread').length;
+  function updateNotificationBadgesUI(unreadCount) {
     if (unreadCount > 0) {
       if (notifBadge) {
         notifBadge.className = 'badge blue-diamond';
@@ -14803,6 +16656,12 @@ document.addEventListener('DOMContentLoaded', () => {
         radialNotifBadge.style.display = 'none';
       }
     }
+  }
+
+  function recalcNotificationBadges() {
+    if (!notifPanel) return;
+    const unreadCount = notifPanel.querySelectorAll('.notification-item.unread').length;
+    updateNotificationBadgesUI(unreadCount);
   }
 
   function renderNotificationsPanel(notifications) {
@@ -14880,7 +16739,7 @@ document.addEventListener('DOMContentLoaded', () => {
       `;
 
       item.addEventListener('click', async (e) => {
-        if (e.target.closest('.btn-accept-request, .btn-reject-request')) return;
+        if (e.target.closest('.btn-accept-request, .btn-reject-request, .btn-accept-reel-mention, .btn-reject-reel-mention')) return;
         e.stopPropagation();
 
         if (item.classList.contains('unread')) {
@@ -14902,8 +16761,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const navTargetId = getUserIdentifier(sender) || senderId;
         if (navTargetId && navTargetId !== 'usr_unknown') {
+          closeNotificationsPanel();
           switchView('profile', navTargetId);
-          notifPanel.style.display = 'none';
         }
       });
 
@@ -15126,29 +16985,34 @@ document.addEventListener('DOMContentLoaded', () => {
     debouncedCreateIcons();
   }
 
-  // Setup click handler for toggle panel
-  if (notifBtn && notifPanel) {
-    notifBtn.addEventListener('click', async (e) => {
+  // Setup click handler for toggle panel via header button
+  if (notifBtn) {
+    notifBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-
-      const searchDropdown = document.getElementById('search-results-dropdown');
-      if (searchDropdown) searchDropdown.style.display = 'none';
-
-      const isVisible = notifPanel.style.display === 'flex';
-      if (isVisible) {
-        notifPanel.style.display = 'none';
-      } else {
-        notifPanel.style.display = 'flex';
-      }
+      toggleNotificationsPanel();
     });
   }
 
-  // Mobile navigation bubble redirection to header button click
+  // Close button inside panel
+  if (notifCloseBtn) {
+    notifCloseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeNotificationsPanel();
+    });
+  }
+
+
+
+  // Mobile navigation bubble redirection to toggle notifications panel
   const radialNotifBtn = document.getElementById('nav-notifications-btn');
   if (radialNotifBtn) {
     radialNotifBtn.addEventListener('click', (e) => {
+      if (!navContainer || !navContainer.classList.contains('open')) {
+        return;
+      }
       e.stopPropagation();
-      if (notifBtn) notifBtn.click();
+      closeRadialMenu();
+      toggleNotificationsPanel();
     });
   }
 
@@ -15159,6 +17023,15 @@ document.addEventListener('DOMContentLoaded', () => {
       e.stopPropagation();
       const token = localStorage.getItem('invibe_jwt_token');
       if (!token) return;
+
+      // Optimistically clear unread states and badges
+      if (notifPanel) {
+        notifPanel.querySelectorAll('.notification-item.unread').forEach(item => {
+          item.classList.remove('unread');
+        });
+      }
+      recalcNotificationBadges();
+
       try {
         await fetch(`${API_URL}/api/notifications/read`, {
           method: 'POST',
@@ -15173,10 +17046,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Click outside to close panel
   document.addEventListener('click', (e) => {
-    if (notifPanel && notifPanel.style.display === 'flex') {
-      if (!notifPanel.contains(e.target) && (!notifBtn || !notifBtn.contains(e.target))) {
-        notifPanel.style.display = 'none';
+    if (isNotificationsPanelOpen()) {
+      const isInsidePanel = notifPanel && notifPanel.contains(e.target);
+      const isInsideNotifBtn = notifBtn && notifBtn.contains(e.target);
+      const isInsideRadialBtn = e.target.closest('#nav-notifications-btn');
+      if (!isInsidePanel && !isInsideNotifBtn && !isInsideRadialBtn) {
+        closeNotificationsPanel();
       }
+    }
+  });
+
+  // Escape key closes panel
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isNotificationsPanelOpen()) {
+      closeNotificationsPanel();
     }
   });
 
@@ -15196,7 +17079,7 @@ document.addEventListener('DOMContentLoaded', () => {
       dmState.activeConversationId = null;
       loadChatThreads();
       setupDMRealtime();
-      console.warn('[DM-RUNTIME] auth-changed: DM re-initialized for user:', authUserId);
+      console.debug('[DM-RUNTIME] auth-changed: DM re-initialized for user:', authUserId);
     } else {
       // Same user – just refresh threads list
       loadChatThreads();
@@ -15487,13 +17370,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const replyBtn = e.target.closest('.action-reply');
       if (replyBtn) {
+        if (window.innerWidth <= 768) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
         const wrapper = replyBtn.closest('.message-bubble-wrapper');
         const bubble = wrapper.querySelector('.chat-bubble');
         if (bubble) {
           const msgId = bubble.getAttribute('data-msg-id');
-          const rawText = bubble.getAttribute('data-raw-text') || 'Message';
+          let rawText = bubble.getAttribute('data-raw-text') || 'Message';
+          
+          let decodedText = rawText.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+          if (!decodedText || decodedText === '[Decryption Failed]') {
+             if (bubble.querySelector('.chat-shared-file-title')) decodedText = bubble.querySelector('.chat-shared-file-title').innerText;
+             else if (bubble.querySelector('img')) decodedText = 'Photo';
+             else if (bubble.querySelector('video')) decodedText = 'Video';
+             else if (bubble.querySelector('audio')) decodedText = 'Audio Message';
+             else decodedText = 'Media Message';
+          }
+
           const senderName = bubble.getAttribute('data-sender-name') || 'User';
-          activateReplyMode(msgId, rawText, senderName);
+          activateReplyMode(msgId, decodedText, senderName);
         }
         replyBtn.closest('.message-action-dropdown').style.display = 'none';
         return;
@@ -15501,13 +17398,55 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const copyBtn = e.target.closest('.action-copy');
       if (copyBtn) {
+        if (window.innerWidth <= 768) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
         const wrapper = copyBtn.closest('.message-bubble-wrapper');
         const bubble = wrapper.querySelector('.chat-bubble');
         if (bubble) {
-          const rawText = bubble.getAttribute('data-raw-text') || '';
-          navigator.clipboard.writeText(rawText).then(() => {
-            showDMToast('Message copied');
-          });
+          let rawText = bubble.getAttribute('data-raw-text') || '';
+          let textToCopy = rawText.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+          if (!textToCopy || textToCopy === '[Decryption Failed]') {
+             const fileA = bubble.querySelector('a[download]');
+             if (fileA) textToCopy = fileA.href;
+             else {
+               const img = bubble.querySelector('img');
+               if (img) textToCopy = img.src;
+               else {
+                 const vid = bubble.querySelector('video');
+                 if (vid) textToCopy = vid.src;
+               }
+             }
+          }
+          
+          if (!textToCopy) textToCopy = 'Message content';
+
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(textToCopy).then(() => {
+              if (typeof showDMToast === 'function') showDMToast('Message copied');
+            }).catch(() => {
+              fallbackCopy(textToCopy);
+            });
+          } else {
+             fallbackCopy(textToCopy);
+          }
+          
+          function fallbackCopy(text) {
+            try {
+              const textArea = document.createElement("textarea");
+              textArea.value = text;
+              textArea.style.position = "fixed";
+              document.body.appendChild(textArea);
+              textArea.focus();
+              textArea.select();
+              document.execCommand('copy');
+              document.body.removeChild(textArea);
+              if (typeof showDMToast === 'function') showDMToast('Message copied');
+            } catch (err) {
+              if (typeof showDMToast === 'function') showDMToast('Copy failed');
+            }
+          }
         }
         copyBtn.closest('.message-action-dropdown').style.display = 'none';
         return;
@@ -15515,10 +17454,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const forwardBtn = e.target.closest('.action-forward');
       if (forwardBtn) {
+        if (window.innerWidth <= 768) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
         const wrapper = forwardBtn.closest('.message-bubble-wrapper');
         const bubble = wrapper.querySelector('.chat-bubble');
         if (bubble) {
-          openForwardModal(bubble.getAttribute('data-msg-id'), bubble.getAttribute('data-raw-text') || 'Message');
+          const msgId = bubble.getAttribute('data-msg-id');
+          const shareModalEl = document.getElementById('share-modal');
+          if (shareModalEl && typeof openShare === 'function') {
+             openShare('forward_' + msgId, shareModalEl);
+             shareModalEl.classList.add('active');
+          }
         }
         forwardBtn.closest('.message-action-dropdown').style.display = 'none';
         return;
@@ -15526,6 +17474,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const deleteBtn = e.target.closest('.action-delete');
       if (deleteBtn) {
+        if (window.innerWidth <= 768) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
         const wrapper = deleteBtn.closest('.message-bubble-wrapper');
         const bubble = wrapper.querySelector('.chat-bubble');
         if (bubble) {
@@ -15707,7 +17659,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!token) return closeDeleteModal();
 
       try {
-        const res = await fetch(`${API_URL}/api/chats/message/${msgToDeleteId}`, {
+        const res = await fetch(`${API_URL}/api/chats/messages/${msgToDeleteId}?forEveryone=true`, {
           method: 'DELETE',
           headers: {
             'Authorization': `Bearer ${token}`
@@ -17303,49 +19255,9 @@ window.publishHubb = async function () {
         if (!dataUrl) continue;
 
         const rawType = upload.type || (upload.file ? upload.file.type : '');
-        let finalMediaType = (rawType && rawType.startsWith('video')) ? 'video' : 'image';
-        let uploadedMediaUrl = null;
+        const finalMediaType = (rawType && rawType.startsWith('video')) ? 'video' : 'image';
 
-        // Attempt direct Supabase storage upload
-        try {
-          const base64Response = await fetch(dataUrl);
-          const blob = await base64Response.blob();
-
-          const ext = finalMediaType === 'video' ? 'mp4' : 'jpeg';
-          const bucketName = finalMediaType === 'video' ? 'post-videos' : 'post-images';
-          const userStr = localStorage.getItem('invibeUser');
-          let userId = 'anon';
-          try { if (userStr) userId = JSON.parse(userStr).id || userId; } catch (e) { }
-          const filename = `${userId}/story_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
-
-          const client = supabase || window.supabase;
-          if (client && client.storage) {
-            const { error: uploadErr } = await client.storage
-              .from(bucketName)
-              .upload(filename, blob, { contentType: blob.type || (finalMediaType === 'video' ? 'video/mp4' : 'image/jpeg'), upsert: true });
-
-            if (!uploadErr) {
-              const { data: publicUrlData } = client.storage.from(bucketName).getPublicUrl(filename);
-              if (publicUrlData && publicUrlData.publicUrl) {
-                uploadedMediaUrl = publicUrlData.publicUrl;
-                console.log('[ShareHubs Publish] Media successfully uploaded to storage:', uploadedMediaUrl);
-              }
-            } else {
-              console.warn('[ShareHubs Publish Notice] Client storage upload notice:', uploadErr.message);
-            }
-          }
-        } catch (uploadException) {
-          console.warn('[ShareHubs Publish Notice] Client storage upload exception:', uploadException.message);
-        }
-
-        // If client-side upload was bypassed or failed, pass dataUrl to backend which will upload to storage via service role
-        if (!uploadedMediaUrl) {
-          uploadedMediaUrl = dataUrl;
-        }
-
-        if (uploadedMediaUrl) {
-          finalMediaItems.push({ url: uploadedMediaUrl, type: finalMediaType });
-        }
+        finalMediaItems.push({ url: dataUrl, type: finalMediaType });
       }
     }
 
@@ -17668,21 +19580,34 @@ window.HubbleEditor = {
   injectEditorUI() {
     // We inject a floating editor canvas that appears when tools are active
     if (!document.getElementById('he-canvas-modal')) {
+      const isMobile = window.innerWidth <= 768;
       const modal = document.createElement('div');
       modal.id = 'he-canvas-modal';
-      modal.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(12px); z-index: 9990; display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.3s;';
+      modal.style.cssText = isMobile 
+        ? 'position: fixed; inset: 0; width: 100%; height: 100dvh; margin: 0; padding: 0; box-sizing: border-box; background: var(--bg-app, #111); z-index: 9990; display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.3s; flex-direction: column;'
+        : 'position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-app, #111); backdrop-filter: blur(12px); z-index: 9990; display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.3s;';
+
+      const toolbarStyle = isMobile
+        ? 'position: relative; top: 0; left: 0; right: 0; width: 100%; box-sizing: border-box; padding: 12px 8px; display: flex; justify-content: space-between; align-items: center; z-index: 9995; flex-shrink: 0;'
+        : 'position: absolute; top: 20px; left: 20px; right: 20px; display: flex; justify-content: space-between; align-items: center; z-index: 9995;';
+
+      const workspaceStyle = isMobile
+        ? 'position: relative; width: 100%; height: auto; flex: 1 1 auto; max-width: none; max-height: none; margin: 0; display: flex; align-items: center; justify-content: center;'
+        : 'position: relative; width: 80%; height: 80%; max-width: 1000px; display: flex; align-items: center; justify-content: center;';
 
       modal.innerHTML = `
-        <div style="position: absolute; top: 20px; right: 20px; display: flex; gap: 12px; z-index: 9995;">
-          <button onclick="HubbleEditor.undo()" id="he-undo-btn" class="ch-premium-tool-btn" style="width: 40px; height: 40px; border-radius: 12px; background: rgba(255,255,255,0.1); color: white; border: none; cursor: pointer; opacity: 0.5; pointer-events: none;"><i data-lucide="undo" style="width: 18px; height: 18px;"></i></button>
-          <button onclick="HubbleEditor.redo()" id="he-redo-btn" class="ch-premium-tool-btn" style="width: 40px; height: 40px; border-radius: 12px; background: rgba(255,255,255,0.1); color: white; border: none; cursor: pointer; opacity: 0.5; pointer-events: none;"><i data-lucide="redo" style="width: 18px; height: 18px;"></i></button>
+        <div id="he-top-toolbar" style="${toolbarStyle}">
+          <div style="display: flex; gap: 6px; flex-shrink: 0;">
+            <button onclick="HubbleEditor.undo()" id="he-undo-btn" class="ch-premium-tool-btn" style="width: 40px !important; height: 40px !important; border-radius: 12px; background: var(--card-bg, rgba(255,255,255,0.1)); color: var(--text-main, white); border: none; cursor: pointer; opacity: 0.5; pointer-events: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0;"><i data-lucide="undo" style="width: 18px; height: 18px;"></i></button>
+            <button onclick="HubbleEditor.redo()" id="he-redo-btn" class="ch-premium-tool-btn" style="width: 40px !important; height: 40px !important; border-radius: 12px; background: var(--card-bg, rgba(255,255,255,0.1)); color: var(--text-main, white); border: none; cursor: pointer; opacity: 0.5; pointer-events: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0;"><i data-lucide="redo" style="width: 18px; height: 18px;"></i></button>
+          </div>
           
-          <div style="position: relative; display: flex; border-radius: 12px; background: rgba(255,255,255,0.1); box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
-            <button onclick="HubbleEditor.pushHistory(); HubbleEditor.state.rotation = (HubbleEditor.state.rotation + 90) % 360; HubbleEditor.updateRender();" class="ch-premium-tool-btn" style="padding: 0 16px; height: 40px; border-radius: 12px 0 0 12px; background: transparent; color: white; border: none; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 8px;"><i data-lucide="rotate-cw" style="width: 16px; height: 16px;"></i> Rotate 90&deg;</button>
-            <div style="width: 1px; background: rgba(255,255,255,0.1); margin: 6px 0;"></div>
-            <button onclick="HubbleEditor.toggleManualRotate()" class="ch-premium-tool-btn" style="padding: 0 10px; height: 40px; border-radius: 0 12px 12px 0; background: transparent; color: white; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center;"><i data-lucide="chevron-down" style="width: 16px; height: 16px;"></i></button>
+          <div style="position: relative; display: flex; border-radius: 12px; background: var(--card-bg, rgba(255,255,255,0.1)); box-shadow: 0 4px 12px rgba(0,0,0,0.2); flex-shrink: 0; white-space: nowrap;">
+            <button onclick="HubbleEditor.pushHistory(); HubbleEditor.state.rotation = (HubbleEditor.state.rotation + 90) % 360; HubbleEditor.updateRender();" class="ch-premium-tool-btn he-rotate-btn" style="width: auto !important; overflow: visible !important; padding: 0 10px; height: 40px; border-radius: 12px 0 0 12px; background: transparent; color: var(--text-main, white); border: none; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap;"><i data-lucide="rotate-cw" style="width: 16px; height: 16px;"></i> <span class="he-rotate-text" style="flex-shrink: 0; white-space: nowrap;">Rotate</span></button>
+            <div style="width: 1px; background: var(--border-color, rgba(255,255,255,0.1)); margin: 6px 0;"></div>
+            <button onclick="HubbleEditor.toggleManualRotate()" class="ch-premium-tool-btn" style="width: 36px !important; height: 40px !important; border-radius: 0 12px 12px 0; background: transparent; color: var(--text-main, white); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0;"><i data-lucide="chevron-down" style="width: 16px; height: 16px;"></i></button>
             
-            <div id="he-manual-rotate-panel" class="he-manual-rotate-panel" style="display: none; position: absolute; top: 48px; right: 0; width: 280px; background: rgba(20,20,25,0.85); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); z-index: 9996; flex-direction: column;">
+            <div id="he-manual-rotate-panel" class="he-manual-rotate-panel" style="display: none; position: absolute; top: 52px; right: 0; width: 280px; background: var(--card-bg, rgba(20,20,25,0.85)); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); z-index: 9996; flex-direction: column;">
                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                  <span style="font-size: 0.95rem; font-weight: 600; color: white;">Manual Rotate</span>
                  <span id="he-manual-rotate-val" style="font-size: 0.85rem; color: var(--primary); font-weight: bold; background: rgba(168,85,247,0.15); padding: 4px 10px; border-radius: 8px; font-variant-numeric: tabular-nums;">0&deg;</span>
@@ -17694,10 +19619,10 @@ window.HubbleEditor = {
                </div>
             </div>
           </div>
-          <button onclick="HubbleEditor.closeCanvas()" class="ch-premium-tool-btn" style="padding: 0 20px; height: 40px; border-radius: 12px; background: linear-gradient(135deg, var(--primary) 0%, #a855f7 100%); color: white; border: none; font-weight: 600; cursor: pointer;">Done Editing</button>
+          <button onclick="HubbleEditor.closeCanvas()" class="ch-premium-tool-btn" style="width: auto !important; overflow: visible !important; padding: 0 12px; height: 40px; border-radius: 12px; background: linear-gradient(135deg, var(--primary) 0%, #a855f7 100%); color: white; border: none; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; flex-shrink: 0; white-space: nowrap;"><i data-lucide="check" style="width: 16px; height: 16px;"></i> Done Editing</button>
         </div>
         
-        <div id="he-workspace" style="position: relative; width: 80%; height: 80%; max-width: 1000px; display: flex; align-items: center; justify-content: center;">
+        <div id="he-workspace" style="${workspaceStyle}">
           <div id="he-render-container" style="position: relative; box-shadow: 0 20px 50px rgba(0,0,0,0.5); overflow: hidden; display: flex; align-items: center; justify-content: center;">
             <div id="he-media-layer" style="position: absolute; width: 100%; height: 100%; transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);"></div>
             <div id="he-interaction-layer" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></div>
@@ -18817,9 +20742,13 @@ window.HubbleEditor = {
     if (!container || !mediaLayer || !interactionLayer) return;
 
     // Set Aspect Ratio based on media
-    container.style.width = '400px';
+    const isMobile = window.innerWidth <= 768;
+    container.style.width = isMobile ? '100%' : '400px';
+    container.style.maxWidth = isMobile ? '100%' : '400px';
+    container.style.height = isMobile ? '100%' : 'auto';
+    container.style.maxHeight = isMobile ? '100%' : 'none';
     container.style.aspectRatio = '9/16';
-    container.style.background = '#111';
+    container.style.background = 'var(--bg-app, transparent)';
     container.style.borderRadius = '16px';
 
     // Render Media Node
@@ -19222,7 +21151,7 @@ window.HubbleEditor = {
     if (!container) return;
 
     // Generate glassmorphism panel
-    let html = `<div style="background: rgba(15,15,20,0.85); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; padding: 20px; width: 320px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); color: white;">`;
+    let html = `<div class="story-mobile-tool-panel" style="background: var(--card-bg, rgba(15,15,20,0.85)); backdrop-filter: blur(20px); border: 1px solid var(--border-color, rgba(255,255,255,0.1)); border-radius: 20px; padding: 20px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); color: var(--text-main, white);">`;
 
     if (activeTool === 'filters') {
       html += `<h4 style="margin: 0 0 16px 0; font-size: 1.1rem; display: flex; align-items: center; gap: 8px;"><i data-lucide="aperture" style="width: 18px; height: 18px; color: var(--primary);"></i> Filters</h4>`;
@@ -19300,23 +21229,23 @@ window.HubbleEditor = {
       const ratios = ['Free', '1:1', '4:5', '3:4', '16:9', '9:16', '1080:1920'];
       const labels = ['Free', '1:1', '4:5', '3:4', '16:9', '9:16', 'Story'];
       ratios.forEach((r, i) => {
-        const active = this.tempCrop && this.tempCrop.aspect === r ? 'border: 2px solid var(--primary); background: rgba(168,85,247,0.1);' : 'border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05);';
-        html += `<button onclick="HubbleEditor.setCropAspect('${r}');" style="padding: 12px; border-radius: 12px; color: white; font-weight: 600; font-size: 0.9rem; cursor: pointer; ${active}">${labels[i]}</button>`;
+        const active = this.tempCrop && this.tempCrop.aspect === r ? 'border: 2px solid var(--primary); background: rgba(168,85,247,0.1); color: var(--primary);' : 'border: 1px solid var(--border-color, rgba(255,255,255,0.1)); background: var(--card-bg, rgba(255,255,255,0.05)); color: var(--text-main, white);';
+        html += `<button onclick="HubbleEditor.setCropAspect('${r}');" style="padding: 12px; border-radius: 12px; font-weight: 600; font-size: 0.9rem; cursor: pointer; ${active}">${labels[i]}</button>`;
       });
       html += `</div>`;
 
       const currentZoom = this.state.zoom || 1;
       const zoomPct = Math.round(currentZoom * 100);
       html += `
-        <div class="he-zoom-panel" style="margin-bottom: 24px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 16px; border-radius: 16px;">
+        <div class="he-zoom-panel" style="margin-bottom: 24px; background: var(--bg-surface, rgba(255,255,255,0.05)); border: 1px solid var(--border-color, rgba(255,255,255,0.1)); padding: 16px; border-radius: 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-            <span style="font-size: 0.9rem; color: rgba(255,255,255,0.8); font-weight: 600;"><i data-lucide="zoom-in" style="width: 14px; height: 14px; vertical-align: middle; margin-right: 6px;"></i>Zoom</span>
+            <span style="font-size: 0.9rem; color: var(--text-main, rgba(255,255,255,0.8)); font-weight: 600;"><i data-lucide="zoom-in" style="width: 14px; height: 14px; vertical-align: middle; margin-right: 6px;"></i>Zoom</span>
             <span id="he-zoom-val" style="font-size: 0.85rem; color: var(--primary); font-weight: bold; background: rgba(168,85,247,0.15); padding: 4px 10px; border-radius: 8px; font-variant-numeric: tabular-nums;">${zoomPct}%</span>
           </div>
           <div style="display: flex; align-items: center; gap: 12px;">
-            <button onclick="HubbleEditor.setCropZoom((HubbleEditor.state.zoom || 1) - 0.1)" style="width: 32px; height: 32px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.1); color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.1s;" onmouseover="this.style.transform='scale(1.1)'" onmouseout="this.style.transform='scale(1)'"><i data-lucide="minus" style="width: 14px; height: 14px;"></i></button>
+            <button onclick="HubbleEditor.setCropZoom((HubbleEditor.state.zoom || 1) - 0.1)" style="width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border-color, rgba(255,255,255,0.2)); background: var(--card-bg, rgba(255,255,255,0.1)); color: var(--text-main, white); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.1s;" onmouseover="this.style.transform='scale(1.1)'" onmouseout="this.style.transform='scale(1)'"><i data-lucide="minus" style="width: 14px; height: 14px;"></i></button>
             <input type="range" id="he-zoom-slider" class="he-custom-slider" min="0.5" max="3" step="0.01" value="${currentZoom}" oninput="HubbleEditor.setCropZoom(parseFloat(this.value))">
-            <button onclick="HubbleEditor.setCropZoom((HubbleEditor.state.zoom || 1) + 0.1)" style="width: 32px; height: 32px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.1); color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.1s;" onmouseover="this.style.transform='scale(1.1)'" onmouseout="this.style.transform='scale(1)'"><i data-lucide="plus" style="width: 14px; height: 14px;"></i></button>
+            <button onclick="HubbleEditor.setCropZoom((HubbleEditor.state.zoom || 1) + 0.1)" style="width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border-color, rgba(255,255,255,0.2)); background: var(--card-bg, rgba(255,255,255,0.1)); color: var(--text-main, white); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.1s;" onmouseover="this.style.transform='scale(1.1)'" onmouseout="this.style.transform='scale(1)'"><i data-lucide="plus" style="width: 14px; height: 14px;"></i></button>
           </div>
         </div>
       `;
@@ -19809,4 +21738,99 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 })();
 
+// --- CONDITIONAL MOBILE COMMENTS RENDERING LOGIC ---
+window.activeCommentPostId = null;
 
+window.getCommentsSectionHTML = function(post, currentUserId, currentUser, localUserAvatar) {
+    let commentsHTML = '';
+    (post.comments || []).forEach(comment => {
+      const commentAuthorId = window.getUserIdentifier ? window.getUserIdentifier(comment.author) || comment.author_id || '' : comment.author_id || '';
+      const commentUsername = (comment.author?.username || '').toLowerCase();
+      const isCommentMe = !!(currentUserId && (currentUserId.toString() === commentAuthorId.toString() || (currentUser?.username && currentUser.username.toLowerCase() === commentUsername)));
+      const resolvedCommentAvatar = (isCommentMe && localUserAvatar)
+        ? localUserAvatar
+        : (comment.author?.profileImage || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=80&h=80&q=80');
+
+      commentsHTML += `
+        <div class="comment-item" style="display: flex; gap: 8px; margin-bottom: 8px; font-size: 13px;">
+          <img src="${resolvedCommentAvatar}" alt="" class="comment-author-avatar" data-user-id="${commentAuthorId}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; cursor: pointer;" />
+          <div>
+            <strong class="comment-author-name" data-user-id="${commentAuthorId}" style="color: var(--text-color); margin-right: 4px; cursor: pointer;">${comment.author?.username || 'user'}</strong>
+            <span style="color: var(--text-muted);">${comment.text}</span>
+          </div>
+        </div>
+      `;
+    });
+
+    return `
+      <div class="comments-section mobile-comments-dynamic" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px; animation: fadeInComments 0.2s ease-out;">
+        <div class="comments-list" id="comments-list-${post._id}" style="max-height: 250px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--text-muted, rgba(148,163,184,0.5)) transparent; overscroll-behavior: contain; -webkit-overflow-scrolling: touch;">
+          ${commentsHTML}
+        </div>
+        
+        <div class="post-comment-input-area" style="display: flex; align-items: center; gap: 8px; margin-top: 12px; position: relative;">
+          <input type="text" placeholder="Write a comment..." class="comment-input-field" id="comment-input-${post._id}" style="flex:1; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; padding: 8px 40px 8px 16px; color: var(--text-color); font-size: 13px;" />
+          <button class="comment-post-btn" data-post-id="${post._id}" style="position: absolute; right: 8px; background: none; border: none; color: var(--primary, #a855f7); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 6px; transition: transform 0.2s;"><i data-lucide="send" style="width: 16px; height: 16px;"></i></button>
+        </div>
+      </div>
+    `;
+};
+
+document.addEventListener('click', (e) => {
+  if (window.innerWidth <= 768) {
+    const commentBtnAction = e.target.closest('.comment-btn-action');
+    const commentsSection = e.target.closest('.comments-section');
+    
+    if (commentBtnAction) {
+      const postId = commentBtnAction.getAttribute('data-post-id');
+      
+      // Close previously open comment section
+      if (window.activeCommentPostId && window.activeCommentPostId !== postId) {
+        const oldPostId = window.activeCommentPostId;
+        const oldContainer = document.querySelector(`.feed-card[data-post-id="${oldPostId}"] .comments-section`) || document.getElementById(`post-${oldPostId}`)?.querySelector('.comments-section') || document.querySelector(`.comments-list#comments-list-${oldPostId}`)?.closest('.comments-section');
+        if (oldContainer) {
+          oldContainer.outerHTML = `<div class="comments-section-placeholder" id="comments-placeholder-${oldPostId}"></div>`;
+        }
+      }
+
+      // Toggle current section
+      const isAlreadyOpen = window.activeCommentPostId === postId;
+      window.activeCommentPostId = isAlreadyOpen ? null : postId;
+      
+      const postCard = commentBtnAction.closest('article.feed-card') || document.getElementById(`post-${postId}`) || commentBtnAction.closest('.post-card');
+      
+      if (postCard) {
+         if (window.activeCommentPostId) {
+             const post = (window.feedPosts && window.feedPosts.find(p => p._id === postId)) || (window.currentProfilePosts && window.currentProfilePosts.find(p => p._id === postId));
+             if (post) {
+                const currentUserStr = localStorage.getItem('invibeUser');
+                const currentUser = currentUserStr ? JSON.parse(currentUserStr) : null;
+                const currentUserId = currentUser ? (currentUser.id || currentUser._id) : null;
+                const localUserAvatar = localStorage.getItem('invibeProfileImage') || currentUser?.profileImage;
+
+                const newHTML = window.getCommentsSectionHTML(post, currentUserId, currentUser, localUserAvatar);
+                const placeholder = postCard.querySelector('.comments-section-placeholder');
+                if (placeholder) {
+                   placeholder.outerHTML = newHTML;
+                   if (typeof lucide !== 'undefined') lucide.createIcons();
+                }
+             }
+         } else {
+             const sec = postCard.querySelector('.comments-section');
+             if (sec) {
+                sec.outerHTML = `<div class="comments-section-placeholder" id="comments-placeholder-${postId}"></div>`;
+             }
+         }
+      }
+    } else if (!commentsSection) {
+      if (window.activeCommentPostId) {
+         const oldPostId = window.activeCommentPostId;
+         const oldContainer = document.querySelector(`.feed-card[data-post-id="${oldPostId}"] .comments-section`) || document.getElementById(`post-${oldPostId}`)?.querySelector('.comments-section') || document.querySelector(`.comments-list#comments-list-${oldPostId}`)?.closest('.comments-section');
+         if (oldContainer) {
+            oldContainer.outerHTML = `<div class="comments-section-placeholder" id="comments-placeholder-${oldPostId}"></div>`;
+         }
+         window.activeCommentPostId = null;
+      }
+    }
+  }
+});

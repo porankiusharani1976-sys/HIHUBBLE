@@ -695,7 +695,7 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
   const currentUserId = req.user.id;
 
   try {
-    const { conversationId, recipient, recipientId, content, mediaUrl, mediaType, mediaName, mediaSize, replyToId, duration, waveform } = req.body;
+    const { conversationId, recipient, recipientId, content, mediaUrl, mediaType, mediaName, mediaSize, replyToId, duration, waveform, isStoryReply } = req.body;
     let targetConvId = conversationId;
     let targetRecipientId = recipientId || recipient;
 
@@ -707,19 +707,13 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
 
     // Auto-create/resolve conversation if conversationId missing
     if (!targetConvId && targetRecipientId) {
-      const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(currentUserId, targetRecipientId);
-      const { data: existingConv } = await supabase
-        .from('conversations')
-        .select('id')
-        .eq('type', 'direct')
-        .eq('direct_user1_id', direct_user1_id)
-        .eq('direct_user2_id', direct_user2_id)
-        .maybeSingle();
+      const existingConv = await findDirectConversation(currentUserId, targetRecipientId);
 
       if (existingConv) {
         targetConvId = existingConv.id;
       } else {
-        const { data: newConv } = await supabase
+        const { direct_user1_id, direct_user2_id } = getCanonicalUserOrder(currentUserId, targetRecipientId);
+        const { data: newConv, error: createConvErr } = await supabase
           .from('conversations')
           .insert([{
             type: 'direct',
@@ -730,6 +724,8 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
           }])
           .select()
           .single();
+
+        if (createConvErr) throw createConvErr;
 
         await supabase.from('conversation_members').insert([
           { conversation_id: newConv.id, user_id: currentUserId, role: 'member' },
@@ -755,6 +751,11 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
     let finalMediaType = mediaType || 'text';
     let finalMimeType = 'image/jpeg';
     let calculatedSize = typeof mediaSize === 'number' ? mediaSize : 0;
+
+    // Rule 1: Reject temporary browser blob URLs immediately
+    if (typeof finalMediaUrl === 'string' && finalMediaUrl.trim().toLowerCase().startsWith('blob:')) {
+      return res.status(400).json({ error: 'Browser blob URLs cannot be persisted in messages.' });
+    }
 
     // If content contains legacy embedded HTML tags, extract mediaUrl and mediaType
     let cleanContent = content || '';
@@ -805,18 +806,21 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
             .upload(filename, buffer, { contentType: cleanMime, upsert: true });
 
           if (uploadErr) {
-            console.warn('Supabase Storage chat-media upload fallback to data URL:', uploadErr.message);
-            finalMediaType = isAudio ? 'audio' : (isVideo ? 'video' : (cleanMime.startsWith('image/') ? 'image' : (finalMediaType || 'file')));
-          } else {
-            const { data: publicUrlData } = supabase.storage.from('chat-media').getPublicUrl(filename);
-            if (publicUrlData?.publicUrl) {
-              finalMediaUrl = publicUrlData.publicUrl;
-              finalMediaType = isAudio ? 'audio' : (isVideo ? 'video' : (cleanMime.startsWith('image/') ? 'image' : (finalMediaType || 'file')));
-            }
+            console.error('[Chat Storage Upload Error]:', uploadErr.message);
+            return res.status(500).json({ error: `Failed to upload chat media: ${uploadErr.message}` });
           }
+
+          const { data: publicUrlData } = supabase.storage.from('chat-media').getPublicUrl(filename);
+          if (!publicUrlData?.publicUrl) {
+            return res.status(500).json({ error: 'Failed to retrieve public URL for chat media.' });
+          }
+
+          finalMediaUrl = publicUrlData.publicUrl;
+          finalMediaType = isAudio ? 'audio' : (isVideo ? 'video' : (cleanMime.startsWith('image/') ? 'image' : (finalMediaType || 'file')));
         }
       } catch (err) {
-        console.warn('Error during media upload processing:', err);
+        console.error('Error during chat media upload processing:', err);
+        return res.status(500).json({ error: 'Failed to process chat media.' });
       }
     }
 
@@ -899,12 +903,15 @@ router.post('/api/chats/message', authenticateToken, async (req, res) => {
         if (!isOnline) {
           const { data: senderProf } = await supabase.from('profiles').select('username').eq('id', currentUserId).maybeSingle();
           const senderName = senderProf?.username || 'Someone';
+          const notifMessage = isStoryReply
+            ? `@${senderName} replied to your HUBB`
+            : `@${senderName} sent you a message: "${content ? content.slice(0, 30) : 'Attachment'}"`;
           await supabase.from('notifications').insert([{
             user_id: targetRecipientId,
             recipient_id: targetRecipientId,
             sender_id: currentUserId,
             type: 'chat_message',
-            message: `@${senderName} sent you a message: "${content ? content.slice(0, 30) : 'Attachment'}"`,
+            message: notifMessage,
             is_read: false,
             created_at: nowIso
           }]);

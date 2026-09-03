@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import Card from '../../components/Post/Card';
 import * as api from '../../services/api';
+import { getDraftThumbnailInfo } from '../../services/draft_thumbnail_service.js';
 
 // --- INDEXEDDB DRAFTS WRAPPER FOR CREATE POST ---
 const PostDraftsDB = {
@@ -131,11 +132,19 @@ const CreatePost = ({ onNavigateBack }) => {
   
   // Workspace Mode: 'editor' | 'mediastudio' | 'audience' | 'schedule' | 'location' | 'topics' | 'preview' | 'drafts'
   const [workspaceMode, setWorkspaceMode] = useState('editor');
+  const [mobileToolsExpanded, setMobileToolsExpanded] = useState(true);
 
   // Locations / Topics Search
   const [tempLocationSearch, setTempLocationSearch] = useState('');
   const [locationResults, setLocationResults] = useState([]);
   const [locationLoading, setLocationLoading] = useState(false);
+
+  // Live Camera Feature State
+  const [isCameraOpen, setIsCameraOpen] = useState(false);
+  const [cameraFacingMode, setCameraFacingMode] = useState('environment');
+  const [cameraError, setCameraError] = useState('');
+  const cameraVideoRef = useRef(null);
+  const cameraStreamRef = useRef(null);
   const [mapCoords, setMapCoords] = useState({ lat: '17.3850', lon: '78.4867' });
   const [tempTopicSearch, setTempTopicSearch] = useState('');
 
@@ -173,7 +182,7 @@ const CreatePost = ({ onNavigateBack }) => {
   }, [tempLocationSearch]);
 
   // Text Overlay Customization Settings
-  const [fontText, setFontText] = useState('New Vibe');
+  const [fontText, setFontText] = useState('New Hubb');
   const [fontFamily, setFontFamily] = useState('Outfit');
   const [fontSize, setFontSize] = useState(24);
   const [fontColor, setFontColor] = useState('#ffffff');
@@ -205,6 +214,7 @@ const CreatePost = ({ onNavigateBack }) => {
   // Scheduling State
   const [isScheduled, setIsScheduled] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
+  const isPublishingRef = useRef(false);
   const [isSchedulingEnabled, setIsSchedulingEnabled] = useState(false);
   const [scheduleTime, setScheduleTime] = useState(getInitialScheduleTimeStr());
   
@@ -222,6 +232,15 @@ const CreatePost = ({ onNavigateBack }) => {
   const [schedulePeriod, setSchedulePeriod] = useState(getInitialPeriodStr());
   const [openTimeDropdown, setOpenTimeDropdown] = useState(null);
   const [scheduleTimezone, setScheduleTimezone] = useState('GMT+5:30 (India Standard Time)');
+
+  // Comprehensive empty-state detection for Story Editor composition area
+  const hasTextContent = Boolean(content && content.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim().length > 0);
+  const hasMediaFiles = Boolean(mediaFiles && mediaFiles.length > 0);
+  const hasSelectedTrack = Boolean(selectedTrack);
+  const hasLocation = Boolean(location && location.trim().length > 0);
+  const hasCustomSchedule = Boolean(isScheduled);
+
+  const isComposerEmpty = !hasTextContent && !hasMediaFiles && !hasSelectedTrack && !hasLocation && !hasCustomSchedule;
 
   // Helper date logic
   const getDaysInMonth = (month, year) => {
@@ -464,10 +483,16 @@ const CreatePost = ({ onNavigateBack }) => {
     const monthStr = getMonthNameShort(selectedMonth);
     const finalScheduleTime = `${monthStr} ${selectedDay}, ${scheduleHour}:${scheduleMinute} ${schedulePeriod}`;
 
+    let hrs = parseInt(scheduleHour, 10);
+    if (schedulePeriod === 'PM' && hrs !== 12) hrs += 12;
+    if (schedulePeriod === 'AM' && hrs === 12) hrs = 0;
+    const exactDate = new Date(selectedYear, selectedMonth, selectedDay, hrs, parseInt(scheduleMinute, 10), 0, 0);
+    const finalIso = exactDate.toISOString();
+
     setIsScheduled(true);
     setScheduleTime(finalScheduleTime);
     setScheduleOption('custom');
-    await handlePostSubmit(true, finalScheduleTime);
+    await handlePostSubmit(true, finalScheduleTime, finalIso);
   };
 
   // Preview Workspace Mode
@@ -515,6 +540,12 @@ const CreatePost = ({ onNavigateBack }) => {
 
   // Media Studio Specific Editor State
   const [editorTab, setEditorTab] = useState('crop'); 
+  const [selectedStickerId, setSelectedStickerId] = useState(null);
+  const handleTabChange = (tabName) => {
+    setEditorTab(tabName);
+    setSelectedStickerId(null);
+    setSelectedTextId(null);
+  };
   const [isBeforeActive, setIsBeforeActive] = useState(false);
   
   // History for active media file
@@ -601,6 +632,82 @@ const CreatePost = ({ onNavigateBack }) => {
 
 
 
+  const stopCameraStream = () => {
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach(track => track.stop());
+      cameraStreamRef.current = null;
+    }
+    if (cameraVideoRef.current) {
+      cameraVideoRef.current.srcObject = null;
+    }
+  };
+
+  const startCamera = async (facingMode = 'environment') => {
+    setCameraError('');
+    stopCameraStream();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode },
+        audio: false
+      });
+      cameraStreamRef.current = stream;
+      setCameraFacingMode(facingMode);
+      
+      if (cameraVideoRef.current) {
+        cameraVideoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error("Camera access error:", err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setCameraError('Camera access is required. Please allow camera permissions.');
+      } else {
+        setCameraError('Live camera is not supported or unavailable on this device.');
+      }
+    }
+  };
+
+  const captureCameraFrame = () => {
+    const video = cameraVideoRef.current;
+    if (!video || !cameraStreamRef.current) return;
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || video.videoWidth;
+    canvas.height = video.videoHeight || video.videoHeight;
+    if (!canvas.width || !canvas.height) return;
+    
+    const ctx = canvas.getContext('2d');
+    
+    if (cameraFacingMode === 'user') {
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    canvas.toBlob((blob) => {
+      if (blob) {
+        const file = new File([blob], `live_capture_${Date.now()}.jpg`, { type: 'image/jpeg' });
+        addFiles([file]);
+        closeCamera();
+      }
+    }, 'image/jpeg', 0.95);
+  };
+
+  const closeCamera = () => {
+    setIsCameraOpen(false);
+    stopCameraStream();
+  };
+
+  const switchCamera = () => {
+    const newMode = cameraFacingMode === 'user' ? 'environment' : 'user';
+    startCamera(newMode);
+  };
+
+  useEffect(() => {
+    return () => {
+      stopCameraStream();
+    };
+  }, []);
+
   const handleFileChange = (e) => {
     const files = Array.from(e.target.files);
     addFiles(files);
@@ -612,6 +719,7 @@ const CreatePost = ({ onNavigateBack }) => {
       return {
         id: Date.now() + index,
         type: isVideo ? 'video' : 'image',
+        file: file,
         previewUrl: URL.createObjectURL(file),
         filter: 'Original',
         brightness: 100,
@@ -638,6 +746,10 @@ const CreatePost = ({ onNavigateBack }) => {
 
   const removeMedia = (id) => {
     setMediaFiles(prev => {
+      const itemToRemove = prev.find(m => m.id === id);
+      if (itemToRemove && itemToRemove.previewUrl && itemToRemove.previewUrl.startsWith('blob:')) {
+        try { URL.revokeObjectURL(itemToRemove.previewUrl); } catch (_) {}
+      }
       const next = prev.filter(m => m.id !== id);
       setActiveMediaIndex(curr => {
         if (curr >= next.length) {
@@ -922,13 +1034,15 @@ const CreatePost = ({ onNavigateBack }) => {
     });
   };
 
-  const handlePostSubmit = async (overrideIsScheduled, overrideScheduleTime) => {
-    if (isPublishing) return;
+  const handlePostSubmit = async (overrideIsScheduled, overrideScheduleTime, overrideIso) => {
+    if (isPublishingRef.current || isPublishing) return;
+    isPublishingRef.current = true;
     setIsPublishing(true);
     setIsLoading(true);
     try {
       const finalIsScheduled = overrideIsScheduled !== undefined ? overrideIsScheduled : (isSchedulingEnabled ? isScheduled : false);
       const finalScheduleTime = overrideScheduleTime !== undefined ? overrideScheduleTime : scheduleTime;
+      const finalScheduledAtIso = overrideIso;
 
       const musicWidgetHtml = selectedTrack ? `
 <div class="feed-post-music-attachment" data-music-url="${selectedTrack.previewUrl}" data-music-title="${selectedTrack.title}" data-music-artist="${selectedTrack.artist}" style="display: flex; align-items: center; gap: 10px; background: rgba(108, 59, 255, 0.12); border: 1px solid rgba(108, 59, 255, 0.25); border-radius: 12px; padding: 8px 12px; margin-top: 10px; cursor: pointer; width: fit-content; user-select: none;">
@@ -950,7 +1064,16 @@ const CreatePost = ({ onNavigateBack }) => {
           if (m.type === 'image') {
             return await bakeImageWithFilters(m);
           }
-          return m.previewUrl;
+          // For videos: stream binary File directly to storage, obtaining durable HTTPS URL with ZERO Base64 memory overhead
+          if (m.file) {
+            return await api.uploadMediaBinary(m.file);
+          }
+          if (m.previewUrl && m.previewUrl.startsWith('blob:')) {
+            const blobRes = await fetch(m.previewUrl);
+            const blob = await blobRes.blob();
+            return await api.uploadMediaBinary(blob);
+          }
+          return m.previewUrl || '';
         })
       );
 
@@ -962,7 +1085,8 @@ const CreatePost = ({ onNavigateBack }) => {
         audience,
         taggedPeople,
         isScheduled: finalIsScheduled,
-        scheduleTime: finalScheduleTime
+        scheduleTime: finalScheduleTime,
+        scheduledAt: finalScheduledAtIso
       };
 
       if (finalIsScheduled) {
@@ -973,10 +1097,18 @@ const CreatePost = ({ onNavigateBack }) => {
         showToastNotification('Hub published successfully! 🎉');
       }
 
+      // Cleanup local preview object URLs after successful publish
+      mediaFiles.forEach(m => {
+        if (m.previewUrl && m.previewUrl.startsWith('blob:')) {
+          try { URL.revokeObjectURL(m.previewUrl); } catch (_) {}
+        }
+      });
+
       setTimeout(() => onNavigateBack(true), 1200);
     } catch (err) {
       showToastNotification(`Error: ${err.message || 'Failed to submit post'}`);
     } finally {
+      isPublishingRef.current = false;
       setIsLoading(false);
       setIsPublishing(false);
     }
@@ -1400,7 +1532,7 @@ const CreatePost = ({ onNavigateBack }) => {
     setFontBgMode(txt.bgMode || 'none');
     setIsFontBold(txt.bold || false);
     setIsFontItalic(txt.italic || false);
-    setEditorTab('text');
+    handleTabChange('text');
   };
 
   const updateSelectedText = (key, value) => {
@@ -1602,31 +1734,107 @@ const CreatePost = ({ onNavigateBack }) => {
   // --- MOBILE HUB TOOLS MENU ---
   const renderMobileHubTools = () => {
     return (
-      <div className="hubble-mobile-hub-tools" style={{ display: 'none', flexDirection: 'column', gap: '8px', marginTop: '16px', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '12px', width: '100%', boxSizing: 'border-box', flexShrink: 0 }}>
-        <h5 style={{ fontSize: '11px', fontWeight: '700', color: 'rgba(255,255,255,0.6)', margin: '0 0 8px 0', textTransform: 'uppercase', letterSpacing: '0.5px', textAlign: 'left' }}>Hub Tools</h5>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', width: '100%', boxSizing: 'border-box' }}>
-          <button type="button" onClick={() => setWorkspaceMode('mediastudio')} style={{ background: workspaceMode === 'mediastudio' ? 'rgba(108, 59, 255, 0.25)' : 'rgba(108, 59, 255, 0.1)', border: workspaceMode === 'mediastudio' ? '1px solid #7C3BFF' : '1px solid rgba(108, 59, 255, 0.15)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
-            <ImageIcon size={14} color="#a855f7" style={{ opacity: workspaceMode === 'mediastudio' ? 1 : 0.8 }} />
-            <span style={{ fontSize: '9px', fontWeight: '600' }}>Media Studio</span>
-          </button>
-
-          <button type="button" onClick={() => setWorkspaceMode('schedule')} style={{ background: workspaceMode === 'schedule' ? 'rgba(249, 115, 22, 0.25)' : 'rgba(249, 115, 22, 0.1)', border: workspaceMode === 'schedule' ? '1px solid #f97316' : '1px solid rgba(249, 115, 22, 0.15)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
-            <Calendar size={14} color="#f97316" style={{ opacity: workspaceMode === 'schedule' ? 1 : 0.8 }} />
-            <span style={{ fontSize: '9px', fontWeight: '600' }}>Schedule</span>
-          </button>
-          <button type="button" onClick={() => setWorkspaceMode('location')} style={{ background: workspaceMode === 'location' ? 'rgba(59, 130, 246, 0.25)' : 'rgba(59, 130, 246, 0.1)', border: workspaceMode === 'location' ? '1px solid #3b82f6' : '1px solid rgba(59, 130, 246, 0.15)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
-            <MapPin size={14} color="#3b82f6" style={{ opacity: workspaceMode === 'location' ? 1 : 0.8 }} />
-            <span style={{ fontSize: '9px', fontWeight: '600' }}>Location</span>
-          </button>
-          <button type="button" onClick={() => setWorkspaceMode('preview')} style={{ background: workspaceMode === 'preview' ? 'rgba(168, 85, 247, 0.25)' : 'rgba(168, 85, 247, 0.1)', border: workspaceMode === 'preview' ? '1px solid #a855f7' : '1px solid rgba(168, 85, 247, 0.15)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
-            <Sparkles size={14} color="#a855f7" style={{ opacity: workspaceMode === 'preview' ? 1 : 0.8 }} />
-            <span style={{ fontSize: '9px', fontWeight: '600' }}>Preview</span>
-          </button>
-          <button type="button" onClick={() => setWorkspaceMode('drafts')} style={{ background: workspaceMode === 'drafts' ? 'rgba(255, 255, 255, 0.15)' : 'rgba(255, 255, 255, 0.05)', border: workspaceMode === 'drafts' ? '1px solid rgba(255, 255, 255, 0.3)' : '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '12px', padding: '10px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#fff', cursor: 'pointer', outline: 'none' }}>
-            <FileText size={14} color="#fff" style={{ opacity: workspaceMode === 'drafts' ? 1 : 0.8 }} />
-            <span style={{ fontSize: '9px', fontWeight: '600' }}>Drafts</span>
+      <div className="hubble-mobile-hub-tools">
+        <div 
+          className="hubble-mobile-tools-header" 
+          onClick={() => setMobileToolsExpanded(!mobileToolsExpanded)}
+        >
+          <div className="hubble-mobile-tools-title-wrap">
+            <Sparkles size={14} className="hubble-mobile-tools-sparkle" />
+            <span>Hub Tools</span>
+            <span className="hubble-mobile-tools-badge">5 Tools</span>
+          </div>
+          <button 
+            type="button" 
+            className="hubble-mobile-tools-toggle-btn"
+            aria-label="Toggle Hub Tools"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMobileToolsExpanded(!mobileToolsExpanded);
+            }}
+          >
+            <ChevronRight size={14} style={{ transform: mobileToolsExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.2s ease' }} />
           </button>
         </div>
+
+        {mobileToolsExpanded && (
+          <div className="hubble-mobile-tools-grid">
+            <button 
+              type="button" 
+              onClick={() => setWorkspaceMode(workspaceMode === 'mediastudio' ? 'editor' : 'mediastudio')}
+              className={`hubble-mobile-tool-card ${workspaceMode === 'mediastudio' ? 'active' : ''}`}
+            >
+              <div className="hubble-mobile-tool-icon purple">
+                <ImageIcon size={18} />
+              </div>
+              <div className="hubble-mobile-tool-info">
+                <strong>Media Studio</strong>
+                <p>Filters & studio effects</p>
+              </div>
+              <ChevronRight size={14} className="hubble-mobile-tool-arrow" />
+            </button>
+
+            <button 
+              type="button" 
+              onClick={() => setWorkspaceMode(workspaceMode === 'schedule' ? 'editor' : 'schedule')}
+              className={`hubble-mobile-tool-card ${workspaceMode === 'schedule' ? 'active' : ''}`}
+            >
+              <div className="hubble-mobile-tool-icon orange">
+                <Calendar size={18} />
+              </div>
+              <div className="hubble-mobile-tool-info">
+                <strong>Schedule</strong>
+                <p>{isScheduled ? scheduleTime : 'Pick date & time'}</p>
+              </div>
+              <ChevronRight size={14} className="hubble-mobile-tool-arrow" />
+            </button>
+
+            <button 
+              type="button" 
+              onClick={() => setWorkspaceMode(workspaceMode === 'location' ? 'editor' : 'location')}
+              className={`hubble-mobile-tool-card ${workspaceMode === 'location' ? 'active' : ''}`}
+            >
+              <div className="hubble-mobile-tool-icon blue">
+                <MapPin size={18} />
+              </div>
+              <div className="hubble-mobile-tool-info">
+                <strong>Location</strong>
+                <p>{location || 'Add location'}</p>
+              </div>
+              <ChevronRight size={14} className="hubble-mobile-tool-arrow" />
+            </button>
+
+            <button 
+              type="button" 
+              onClick={() => setWorkspaceMode(workspaceMode === 'preview' ? 'editor' : 'preview')}
+              className={`hubble-mobile-tool-card ${workspaceMode === 'preview' ? 'active' : ''}`}
+            >
+              <div className="hubble-mobile-tool-icon pink">
+                <Sparkles size={18} />
+              </div>
+              <div className="hubble-mobile-tool-info">
+                <strong>Preview</strong>
+                <p>Device simulation</p>
+              </div>
+              <ChevronRight size={14} className="hubble-mobile-tool-arrow" />
+            </button>
+
+            <button 
+              type="button" 
+              onClick={() => setWorkspaceMode(workspaceMode === 'drafts' ? 'editor' : 'drafts')}
+              className={`hubble-mobile-tool-card ${workspaceMode === 'drafts' ? 'active' : ''}`}
+            >
+              <div className="hubble-mobile-tool-icon zinc">
+                <FileText size={18} />
+              </div>
+              <div className="hubble-mobile-tool-info">
+                <strong>Drafts</strong>
+                <p>{draftsList.length > 0 ? `${draftsList.length} saved` : 'Saved drafts'}</p>
+              </div>
+              <ChevronRight size={14} className="hubble-mobile-tool-arrow" />
+            </button>
+          </div>
+        )}
       </div>
     );
   };
@@ -1769,10 +1977,47 @@ const CreatePost = ({ onNavigateBack }) => {
                     <div key={stk.id} 
                       onMouseDown={(e) => { if (editorTab === 'stickers') handleStickerMouseDown(e, stk.id); }}
                       onTouchStart={(e) => { if (editorTab === 'stickers') handleStickerTouchStart(e, stk.id); }}
-                      style={{ position: 'absolute', left: `${stk.x}%`, top: `${stk.y}%`, fontSize: `${stk.scale * 40}px`, transform: `translate(-50%, -50%) rotate(${stk.rotation || 0}deg)`, cursor: editorTab === 'stickers' ? 'move' : 'default', userSelect: 'none', zIndex: 10 }}>
+                      onClick={(e) => {
+                        if (editorTab === 'stickers') {
+                          e.stopPropagation();
+                          setSelectedStickerId(stk.id);
+                        }
+                      }}
+                      style={{ 
+                        position: 'absolute', 
+                        left: `${stk.x}%`, 
+                        top: `${stk.y}%`, 
+                        fontSize: `${(stk.scale || 1) * 40}px`, 
+                        transform: `translate(-50%, -50%) rotate(${stk.rotation || 0}deg)`, 
+                        cursor: editorTab === 'stickers' ? 'pointer' : 'default', 
+                        userSelect: 'none', 
+                        zIndex: 10,
+                        border: editorTab === 'stickers' && selectedStickerId === stk.id ? '1px dashed rgba(255,255,255,0.8)' : 'none',
+                        padding: '4px',
+                        borderRadius: '4px'
+                      }}>
                       {stk.emoji}
                       {editorTab === 'stickers' && (
-                        <div style={{ position: 'absolute', right: '-10px', top: '-10px', background: 'rgba(0,0,0,0.5)', borderRadius: '50%', padding: '2px', cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); updateActiveMedia('stickers', (activeImage.stickers || []).filter(s => s.id !== stk.id)); }}>
+                        <div 
+                          style={{ 
+                            position: 'absolute', 
+                            right: '-12px', 
+                            top: '-12px', 
+                            background: 'rgba(255,59,48,0.9)', 
+                            borderRadius: '50%', 
+                            padding: '3px', 
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            zIndex: 12
+                          }} 
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            updateActiveMedia('stickers', (activeImage.stickers || []).filter(s => s.id !== stk.id), true); 
+                            if (selectedStickerId === stk.id) setSelectedStickerId(null);
+                          }}
+                        >
                           <X size={10} color="#fff" />
                         </div>
                       )}
@@ -1857,12 +2102,12 @@ const CreatePost = ({ onNavigateBack }) => {
             </div>
 
             {/* PROPERTIES: Horizontal scrolling / compact */}
-            <div className="hubble-mediastudio-properties-bottom" style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#121212', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.08)', padding: '10px 14px', overflowY: 'auto', overflowX: 'hidden', minHeight: '90px', marginBottom: '8px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
+            <div className="hubble-mediastudio-properties-bottom hubble-editor-tool-panel" style={{ flex: 1, display: 'flex', flexDirection: 'column', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.08)', padding: '10px 14px', overflowY: 'auto', overflowX: 'hidden', minHeight: '90px', marginBottom: '8px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
               {editorTab === 'crop' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', width: '100%', maxWidth: '100%', minWidth: 0 }}>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                      <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Aspect Ratio</span>
+                      <span className="hubble-tool-heading">Aspect Ratio</span>
                       <div style={{ display: 'flex', gap: '6px' }}>
                         {['1:1', '4:5', '16:9', '9:16', 'Free'].map((ratio) => {
                           const isActive = activeImage.cropRatio === ratio || (ratio === 'Free' && activeImage.cropRatio === 'Custom');
@@ -1876,7 +2121,7 @@ const CreatePost = ({ onNavigateBack }) => {
                     </div>
                     
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                      <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Flip</span>
+                      <span className="hubble-tool-heading">Flip</span>
                       <div style={{ display: 'flex', gap: '6px' }}>
                         <button type="button" onClick={() => updateActiveMedia('flipH', !activeImage.flipH)} className={`hubble-aspect-pill ${activeImage.flipH ? 'active' : ''}`} style={{ padding: '4px 10px', fontSize: '10px' }}>Flip H</button>
                         <button type="button" onClick={() => updateActiveMedia('flipV', !activeImage.flipV)} className={`hubble-aspect-pill ${activeImage.flipV ? 'active' : ''}`} style={{ padding: '4px 10px', fontSize: '10px' }}>Flip V</button>
@@ -1884,7 +2129,7 @@ const CreatePost = ({ onNavigateBack }) => {
                     </div>
 
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                      <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Rotate</span>
+                      <span className="hubble-tool-heading">Rotate</span>
                       <button onClick={() => updateActiveMedia('rotation', ((activeImage.rotation || 0) + 90) % 360)} className="hubble-btn-secondary" style={{ padding: '4px 10px', fontSize: '10px', borderRadius: '20px' }}>
                         <RotateCw size={12} style={{ marginRight: '4px' }} /> Rotate 90°
                       </button>
@@ -1892,7 +2137,7 @@ const CreatePost = ({ onNavigateBack }) => {
                   </div>
 
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '4px', width: '100%', maxWidth: '100%', minWidth: 0 }}>
-                    <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.6)', fontWeight: '600', whiteSpace: 'nowrap' }}>Zoom: {Math.round(((activeImage.cropZoom || 1) - 1) / 2 * 100)}%</span>
+                    <span className="hubble-tool-heading" style={{ whiteSpace: 'nowrap' }}>Zoom: {Math.round(((activeImage.cropZoom || 1) - 1) / 2 * 100)}%</span>
                     <input type="range" min="1" max="3" step="0.01" value={activeImage.cropZoom || 1} onChange={(e) => updateActiveMedia('cropZoom', parseFloat(e.target.value))} className="hubble-slider" style={{ flex: 1 }} />
                   </div>
 
@@ -1910,7 +2155,7 @@ const CreatePost = ({ onNavigateBack }) => {
 
               {editorTab === 'filters' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
-                  <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Filters</span>
+                  <span className="hubble-tool-heading">Filters</span>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', width: '100%', boxSizing: 'border-box' }}>
                     {['Original', 'Warm', 'Cool', 'B&W', 'Sepia', 'Vintage'].map((filt) => (
                       <button key={filt} onClick={() => updateActiveMedia('filter', filt)} className={`hubble-filter-card-btn ${activeImage.filter === filt ? 'active' : ''}`} style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '6px', padding: '6px 8px', justifyContent: 'center' }}>
@@ -1920,7 +2165,7 @@ const CreatePost = ({ onNavigateBack }) => {
                           backgroundImage: `url(${activeImage.previewUrl})`,
                           filter: filt === 'B&W' ? 'grayscale(100%)' : filt === 'Warm' ? 'sepia(30%) hue-rotate(15deg)' : filt === 'Cool' ? 'saturate(110%) hue-rotate(-15deg)' : filt === 'Sepia' ? 'sepia(100%)' : filt === 'Vintage' ? 'sepia(50%) hue-rotate(-30deg) saturate(140%) contrast(120%)' : 'none'
                         }} />
-                        <span style={{ fontSize: '10px' }}>{filt}</span>
+                        <span className="hubble-tool-label">{filt}</span>
                       </button>
                     ))}
                   </div>
@@ -1950,7 +2195,7 @@ const CreatePost = ({ onNavigateBack }) => {
 
               {editorTab === 'effects' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
-                  <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Effects</span>
+                  <span className="hubble-tool-heading">Effects</span>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px 8px', width: '100%', boxSizing: 'border-box' }}>
                     {['None', 'Vignette', 'VHS Blur', 'Warm Glow', 'Desaturate'].map((eff) => (
                       <button key={eff} onClick={() => updateActiveMedia('effect', eff)} className={`hubble-aspect-pill ${activeImage.effect === eff ? 'active' : ''}`} style={{ padding: '6px 8px', fontSize: '10px', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -1963,18 +2208,81 @@ const CreatePost = ({ onNavigateBack }) => {
 
               {editorTab === 'stickers' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
-                  <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Stickers</span>
+                  <span className="hubble-tool-heading">Stickers</span>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: '8px', width: '100%', boxSizing: 'border-box' }}>
                     {['✨', '🔥', '💖', '🎉', '🌟', '👀', '💯', '🚀', '💡', '🏆', '⭐', '🎈', '😂', '😍', '👍', '❤️'].map((emoji) => (
                       <button key={emoji} onClick={() => {
                           const list = [...(activeImage.stickers || [])];
-                          list.push({ id: Date.now(), emoji, x: 50, y: 50, scale: 1, rotation: 0 });
-                          updateActiveMedia('stickers', list);
+                          const newStickerId = Date.now();
+                          list.push({ id: newStickerId, emoji, x: 50, y: 50, scale: 1, rotation: 0 });
+                          updateActiveMedia('stickers', list, true);
+                          setSelectedStickerId(newStickerId);
                         }} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', borderRadius: '8px', fontSize: '18px', padding: '6px 0', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         {emoji}
                       </button>
                     ))}
                   </div>
+
+                  {selectedStickerId && (() => {
+                    const currentSticker = (activeImage.stickers || []).find(s => s.id === selectedStickerId);
+                    if (!currentSticker) return null;
+                    return (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '10px', background: 'rgba(255,255,255,0.05)', padding: '10px', borderRadius: '8px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span className="hubble-tool-heading">Selected Sticker: {currentSticker.emoji}</span>
+                          <button onClick={() => setSelectedStickerId(null)} style={{ background: 'none', border: 'none', color: '#ff4f5e', fontSize: '10px', cursor: 'pointer', marginLeft: 'auto' }}>Deselect</button>
+                        </div>
+                        
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <span className="hubble-tool-heading" style={{ width: '60px' }}>Scale:</span>
+                          <input 
+                            type="range" 
+                            min="0.2" 
+                            max="4" 
+                            step="0.05" 
+                            value={currentSticker.scale || 1} 
+                            onChange={(e) => {
+                              const scaleVal = parseFloat(e.target.value);
+                              const list = (activeImage.stickers || []).map(s => {
+                                if (s.id === selectedStickerId) {
+                                  return { ...s, scale: scaleVal };
+                                }
+                                return s;
+                              });
+                              updateActiveMedia('stickers', list, true);
+                            }} 
+                            className="hubble-slider" 
+                            style={{ flex: 1 }} 
+                          />
+                          <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.7)', width: '35px', textAlign: 'right' }}>{Math.round((currentSticker.scale || 1) * 100)}%</span>
+                        </div>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <span className="hubble-tool-heading" style={{ width: '60px' }}>Rotation:</span>
+                          <input 
+                            type="range" 
+                            min="-180" 
+                            max="180" 
+                            step="1" 
+                            value={currentSticker.rotation || 0} 
+                            onChange={(e) => {
+                              const rotVal = parseInt(e.target.value);
+                              const list = (activeImage.stickers || []).map(s => {
+                                if (s.id === selectedStickerId) {
+                                  return { ...s, rotation: rotVal };
+                                }
+                                return s;
+                              });
+                              updateActiveMedia('stickers', list, true);
+                            }} 
+                            className="hubble-slider" 
+                            style={{ flex: 1 }} 
+                          />
+                          <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.7)', width: '35px', textAlign: 'right' }}>{currentSticker.rotation || 0}°</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -1990,7 +2298,7 @@ const CreatePost = ({ onNavigateBack }) => {
                   
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginTop: '2px', width: '100%', maxWidth: '100%', minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600' }}>Font:</span>
+                      <span className="hubble-tool-heading">Font:</span>
                       <select value={fontFamily} onChange={(e) => { setFontFamily(e.target.value); updateSelectedText('fontFamily', e.target.value); }} className="hubble-workspace-input" style={{ padding: '2px 6px', fontSize: '9px', color: '#fff', background: '#1e1b30', width: 'auto' }}>
                         <option value="Inter, sans-serif">Inter</option>
                         <option value="Roboto, sans-serif">Roboto</option>
@@ -2000,7 +2308,7 @@ const CreatePost = ({ onNavigateBack }) => {
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600' }}>Color:</span>
+                      <span className="hubble-tool-heading">Color:</span>
                       <div style={{ display: 'flex', gap: '4px' }}>
                         {['#ffffff', '#000000', '#ff3b30', '#4cd964', '#007aff', '#ffcc00'].map(color => (
                           <button key={color} onClick={() => { setFontColor(color); updateSelectedText('color', color); }} style={{ width: '14px', height: '14px', borderRadius: '50%', background: color, border: fontColor === color ? '1.5px solid #6C3BFF' : '1.5px solid transparent', cursor: 'pointer', padding: 0 }} />
@@ -2013,7 +2321,7 @@ const CreatePost = ({ onNavigateBack }) => {
 
               {editorTab === 'frames' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
-                  <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Frames</span>
+                  <span className="hubble-tool-heading">Frames</span>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px 8px', width: '100%', boxSizing: 'border-box' }}>
                     {['None', 'White Classic', 'Polaroid', 'Film', 'Neon Glow'].map((frm) => (
                       <button key={frm} onClick={() => updateActiveMedia('frame', frm)} className={`hubble-aspect-pill ${activeImage.frame === frm ? 'active' : ''}`} style={{ padding: '6px 8px', fontSize: '10px', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -2027,25 +2335,25 @@ const CreatePost = ({ onNavigateBack }) => {
 
             {/* TOOLS: Horizontal bar */}
             <div className="hubble-mediastudio-tools-bottom" style={{ display: 'flex', flexDirection: 'row', background: '#161616', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)', padding: '4px 6px', gap: '6px', overflowX: 'auto', marginBottom: '8px', scrollbarWidth: 'none', flexShrink: 0, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box' }}>
-              <button type="button" onClick={() => setEditorTab('crop')} className={`hubble-tool-btn-horizontal ${editorTab === 'crop' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'crop' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'crop' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('crop')} className={`hubble-tool-btn-horizontal ${editorTab === 'crop' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'crop' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'crop' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <Bold size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Crop</span>
               </button>
-              <button type="button" onClick={() => setEditorTab('filters')} className={`hubble-tool-btn-horizontal ${editorTab === 'filters' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'filters' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'filters' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('filters')} className={`hubble-tool-btn-horizontal ${editorTab === 'filters' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'filters' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'filters' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <Sparkles size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Filters</span>
               </button>
-              <button type="button" onClick={() => setEditorTab('adjust')} className={`hubble-tool-btn-horizontal ${editorTab === 'adjust' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'adjust' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'adjust' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('adjust')} className={`hubble-tool-btn-horizontal ${editorTab === 'adjust' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'adjust' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'adjust' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <Clock size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Adjust</span>
               </button>
-              <button type="button" onClick={() => setEditorTab('effects')} className={`hubble-tool-btn-horizontal ${editorTab === 'effects' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'effects' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'effects' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('effects')} className={`hubble-tool-btn-horizontal ${editorTab === 'effects' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'effects' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'effects' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <ImageIcon size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Effects</span>
               </button>
-              <button type="button" onClick={() => setEditorTab('stickers')} className={`hubble-tool-btn-horizontal ${editorTab === 'stickers' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'stickers' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'stickers' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('stickers')} className={`hubble-tool-btn-horizontal ${editorTab === 'stickers' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'stickers' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'stickers' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <Heart size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Stickers</span>
               </button>
-              <button type="button" onClick={() => setEditorTab('text')} className={`hubble-tool-btn-horizontal ${editorTab === 'text' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'text' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'text' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('text')} className={`hubble-tool-btn-horizontal ${editorTab === 'text' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'text' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'text' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <Type size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Text</span>
               </button>
-              <button type="button" onClick={() => setEditorTab('frames')} className={`hubble-tool-btn-horizontal ${editorTab === 'frames' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'frames' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'frames' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
+              <button type="button" onClick={() => handleTabChange('frames')} className={`hubble-tool-btn-horizontal ${editorTab === 'frames' ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: editorTab === 'frames' ? 'rgba(108, 59, 255, 0.15)' : 'transparent', border: editorTab === 'frames' ? '1px solid rgba(108, 59, 255, 0.3)' : 'none', color: '#fff', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer', flexShrink: 0 }}>
                 <Tablet size={12} /> <span style={{ fontSize: '9.5px', fontWeight: '600' }}>Frames</span>
               </button>
             </div>
@@ -2161,9 +2469,10 @@ const CreatePost = ({ onNavigateBack }) => {
             </div>
 
             {/* Scheduling Toggle */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '16px 32px', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-              <span style={{ color: '#fff', fontSize: '14px', fontWeight: '700' }}>Scheduling</span>
+            <div className="hubble-mobile-scheduling-row" style={{ display: 'flex', justifyContent: 'space-between', padding: '16px 32px', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+              <span className="hubble-mobile-scheduling-label" style={{ color: '#fff', fontSize: '14px', fontWeight: '700' }}>Scheduling</span>
               <div 
+                className={`hubble-mobile-scheduling-toggle ${isSchedulingEnabled ? 'on' : 'off'}`}
                 onClick={() => setIsSchedulingEnabled(!isSchedulingEnabled)}
                 style={{
                   width: '44px', height: '24px', borderRadius: '12px',
@@ -2172,7 +2481,7 @@ const CreatePost = ({ onNavigateBack }) => {
                   flexShrink: 0
                 }}
               >
-                <div style={{
+                <div className="hubble-mobile-scheduling-knob" style={{
                   width: '20px', height: '20px', borderRadius: '50%',
                   background: '#fff', position: 'absolute', top: '2px',
                   left: isSchedulingEnabled ? '22px' : '2px', transition: '0.3s'
@@ -2797,13 +3106,25 @@ const CreatePost = ({ onNavigateBack }) => {
               <div className="hubble-drafts-list">
                 {draftsList.map(d => {
                   const cleanText = d.text ? d.text.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ') : '';
+                  const thumbInfo = getDraftThumbnailInfo(d);
                   return (
                     <div key={d.id} className="hubble-draft-row">
-                      <div className="hubble-draft-info">
-                        <strong className="hubble-draft-title">{d.title}</strong>
-                        <p className="hubble-draft-text">{cleanText || 'No content'}</p>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '16px', minWidth: 0, flex: 1 }}>
+                        <div className="hubble-draft-thumb" style={{ width: '56px', height: '56px', borderRadius: '12px', overflow: 'hidden', background: 'rgba(0,0,0,0.4)', flexShrink: 0, border: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          {!thumbInfo.url ? (
+                            <ImageIcon size={24} color="rgba(255,255,255,0.3)" />
+                          ) : thumbInfo.isVideo ? (
+                            <video src={thumbInfo.url.includes('#t=') ? thumbInfo.url : `${thumbInfo.url}#t=0.1`} preload="metadata" muted playsInline style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }} />
+                          ) : (
+                            <img src={thumbInfo.url} alt="Draft thumbnail" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(e) => { e.target.style.display = 'none'; }} />
+                          )}
+                        </div>
+                        <div className="hubble-draft-info" style={{ minWidth: 0 }}>
+                          <strong className="hubble-draft-title" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block' }}>{d.title}</strong>
+                        <p className="hubble-draft-text" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', margin: '4px 0 0 0' }}>{cleanText || 'No content'}</p>
+                        </div>
                       </div>
-                      <div className="hubble-draft-actions" style={{ display: 'flex', gap: '8px' }}>
+                      <div className="hubble-draft-actions" style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
                         <button 
                           onClick={() => { 
                             setContent(d.text); 
@@ -2853,12 +3174,9 @@ const CreatePost = ({ onNavigateBack }) => {
                         <button
                           onClick={async (e) => {
                             e.stopPropagation();
-                            if (confirm('Are you sure you want to delete this draft?')) {
-                              await PostDraftsDB.deleteDraft(d.id);
-                              const updatedList = await PostDraftsDB.getDrafts();
-                              setDraftsList(updatedList.sort((a, b) => b.id - a.id));
-                              showToastNotification('Draft deleted successfully! 🗑️');
-                            }
+                            await PostDraftsDB.deleteDraft(d.id);
+                            const updatedList = await PostDraftsDB.getDrafts();
+                            setDraftsList(updatedList.sort((a, b) => b.id - a.id));
                           }}
                           className="hubble-btn-delete"
                           style={{
@@ -2891,80 +3209,96 @@ const CreatePost = ({ onNavigateBack }) => {
           <div className="hubble-composer-workspace">
             {/* Header */}
             <div className="hubble-composer-header">
-              <div className="hubble-profile-group">
-                <button onClick={onNavigateBack} className="hubble-circle-btn">
-                  <ArrowLeft size={16} />
-                </button>
-                <div>
-                  <h3 style={{ fontSize: '14px', fontWeight: '700', margin: 0, display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    Create a New Vibe ✦
-                  </h3>
-                  <p style={{ fontSize: '9px', color: 'rgba(255,255,255,0.4)', margin: '2px 0 0 0' }}>
-                    Share your thoughts, moments & vibes with the universe.
-                  </p>
+              <div className="hubble-header-main-row">
+                <div className="hubble-profile-group">
+                  <button onClick={onNavigateBack} className="hubble-circle-btn hubble-back-btn" aria-label="Go Back">
+                    <ArrowLeft size={16} />
+                  </button>
+                  <div className="hubble-title-block">
+                    <h3 className="hubble-composer-title">
+                      Create a New Hubb ✦
+                    </h3>
+                    <p className="hubble-composer-subtitle hubble-desktop-subtitle">
+                      Share your thoughts, moments & vibes with the universe.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="hubble-header-right-buttons">
+                  <button 
+                    onClick={async () => {
+                      try {
+                        const savedMedia = await Promise.all(mediaFiles.map(async (m) => {
+                          try {
+                            let thumbDataUrl = m.thumbDataUrl || null;
+                            if (m.type === 'image') {
+                              const bakedUrl = await bakeImageWithFilters(m);
+                              if (bakedUrl && bakedUrl.startsWith('data:')) {
+                                thumbDataUrl = bakedUrl;
+                              }
+                            }
+                            
+                            const res = await fetch(m.previewUrl);
+                            const blob = await res.blob();
+                            return {
+                              ...m,
+                              blob: blob,
+                              previewUrl: '',
+                              thumbDataUrl: thumbDataUrl
+                            };
+                          } catch (err) {
+                            console.error('Failed to convert media to blob:', err);
+                            return m;
+                          }
+                        }));
+
+                        const textContent = content.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ');
+                        const titleText = textContent.trim().substring(0, 15) || 'Untitled Draft';
+
+                        const newDraft = {
+                          id: Date.now(),
+                          title: `Draft: ${titleText}...`,
+                          text: content,
+                          mediaItems: savedMedia
+                        };
+
+                        await PostDraftsDB.saveDraft(newDraft);
+                        
+                        const updatedList = await PostDraftsDB.getDrafts();
+                        setDraftsList(updatedList.sort((a, b) => b.id - a.id));
+                        showToastNotification('Draft saved successfully! 💾');
+                      } catch (err) {
+                        console.error('Error saving draft:', err);
+                        showToastNotification('Failed to save draft ❌');
+                      }
+                    }} 
+                    className="hubble-btn-secondary-sm hubble-save-draft-btn"
+                    style={{ borderRadius: '12px' }}
+                  >
+                    Save Draft
+                  </button>
+                  <button 
+                    onClick={() => handlePostSubmit()} 
+                    disabled={isPublishing}
+                    className="hubble-publish-btn" 
+                    style={{ background: 'linear-gradient(135deg, #7C3BFF 0%, #d946ef 100%)', border: 'none', borderRadius: '12px', fontSize: '12px', fontWeight: '700', padding: '8px 18px', display: 'flex', alignItems: 'center', gap: '6px', opacity: isPublishing ? 0.7 : 1, cursor: isPublishing ? 'not-allowed' : 'pointer', color: '#fff', boxShadow: '0 4px 15px rgba(124, 59, 255, 0.4)' }}
+                  >
+                    {isPublishing ? (
+                      <>
+                        <RefreshCw size={12} className="hubble-spin" />
+                        <span>Posting...</span>
+                      </>
+                    ) : (
+                      <span>Post</span>
+                    )}
+                  </button>
                 </div>
               </div>
 
-              <div className="hubble-header-right-buttons">
-                <button 
-                  onClick={async () => {
-                    try {
-                      const savedMedia = await Promise.all(mediaFiles.map(async (m) => {
-                        try {
-                          const res = await fetch(m.previewUrl);
-                          const blob = await res.blob();
-                          return {
-                            ...m,
-                            blob: blob,
-                            previewUrl: ''
-                          };
-                        } catch (err) {
-                          console.error('Failed to convert media to blob:', err);
-                          return m;
-                        }
-                      }));
-
-                      const textContent = content.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ');
-                      const titleText = textContent.trim().substring(0, 15) || 'Untitled Draft';
-
-                      const newDraft = {
-                        id: Date.now(),
-                        title: `Draft: ${titleText}...`,
-                        text: content,
-                        mediaItems: savedMedia
-                      };
-
-                      await PostDraftsDB.saveDraft(newDraft);
-                      
-                      const updatedList = await PostDraftsDB.getDrafts();
-                      setDraftsList(updatedList.sort((a, b) => b.id - a.id));
-                      showToastNotification('Draft saved successfully! 💾');
-                    } catch (err) {
-                      console.error('Error saving draft:', err);
-                      showToastNotification('Failed to save draft ❌');
-                    }
-                  }} 
-                  className="hubble-btn-secondary-sm"
-                  style={{ borderRadius: '12px' }}
-                >
-                  Save Draft
-                </button>
-                <button 
-                  onClick={() => handlePostSubmit()} 
-                  disabled={isPublishing}
-                  className="hubble-publish-btn" 
-                  style={{ background: '#6C3BFF', border: 'none', borderRadius: '12px', fontSize: '11px', fontWeight: '700', padding: '6px 16px', display: 'flex', alignItems: 'center', gap: '6px', opacity: isPublishing ? 0.7 : 1, cursor: isPublishing ? 'not-allowed' : 'pointer' }}
-                >
-                  {isPublishing ? (
-                    <>
-                      <RefreshCw size={12} className="hubble-spin" />
-                      Posting...
-                    </>
-                  ) : (
-                    'Post'
-                  )}
-                </button>
-              </div>
+              {/* Mobile Dedicated Subtitle Row (Zero Overlap with Buttons) */}
+              <p className="hubble-composer-subtitle hubble-mobile-subtitle">
+                Share your thoughts, moments & vibes with the universe.
+              </p>
             </div>
 
             {/* Scrollable Editor Content */}
@@ -2975,9 +3309,76 @@ const CreatePost = ({ onNavigateBack }) => {
                 contentEditable
                 onInput={() => setContent(textareaRef.current.innerHTML)}
                 placeholder="What's on your mind today?"
-                className="hubble-composer-textarea"
-                style={{ minHeight: '120px', outline: 'none', textAlign: 'left', whiteSpace: 'pre-wrap' }}
+                className={`hubble-composer-textarea ${isComposerEmpty ? 'hubble-textarea-in-empty-mode' : ''}`}
+                style={{ outline: 'none', textAlign: 'left', whiteSpace: 'pre-wrap' }}
               />
+
+              {/* Mobile Empty-State Card (Visible on Mobile when isComposerEmpty is true) */}
+              {isComposerEmpty && (
+                <div 
+                  className="hubble-story-empty-state"
+                  onClick={() => {
+                    textareaRef.current?.focus();
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  aria-label="Tap to start creating your Hubb"
+                >
+                  <button 
+                    type="button" 
+                    className="hubble-mobile-only hubble-live-camera-btn" 
+                    onClick={(e) => { e.stopPropagation(); startCamera(); setIsCameraOpen(true); }}
+                    style={{
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '8px',
+                      background: 'linear-gradient(135deg, #7C3BFF 0%, #d946ef 100%)',
+                      color: '#fff',
+                      border: 'none',
+                      padding: '12px 24px',
+                      borderRadius: '16px',
+                      fontWeight: '700',
+                      fontSize: '14px',
+                      boxShadow: '0 4px 15px rgba(124, 59, 255, 0.4)',
+                      marginBottom: '20px',
+                      cursor: 'pointer',
+                      zIndex: 10
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+                    </div>
+                    LIVE CAMERA
+                  </button>
+
+                  <div className="hubble-empty-sparkle-wrap">
+                    <span className="hubble-empty-sparkle">✦</span>
+                  </div>
+                  
+                  <h2 className="hubble-empty-heading">
+                    Ready to share<br />something amazing?
+                  </h2>
+                  
+                  <p className="hubble-empty-desc">
+                    Add photos, videos, music or location<br />to start creating your Hubb.
+                  </p>
+
+                  <div className="hubble-empty-guidance-wrap" aria-hidden="true">
+                    <svg className="hubble-empty-guidance-arrow" width="28" height="34" viewBox="0 0 28 34" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M14 2 V22 M14 22 L7 15 M14 22 L21 15" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" strokeDasharray="3.5 3.5"/>
+                    </svg>
+                  </div>
+
+                  <div className="hubble-empty-mascot-wrap">
+                    <img 
+                      src="/hihubble-mascot-full.png" 
+                      alt="Hi-HUBBLE Mascot" 
+                      className="hubble-empty-mascot" 
+                      draggable="false"
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* Large Media Previews inside Composer */}
               {mediaFiles.length > 0 && (
@@ -3434,19 +3835,19 @@ const CreatePost = ({ onNavigateBack }) => {
               </div>
             )}
 
-            <div className="hubble-quick-toolbar" style={{ border: 'none', background: 'rgba(0,0,0,0.15)', padding: '4px', borderRadius: '12px' }}>
-              <button onClick={() => fileInputRef.current?.click()} className="hubble-quick-btn"><ImageIcon size={11} /> Photo</button>
-              <button onClick={() => fileInputRef.current?.click()} className="hubble-quick-btn"><Video size={11} /> Video</button>
-              <button type="button" onClick={() => setMusicModalOpen(true)} className="hubble-quick-btn"><Music size={11} /> Music</button>
-              <button onClick={() => setWorkspaceMode('location')} className="hubble-quick-btn"><MapPin size={11} /> Location</button>
+            <div className="hubble-quick-toolbar">
+              <button type="button" onClick={() => fileInputRef.current?.click()} className="hubble-quick-btn photo-btn"><ImageIcon size={15} /> <span>Photo</span></button>
+              <button type="button" onClick={() => fileInputRef.current?.click()} className="hubble-quick-btn video-btn"><Video size={15} /> <span>Video</span></button>
+              <button type="button" onClick={() => setMusicModalOpen(true)} className="hubble-quick-btn music-btn"><Music size={15} /> <span>Music</span></button>
+              <button type="button" onClick={() => setWorkspaceMode('location')} className="hubble-quick-btn location-btn"><MapPin size={15} /> <span>Location</span></button>
             </div>
 
             {renderMobileHubTools()}
 
             {/* Formatting & Bottom controls row */}
-            <div className="hubble-composer-footer" style={{ borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '10px', marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px', width: '100%' }}>
+            <div className="hubble-composer-footer">
               {showEmojiPicker && (
-                <div className="hubble-composer-emoji-bar" style={{ display: 'flex', gap: '6px', background: 'rgba(0, 0, 0, 0.25)', padding: '6px', borderRadius: '10px', flexWrap: 'wrap', width: 'fit-content' }}>
+                <div className="hubble-composer-emoji-bar">
                   {['😊', '😂', '😍', '🔥', '🎉', '👍', '❤️', '✨', '🙌', '💀'].map(emoji => (
                     <button
                       key={emoji}
@@ -3456,7 +3857,7 @@ const CreatePost = ({ onNavigateBack }) => {
                         if (editor) {
                           editor.focus();
                           const selection = window.getSelection();
-                          if (selection.rangeCount > 0) {
+                          if (selection && selection.rangeCount > 0) {
                             const range = selection.getRangeAt(0);
                             range.deleteContents();
                             const node = document.createTextNode(emoji);
@@ -3473,7 +3874,7 @@ const CreatePost = ({ onNavigateBack }) => {
                         }
                         setShowEmojiPicker(false);
                       }}
-                      style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '14px', padding: '2px' }}
+                      className="hubble-emoji-btn"
                     >
                       {emoji}
                     </button>
@@ -3481,22 +3882,19 @@ const CreatePost = ({ onNavigateBack }) => {
                 </div>
               )}
               
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+              <div className="hubble-composer-bottom-row">
                 {/* Rich text formatting shortcuts */}
                 <div className="hubble-format-bar">
-                  <button type="button" onClick={() => applyFormatting('bold')} className="format-btn"><Bold size={12} /></button>
-                  <button type="button" onClick={() => applyFormatting('italic')} className="format-btn"><Italic size={12} /></button>
-                  <button type="button" onClick={() => applyFormatting('underline')} className="format-btn"><Underline size={12} /></button>
-                  <button type="button" onClick={() => applyFormatting('link')} className="format-btn"><Link size={12} /></button>
-                  <button type="button" onClick={() => setShowEmojiPicker(!showEmojiPicker)} className="format-btn" style={{ background: showEmojiPicker ? 'rgba(108,59,255,0.2)' : '' }}><Smile size={12} /></button>
+                  <button type="button" onClick={() => applyFormatting('bold')} className="format-btn" aria-label="Bold" title="Bold"><Bold size={16} /></button>
+                  <button type="button" onClick={() => applyFormatting('italic')} className="format-btn" aria-label="Italic" title="Italic"><Italic size={16} /></button>
+                  <button type="button" onClick={() => applyFormatting('underline')} className="format-btn" aria-label="Underline" title="Underline"><Underline size={16} /></button>
+                  <button type="button" onClick={() => applyFormatting('link')} className="format-btn" aria-label="Insert Link" title="Link"><Link size={16} /></button>
+                  <button type="button" onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`format-btn ${showEmojiPicker ? 'active' : ''}`} aria-label="Insert Emoji" title="Emoji"><Smile size={16} /></button>
                 </div>
 
-              {/* Right Side Char Count & Publish */}
-              <div className="hubble-composer-actions">
-
+                <div className="hubble-composer-actions"></div>
               </div>
             </div>
-          </div>
 
           </div>
         );
@@ -3511,49 +3909,9 @@ const CreatePost = ({ onNavigateBack }) => {
         body.create-post-view-active #app-sidebar-right {
           display: none !important;
         }
-        @media (min-width: 769px) {
+        @media (min-width: 1024px) {
           body.create-post-view-active #app-main-layout {
             grid-template-columns: 280px 1fr !important;
-          }
-        }
-        @media (max-width: 768px) {
-          body.create-post-view-active {
-            overflow-y: auto !important;
-            overflow-x: hidden !important;
-          }
-          body.create-post-view-active #app-main-layout {
-            height: auto !important;
-            min-height: 100vh !important;
-            overflow-y: visible !important;
-          }
-          .hubble-workspace-card:has(.hubble-audience-layout),
-          .hubble-workspace-card:has(.hubble-schedule-layout),
-          .hubble-workspace-card:has(.hubble-drafts-workspace) {
-            width: calc(100vw - 24px) !important;
-            max-width: none !important;
-            position: relative !important;
-            left: 50% !important;
-            transform: translateX(-50%) !important;
-          }
-          .hubble-workspace-card {
-            height: auto !important;
-            min-height: auto !important;
-            max-height: none !important;
-          }
-          .hubble-sub-workspace,
-          .hubble-workspace-card > div {
-            height: auto !important;
-            overflow-y: visible !important;
-            overflow-x: hidden !important;
-          }
-          .hubble-schedule-layout {
-            height: auto !important;
-            overflow-y: visible !important;
-            overflow-x: hidden !important;
-            min-height: auto !important;
-          }
-          .hubble-tools-column {
-            display: none !important;
           }
         }
 
@@ -3851,22 +4209,59 @@ const CreatePost = ({ onNavigateBack }) => {
 
         .hubble-composer-header {
           display: flex;
-          align-items: center;
-          justify-content: space-between;
+          flex-direction: column;
           border-bottom: 1px solid rgba(255, 255, 255, 0.05);
           padding-bottom: 12px;
+          gap: 0;
+          width: 100%;
+        }
+
+        .hubble-header-main-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          width: 100%;
+          gap: 12px;
         }
 
         .hubble-profile-group {
           display: flex;
           align-items: center;
           gap: 12px;
+          min-width: 0;
+        }
+
+        .hubble-title-block {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          text-align: left;
+        }
+
+        .hubble-composer-title {
+          font-size: 14px;
+          font-weight: 700;
+          margin: 0;
+          color: #fff;
+        }
+
+        .hubble-desktop-subtitle {
+          display: block;
+          font-size: 9px;
+          color: rgba(255, 255, 255, 0.4);
+          margin: 0;
+          line-height: 1.3;
+        }
+
+        .hubble-mobile-subtitle {
+          display: none;
         }
 
         .hubble-header-right-buttons {
           display: flex;
           align-items: center;
           gap: 8px;
+          flex-shrink: 0;
         }
 
         .hubble-composer-textarea {
@@ -5145,6 +5540,12 @@ const CreatePost = ({ onNavigateBack }) => {
           outline: none;
         }
 
+        @media (max-width: 768px) {
+          body.light-theme .hubble-btn-restore {
+            color: #6C3BFF;
+          }
+        }
+
         .hubble-btn-restore:hover {
           background: linear-gradient(90deg, rgba(108, 59, 255, 0.8), rgba(255, 79, 163, 0.8));
           border-color: transparent;
@@ -5263,7 +5664,7 @@ const CreatePost = ({ onNavigateBack }) => {
         .hubble-tool-icon-box.orange { background: rgba(249, 115, 22, 0.25); color: #fb923c; }
         .hubble-tool-icon-box.blue { background: rgba(59, 130, 246, 0.25); color: #60a5fa; }
         .hubble-tool-icon-box.green { background: rgba(16, 185, 129, 0.25); color: #34d399; }
-        .hubble-tool-icon-box.zinc { background: rgba(113, 113, 122, 0.25); color: #a1a1aa; }
+        .hubble-tool-icon-box.zinc { background: rgba(124, 58, 237, 0.25); color: #c084fc; }
 
         .hubble-tool-text strong {
           display: block;
@@ -5310,43 +5711,855 @@ const CreatePost = ({ onNavigateBack }) => {
           animation: hubble-spin 1.5s linear infinite;
         }
 
-        .hubble-mobile-hub-tools {
-          display: none !important;
+        .hubble-story-empty-state {
+          display: none;
         }
 
-        /* TABLET BREAKPOINT */
-        @media (max-width: 1024px) {
-          .hubble-creative-page-container {
-            grid-template-columns: calc(65% - 10.4px) calc(35% - 5.6px);
-            gap: 16px;
+        @keyframes hubble-subtle-float {
+          0%, 100% {
+            transform: translateY(0);
+          }
+          50% {
+            transform: translateY(-5px);
           }
         }
 
-        /* MOBILE BREAKPOINT */
-        @media (max-width: 768px) {
+        /* ==================== RESPONSIVE BREAKPOINT SYSTEM ==================== */
+
+        /* TABLET BREAKPOINT (768px - 1023px) */
+        @media (min-width: 768px) and (max-width: 1023.98px) {
           .hubble-creative-page-container {
-            grid-template-columns: 1fr;
-            gap: 12px;
-            height: auto !important;
-          }
-          .hubble-workspace-column {
-            height: auto !important;
+            grid-template-columns: calc(64% - 10px) calc(36% - 10px);
+            gap: 20px;
+            max-width: 100%;
+            padding: 0 16px;
           }
           .hubble-workspace-card {
-            height: auto !important;
-            min-height: calc(100vh - 120px);
-            max-height: none !important;
-            border-radius: 16px;
+            height: auto;
+            min-height: 600px;
+            max-height: none;
           }
-          .hubble-sub-workspace, .hubble-composer-workspace {
-            padding: 16px;
-            overflow-y: auto;
+          .hubble-mobile-hub-tools {
+            display: none !important;
+          }
+          .hubble-story-empty-state {
+            display: none !important;
+          }
+        }
+
+        /* MOBILE BREAKPOINT (< 768px) */
+        @media (max-width: 767.98px) {
+          body.create-post-view-active {
+            height: 100dvh !important;
+            height: 100vh;
+            max-height: 100dvh !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+            position: fixed !important;
+            width: 100% !important;
+            inset: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            display: flex !important;
+            flex-direction: column !important;
+          }
+          body.create-post-view-active .app-container,
+          body.create-post-view-active #app-container {
+            display: flex !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            height: 100dvh !important;
+            height: 100vh;
+            max-height: 100dvh !important;
+            min-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+            flex: 1 1 100% !important;
+          }
+          body.create-post-view-active #main-header,
+          body.create-post-view-active .main-header {
+            flex-shrink: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            margin: 0 !important;
+            padding: 10px 16px !important;
+            box-sizing: border-box !important;
+          }
+          body.create-post-view-active #app-sidebar-left,
+          body.create-post-view-active .sidebar-left,
+          body.create-post-view-active #app-sidebar-right,
+          body.create-post-view-active .sidebar-right {
+            display: none !important;
+          }
+          body.create-post-view-active #app-main-layout,
+          body.create-post-view-active .main-layout {
+            display: flex !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            height: auto !important;
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+          }
+          body.create-post-view-active .main-content {
+            display: flex !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            height: 100% !important;
+            flex: 1 1 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            gap: 0 !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+          }
+          body.create-post-view-active .content-feed,
+          body.create-post-view-active #view-create-post,
+          body.create-post-view-active .view-panel#view-create-post {
+            display: flex !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            height: 100% !important;
+            flex: 1 1 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+          }
+          .hubble-creative-page-container {
+            display: flex !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            padding: 6px 8px calc(max(6px, env(safe-area-inset-bottom))) 8px !important;
+            margin: 0 auto !important;
+            gap: 0 !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+            flex: 1 1 100% !important;
+          }
+          .hubble-workspace-column {
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            display: flex !important;
+            flex-direction: column !important;
+            flex: 1 1 100% !important;
+            gap: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+          .hubble-tools-column {
+            display: none !important;
+          }
+
+          /* STORY EDITOR TOOL PANELS CSS */
+          .hubble-editor-tool-panel {
+            background: #121212;
+            width: 100%;
+            max-width: 100vw;
+            box-sizing: border-box;
+          }
+          .hubble-tool-heading {
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.5);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+          }
+          .hubble-tool-label {
+            font-size: 10px;
+            color: #fff;
+          }
+          
+          /* LIGHT MODE OVERRIDES FOR STORY EDITOR */
+          body.light-theme .hubble-editor-tool-panel {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(12px);
+            border-color: rgba(0, 0, 0, 0.1) !important;
+          }
+          body.light-theme .hubble-tool-heading {
+            color: rgba(0, 0, 0, 0.7);
+            font-weight: 700;
+          }
+          body.light-theme .hubble-tool-label {
+            color: #000;
+          }
+          body.light-theme .hubble-slider-labels span {
+            color: rgba(0, 0, 0, 0.8) !important;
+          }
+          body.light-theme .hubble-aspect-pill,
+          body.light-theme .hubble-btn-secondary {
+            color: #000 !important;
+            background: rgba(0, 0, 0, 0.05) !important;
+          }
+          body.light-theme .hubble-aspect-pill.active {
+            background: rgba(108, 59, 255, 0.15) !important;
+            color: #6C3BFF !important;
+            border: 1px solid rgba(108, 59, 255, 0.3) !important;
+          }
+          body.light-theme .hubble-music-picker-modal {
+            background: rgba(255, 255, 255, 0.95) !important;
+            border-color: rgba(0,0,0,0.1) !important;
+          }
+          body.light-theme .hubble-music-picker-modal h3 {
+            color: #000 !important;
+          }
+          body.light-theme .hubble-music-picker-modal input {
+            background: rgba(0, 0, 0, 0.05) !important;
+            color: #000 !important;
+            border-color: rgba(0, 0, 0, 0.1) !important;
+          }
+          body.light-theme .hubble-music-picker-modal input::placeholder {
+            color: rgba(0, 0, 0, 0.4) !important;
+          }
+          body.light-theme .music-search-result {
+            color: #000 !important;
+          }
+          body.light-theme .music-artist-name {
+            color: rgba(0, 0, 0, 0.6) !important;
+          }
+
+          @media (max-width: 440px) {
+            .hubble-editor-tool-panel {
+              padding: 12px !important;
+            }
+          }
+
+          .hubble-workspace-card {
+            width: 100% !important;
+            max-width: 100% !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            border-radius: 18px !important;
+            padding: 0 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            flex: 1 1 100% !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4), 0 0 30px rgba(108, 59, 255, 0.08) !important;
+            margin: 0 !important;
+          }
+          .hubble-workspace-card > div {
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            display: flex !important;
+            flex-direction: column !important;
+            flex: 1 1 100% !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+          .hubble-composer-workspace {
+            padding: 12px 14px 10px 14px !important;
+            display: flex !important;
+            flex-direction: column !important;
+            flex: 1 1 100% !important;
+            width: 100% !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            gap: 8px !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+          }
+          .hubble-composer-header {
+            display: flex !important;
+            flex-direction: column !important;
+            align-items: stretch !important;
+            justify-content: flex-start !important;
+            gap: 6px !important;
+            padding-bottom: 10px !important;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+            flex-shrink: 0 !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+          }
+          .hubble-header-main-row {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: space-between !important;
+            width: 100% !important;
+            gap: 10px !important;
+          }
+          .hubble-profile-group {
+            display: flex !important;
+            align-items: center !important;
+            gap: 10px !important;
+            min-width: 0 !important;
+            flex: 1 1 auto !important;
+          }
+          .hubble-desktop-subtitle {
+            display: none !important;
+          }
+          .hubble-mobile-subtitle {
+            display: block !important;
+            width: 100% !important;
+            padding-left: 50px !important;
+            margin: 0 !important;
+            font-size: 12px !important;
+            line-height: 1.35 !important;
+            color: rgba(255, 255, 255, 0.6) !important;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+            box-sizing: border-box !important;
+          }
+          .hubble-back-btn,
+          .hubble-circle-btn {
+            width: 40px !important;
+            height: 40px !important;
+            min-width: 40px !important;
+            min-height: 40px !important;
+            border-radius: 50% !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-composer-title {
+            font-size: clamp(15px, 4.2vw, 17px) !important;
+            font-weight: 700 !important;
+            margin: 0 !important;
+            line-height: 1.2 !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+          }
+          .hubble-header-right-buttons {
+            display: flex !important;
+            align-items: center !important;
+            gap: 8px !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-save-draft-btn,
+          .hubble-btn-secondary-sm {
+            height: 38px !important;
+            min-height: 38px !important;
+            padding: 0 14px !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            border-radius: 12px !important;
+            white-space: nowrap !important;
+          }
+          .hubble-publish-btn {
+            height: 38px !important;
+            min-height: 38px !important;
+            padding: 0 18px !important;
+            font-size: 12px !important;
+            font-weight: 700 !important;
+            border-radius: 12px !important;
+            white-space: nowrap !important;
           }
           .hubble-composer-scroll-content {
+            flex: 1 1 auto !important;
+            display: flex !important;
+            flex-direction: column !important;
             min-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow-y: auto !important;
+            -webkit-overflow-scrolling: touch;
+            position: relative !important;
+          }
+          .hubble-composer-textarea {
+            flex: 1 !important;
+            min-height: clamp(120px, 25vh, 260px) !important;
+            font-size: 16px !important;
+            line-height: 1.55 !important;
+            padding: 8px 2px !important;
+            box-sizing: border-box !important;
+          }
+          .hubble-textarea-in-empty-mode {
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            opacity: 0 !important;
+            overflow: hidden !important;
+            pointer-events: none !important;
+          }
+
+          /* Mobile Story Editor Empty State */
+          .hubble-story-empty-state {
+            display: flex !important;
+            flex-direction: column !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+            flex: 1 1 auto !important;
+            width: 100% !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            padding: 4px 8px 2px 8px !important;
+            box-sizing: border-box !important;
+            cursor: pointer !important;
+            user-select: none !important;
+            -webkit-tap-highlight-color: transparent !important;
+            animation: hubble-fade-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) !important;
+          }
+          .hubble-empty-sparkle-wrap {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            margin-bottom: 2px !important;
+          }
+          .hubble-empty-sparkle {
+            font-size: 20px !important;
+            color: #c084fc !important;
+            filter: drop-shadow(0 0 10px rgba(192, 132, 252, 0.7)) !important;
+            line-height: 1 !important;
+          }
+          .hubble-empty-heading {
+            font-size: clamp(16px, 4.2vw, 19px) !important;
+            font-weight: 800 !important;
+            color: #ffffff !important;
+            text-align: center !important;
+            margin: 0 0 4px 0 !important;
+            line-height: 1.25 !important;
+            letter-spacing: -0.2px !important;
+            max-width: 280px !important;
+          }
+          .hubble-empty-desc {
+            font-size: clamp(11px, 3vw, 12.5px) !important;
+            font-weight: 500 !important;
+            color: rgba(255, 255, 255, 0.65) !important;
+            text-align: center !important;
+            margin: 0 0 6px 0 !important;
+            line-height: 1.4 !important;
+            max-width: 270px !important;
+          }
+          .hubble-empty-guidance-wrap {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            margin: 0 0 4px 0 !important;
+            color: #a855f7 !important;
+            pointer-events: none !important;
+          }
+          .hubble-empty-guidance-arrow {
+            display: block !important;
+            opacity: 0.9 !important;
+            filter: drop-shadow(0 0 6px rgba(168, 85, 247, 0.4)) !important;
+          }
+          .hubble-empty-mascot-wrap {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            margin-top: 2px !important;
+            pointer-events: none !important;
+          }
+          .hubble-empty-mascot {
+            width: clamp(90px, 22vw, 125px) !important;
+            height: auto !important;
+            max-height: 140px !important;
+            object-fit: contain !important;
+            display: block !important;
+            margin: 0 auto !important;
+            pointer-events: none !important;
+            user-select: none !important;
+            animation: hubble-subtle-float 4s ease-in-out infinite !important;
+            filter: drop-shadow(0 12px 24px rgba(108, 59, 255, 0.25)) !important;
+          }
+          @media (prefers-reduced-motion: reduce) {
+            .hubble-empty-mascot {
+              animation: none !important;
+            }
+          }
+
+          .hubble-quick-toolbar {
+            display: grid !important;
+            grid-template-columns: repeat(4, 1fr) !important;
+            gap: 6px !important;
+            width: 100% !important;
+            padding: 6px !important;
+            border-radius: 14px !important;
+            background: rgba(255, 255, 255, 0.04) !important;
+            border: 1px solid rgba(255, 255, 255, 0.07) !important;
+            box-sizing: border-box !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-quick-btn {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            gap: 6px !important;
+            height: 40px !important;
+            min-height: 40px !important;
+            padding: 0 6px !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            border-radius: 10px !important;
+            background: rgba(255, 255, 255, 0.03) !important;
+            border: 1px solid rgba(255, 255, 255, 0.04) !important;
+            color: rgba(255, 255, 255, 0.85) !important;
+            white-space: nowrap !important;
           }
           .hubble-mobile-hub-tools {
             display: flex !important;
+            flex-direction: column !important;
+            gap: 8px !important;
+            width: 100% !important;
+            margin-top: 2px !important;
+            box-sizing: border-box !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-mobile-tools-header {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: space-between !important;
+            padding: 4px 2px !important;
+            cursor: pointer !important;
+          }
+          .hubble-mobile-tools-title-wrap {
+            display: flex !important;
+            align-items: center !important;
+            gap: 6px !important;
+            font-size: 11px !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.6px !important;
+            text-transform: uppercase !important;
+            color: rgba(255, 255, 255, 0.6) !important;
+          }
+          .hubble-mobile-tools-sparkle {
+            color: #c084fc !important;
+          }
+          .hubble-mobile-tools-badge {
+            font-size: 9px !important;
+            font-weight: 700 !important;
+            padding: 2px 7px !important;
+            border-radius: 10px !important;
+            background: rgba(168, 85, 247, 0.15) !important;
+            color: #c084fc !important;
+            border: 1px solid rgba(168, 85, 247, 0.25) !important;
+          }
+          .hubble-mobile-tools-toggle-btn {
+            background: transparent !important;
+            border: none !important;
+            color: rgba(255, 255, 255, 0.5) !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            cursor: pointer !important;
+          }
+          .hubble-mobile-tools-grid {
+            display: grid !important;
+            grid-template-columns: repeat(2, 1fr) !important;
+            gap: 8px !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+          }
+          .hubble-mobile-tools-grid > button:last-child:nth-child(odd) {
+            grid-column: span 2 !important;
+          }
+          .hubble-mobile-tool-card {
+            display: flex !important;
+            align-items: center !important;
+            gap: 10px !important;
+            padding: 10px 12px !important;
+            min-height: 48px !important;
+            border-radius: 14px !important;
+            background: rgba(255, 255, 255, 0.03) !important;
+            border: 1px solid rgba(255, 255, 255, 0.07) !important;
+            color: #fff !important;
+            text-align: left !important;
+            cursor: pointer !important;
+            box-sizing: border-box !important;
+            transition: all 0.2s ease !important;
+          }
+          .hubble-mobile-tool-card.active {
+            background: rgba(108, 59, 255, 0.15) !important;
+            border-color: rgba(108, 59, 255, 0.4) !important;
+          }
+          .hubble-mobile-tool-icon {
+            width: 32px !important;
+            height: 32px !important;
+            min-width: 32px !important;
+            min-height: 32px !important;
+            border-radius: 10px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-mobile-tool-icon.purple { background: rgba(108, 59, 255, 0.22); color: #c084fc; }
+          .hubble-mobile-tool-icon.orange { background: rgba(249, 115, 22, 0.22); color: #fb923c; }
+          .hubble-mobile-tool-icon.blue { background: rgba(59, 130, 246, 0.22); color: #60a5fa; }
+          .hubble-mobile-tool-icon.pink { background: rgba(244, 114, 182, 0.22); color: #f472b6; }
+          .hubble-mobile-tool-icon.zinc { background: rgba(124, 58, 237, 0.22); color: #c084fc; }
+          .hubble-mobile-tool-info {
+            display: flex !important;
+            flex-direction: column !important;
+            min-width: 0 !important;
+            flex: 1 !important;
+          }
+          .hubble-mobile-tool-info strong {
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            color: #fff !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+          }
+          .hubble-mobile-tool-info p {
+            font-size: 10px !important;
+            color: rgba(255, 255, 255, 0.45) !important;
+            margin: 1px 0 0 0 !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+          }
+          .hubble-mobile-tool-arrow {
+            color: rgba(255, 255, 255, 0.3) !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-composer-footer {
+            border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+            padding-top: 8px !important;
+            margin-top: auto !important;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 8px !important;
+            width: 100% !important;
+            flex-shrink: 0 !important;
+          }
+          .hubble-composer-bottom-row {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: space-between !important;
+            width: 100% !important;
+          }
+          .hubble-format-bar {
+            display: flex !important;
+            align-items: center !important;
+            gap: 8px !important;
+          }
+          .format-btn {
+            width: 40px !important;
+            height: 40px !important;
+            min-width: 40px !important;
+            min-height: 40px !important;
+            border-radius: 10px !important;
+            background: rgba(255, 255, 255, 0.04) !important;
+            border: 1px solid rgba(255, 255, 255, 0.07) !important;
+            color: rgba(255, 255, 255, 0.7) !important;
+          }
+          .format-btn.active {
+            background: rgba(108, 59, 255, 0.2) !important;
+            border-color: rgba(108, 59, 255, 0.4) !important;
+            color: #c084fc !important;
+          }
+          .hubble-composer-emoji-bar {
+            background: rgba(20, 16, 38, 0.95) !important;
+            border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            border-radius: 14px !important;
+            padding: 8px 10px !important;
+            gap: 6px !important;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6) !important;
+          }
+          .hubble-emoji-btn {
+            font-size: 20px !important;
+            min-width: 36px !important;
+            min-height: 36px !important;
+            padding: 4px !important;
+          }
+
+          /* Sub-workspaces on mobile */
+          .hubble-sub-workspace {
+            padding: 14px !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
+            overflow-y: auto !important;
+            -webkit-overflow-scrolling: touch;
+            width: 100% !important;
+            box-sizing: border-box !important;
+            flex: 1 1 100% !important;
+          }
+          .hubble-sub-header {
+            padding-bottom: 12px !important;
+            margin-bottom: 8px !important;
+          }
+          .hubble-mediastudio-vertical-layout {
+            padding: 14px 12px !important;
+          }
+          .hubble-mediastudio-canvas-wrapper {
+            height: 240px !important;
+            min-height: 200px !important;
+          }
+          .hubble-schedule-layout {
+            grid-template-columns: 1fr !important;
+            gap: 16px !important;
+            padding: 0 !important;
+          }
+          .hubble-audience-layout {
+            grid-template-columns: 1fr !important;
+            gap: 16px !important;
+            padding: 0 !important;
+          }
+          .hubble-globe-visual {
+            display: none !important;
+          }
+          .hubble-drafts-workspace {
+            padding: 16px !important;
+          }
+          .hubble-draft-row {
+            padding: 14px 14px !important;
+            gap: 10px !important;
+          }
+        }
+
+        /* SMALL MOBILE BREAKPOINT (<= 390px) */
+        @media (max-width: 390px) {
+          .hubble-creative-page-container {
+            padding: 6px 8px calc(max(8px, env(safe-area-inset-bottom))) 8px !important;
+          }
+          .hubble-composer-workspace {
+            padding: 10px 12px 8px 12px !important;
+            gap: 6px !important;
+          }
+          .hubble-mobile-subtitle {
+            padding-left: 48px !important;
+            font-size: 11.5px !important;
+            line-height: 1.3 !important;
+          }
+          .hubble-empty-heading {
+            font-size: 15.5px !important;
+            margin-bottom: 3px !important;
+          }
+          .hubble-empty-desc {
+            font-size: 10.5px !important;
+            margin-bottom: 4px !important;
+          }
+          .hubble-empty-mascot {
+            width: clamp(80px, 20vw, 110px) !important;
+            max-height: 120px !important;
+          }
+          .hubble-empty-guidance-arrow {
+            transform: scale(0.85) !important;
+          }
+          .hubble-save-draft-btn,
+          .hubble-btn-secondary-sm {
+            padding: 0 10px !important;
+            font-size: 11px !important;
+          }
+          .hubble-publish-btn {
+            padding: 0 14px !important;
+            font-size: 11px !important;
+          }
+          .hubble-quick-btn {
+            font-size: 11px !important;
+            gap: 4px !important;
+            padding: 0 4px !important;
+          }
+          .hubble-mobile-tool-card {
+            padding: 8px 10px !important;
+          }
+          .format-btn {
+            width: 36px !important;
+            height: 36px !important;
+            min-width: 36px !important;
+            min-height: 36px !important;
+          }
+        }
+
+        /* ULTRA-SMALL MOBILE (<= 360px) */
+        @media (max-width: 360px) {
+          .hubble-creative-page-container {
+            padding: 4px 6px calc(max(6px, env(safe-area-inset-bottom))) 6px !important;
+          }
+          .hubble-composer-header {
+            gap: 4px !important;
+          }
+          .hubble-header-main-row {
+            flex-wrap: wrap !important;
+            gap: 6px !important;
+          }
+          .hubble-profile-group {
+            width: 100% !important;
+            justify-content: flex-start !important;
+          }
+          .hubble-mobile-subtitle {
+            padding-left: 42px !important;
+            font-size: 10.5px !important;
+            line-height: 1.25 !important;
+          }
+          .hubble-header-right-buttons {
+            width: 100% !important;
+            justify-content: flex-end !important;
+            margin-top: 2px !important;
+          }
+          .hubble-back-btn,
+          .hubble-circle-btn {
+            width: 34px !important;
+            height: 34px !important;
+            min-width: 34px !important;
+            min-height: 34px !important;
+          }
+          .hubble-story-empty-state {
+            padding: 2px 6px !important;
+          }
+          .hubble-empty-heading {
+            font-size: 14.5px !important;
+            margin-bottom: 2px !important;
+          }
+          .hubble-empty-desc {
+            font-size: 10px !important;
+            margin-bottom: 3px !important;
+          }
+          .hubble-empty-mascot {
+            width: clamp(70px, 18vw, 95px) !important;
+            max-height: 105px !important;
+          }
+          .hubble-empty-guidance-arrow {
+            transform: scale(0.8) !important;
+          }
+          .hubble-quick-toolbar {
+            gap: 4px !important;
+            padding: 4px !important;
+          }
+          .hubble-quick-btn {
+            height: 36px !important;
+            min-height: 36px !important;
+            font-size: 10px !important;
+          }
+          .hubble-mobile-tools-grid {
+            grid-template-columns: 1fr !important;
+          }
+          .hubble-mobile-tools-grid > button:last-child:nth-child(odd) {
+            grid-column: span 1 !important;
+          }
+          .format-btn {
+            width: 32px !important;
+            height: 32px !important;
+            min-width: 32px !important;
+            min-height: 32px !important;
           }
         }
 
@@ -5635,6 +6848,77 @@ const CreatePost = ({ onNavigateBack }) => {
           color: #1a153b !important;
         }
 
+        /* --- MOBILE LIGHT MODE CALENDAR VISIBILITY FIX --- */
+        @media (max-width: 767.98px) {
+          /* Override the parent container's inline opacity (0.3) so the calendar is clearly visible */
+          body.light-theme .hubble-schedule-layout {
+            opacity: 1 !important;
+          }
+          
+          body.light-theme .hubble-calendar-mock {
+            background: #ffffff !important;
+            border: 1px solid rgba(0, 0, 0, 0.15) !important;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05) !important;
+          }
+          body.light-theme .hubble-cal-header strong,
+          body.light-theme .hubble-cal-header span {
+            color: #000000 !important;
+            font-weight: 700 !important;
+          }
+          body.light-theme .hubble-cal-days .cal-label {
+            color: #000000 !important;
+            font-weight: 700 !important;
+          }
+          body.light-theme .cal-day-cell {
+            color: #000000 !important;
+            font-weight: 600 !important;
+          }
+          body.light-theme .cal-day-cell.past-cell {
+            color: rgba(0, 0, 0, 0.45) !important;
+          }
+          body.light-theme .hubble-time-picker > span {
+            color: #000000 !important;
+            font-weight: 700 !important;
+          }
+          body.light-theme .hubble-time-select {
+            background: #ffffff !important;
+            color: #000000 !important;
+            border: 1px solid rgba(0, 0, 0, 0.2) !important;
+            font-weight: 600 !important;
+          }
+          body.light-theme .hubble-time-select span {
+            color: #000000 !important;
+            opacity: 1 !important;
+          }
+          /* Fix Dropdown lists which have inline dark mode hardcoded */
+          body.light-theme .hubble-time-picker > div > div[style*="absolute"] {
+            background: #ffffff !important;
+            border: 1px solid rgba(0, 0, 0, 0.15) !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
+          }
+          body.light-theme .hubble-time-picker > div > div[style*="absolute"] > div {
+            color: #000000 !important;
+            font-weight: 500 !important;
+          }
+          body.light-theme .hubble-time-picker > div > div[style*="absolute"] > div:hover {
+            background: rgba(0, 0, 0, 0.05) !important;
+          }
+
+          /* --- MOBILE LIGHT MODE SCHEDULING TOGGLE FIX --- */
+          body.light-theme .hubble-mobile-scheduling-row {
+            border-bottom-color: rgba(0, 0, 0, 0.1) !important;
+          }
+          body.light-theme .hubble-mobile-scheduling-label {
+            color: #000000 !important;
+          }
+          body.light-theme .hubble-mobile-scheduling-toggle.off {
+            background: #cbd5e1 !important;
+          }
+          body.light-theme .hubble-mobile-scheduling-knob {
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2) !important;
+          }
+        }
+
         body.light-theme .hubble-option-row.active strong {
           color: #ffffff !important;
         }
@@ -5848,6 +7132,93 @@ const CreatePost = ({ onNavigateBack }) => {
         body.light-theme .hubble-add-thumbnail-btn:hover {
           background: rgba(108, 59, 255, 0.08) !important;
         }
+
+        body.light-theme .hubble-mobile-tool-card {
+          background: rgba(108, 59, 255, 0.03) !important;
+          border: 1px solid rgba(108, 59, 255, 0.1) !important;
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-mobile-tool-card.active {
+          background: rgba(108, 59, 255, 0.08) !important;
+          border-color: rgba(108, 59, 255, 0.3) !important;
+        }
+
+        body.light-theme .hubble-mobile-tool-icon.purple,
+        body.light-theme .hubble-tool-icon-box.purple { background: rgba(108, 59, 255, 0.15) !important; color: #6c3bff !important; }
+        body.light-theme .hubble-mobile-tool-icon.orange,
+        body.light-theme .hubble-tool-icon-box.orange { background: rgba(249, 115, 22, 0.15) !important; color: #ea580c !important; }
+        body.light-theme .hubble-mobile-tool-icon.blue,
+        body.light-theme .hubble-tool-icon-box.blue { background: rgba(59, 130, 246, 0.15) !important; color: #2563eb !important; }
+        body.light-theme .hubble-mobile-tool-icon.pink,
+        body.light-theme .hubble-tool-icon-box.pink { background: rgba(244, 114, 182, 0.15) !important; color: #db2777 !important; }
+        body.light-theme .hubble-mobile-tool-icon.zinc,
+        body.light-theme .hubble-tool-icon-box.zinc { background: rgba(124, 58, 237, 0.15) !important; color: #6c3bff !important; }
+
+        body.light-theme .hubble-mobile-tool-info strong {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-mobile-tool-info p {
+          color: #6b7280 !important;
+        }
+
+        body.light-theme .hubble-mobile-tools-title-wrap {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-mobile-tools-toggle-btn {
+          color: #6b7280 !important;
+        }
+
+        body.light-theme .hubble-composer-title {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-composer-subtitle {
+          color: #6b7280 !important;
+        }
+
+        body.light-theme .hubble-composer-emoji-bar {
+          background: #ffffff !important;
+          border: 1px solid rgba(108, 59, 255, 0.15) !important;
+          box-shadow: 0 10px 30px rgba(108, 59, 255, 0.1) !important;
+        }
+
+        body.light-theme .hubble-story-empty-state {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-empty-sparkle {
+          color: #7C3BFF !important;
+          filter: drop-shadow(0 0 8px rgba(124, 59, 255, 0.4)) !important;
+        }
+
+        body.light-theme .hubble-empty-heading {
+          color: #1a153b !important;
+        }
+
+        body.light-theme .hubble-empty-desc {
+          color: #6b7280 !important;
+        }
+
+        body.light-theme .hubble-empty-guidance-wrap {
+          color: #7C3BFF !important;
+        }
+
+        body.light-theme .hubble-empty-mascot {
+          filter: drop-shadow(0 10px 20px rgba(108, 59, 255, 0.16)) !important;
+        }
+
+        .hubble-mobile-only {
+          display: none !important;
+        }
+
+        @media (max-width: 768px) {
+          .hubble-mobile-only {
+            display: flex !important;
+          }
+        }
       `}</style>
 
       {/* CENTER WORKSPACE COLUMN - 68% Wide */}
@@ -5946,6 +7317,72 @@ const CreatePost = ({ onNavigateBack }) => {
           </div>
         </div>
       </div>
+      {/* MOBILE LIVE CAMERA OVERLAY */}
+      {isCameraOpen && (
+        <div 
+          className="hubble-mobile-only"
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            width: '100vw',
+            height: '100vh',
+            backgroundColor: '#000',
+            zIndex: 999999,
+            flexDirection: 'column'
+          }}
+        >
+          {/* Header */}
+          <div style={{ padding: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', zIndex: 10, background: 'linear-gradient(to bottom, rgba(0,0,0,0.8), transparent)' }}>
+            <button onClick={closeCamera} style={{ background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%', width: '40px', height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', cursor: 'pointer', backdropFilter: 'blur(10px)' }}>
+              <X size={20} />
+            </button>
+            <button onClick={switchCamera} style={{ background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%', width: '40px', height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', cursor: 'pointer', backdropFilter: 'blur(10px)' }}>
+              <RotateCw size={20} />
+            </button>
+          </div>
+          
+          {/* Video Preview */}
+          <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+            <video 
+              ref={cameraVideoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              style={{ width: '100%', height: '100%', objectFit: 'cover', transform: cameraFacingMode === 'user' ? 'scaleX(-1)' : 'none' }}
+            />
+            {cameraError && (
+              <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center', color: '#fff', width: '80%', padding: '20px', background: 'rgba(0,0,0,0.7)', borderRadius: '16px' }}>
+                <p style={{ margin: 0, fontSize: '14px', lineHeight: 1.5 }}>{cameraError}</p>
+                <button onClick={closeCamera} style={{ marginTop: '16px', background: '#7C3BFF', border: 'none', color: '#fff', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer', fontWeight: 600 }}>Dismiss</button>
+              </div>
+            )}
+          </div>
+          
+          {/* Capture Controls */}
+          <div style={{ padding: '30px', display: 'flex', justifyContent: 'center', alignItems: 'center', background: 'linear-gradient(to top, rgba(0,0,0,0.9), transparent)', paddingBottom: '50px' }}>
+            <button 
+              onClick={captureCameraFrame} 
+              disabled={!!cameraError}
+              style={{ 
+                width: '72px', 
+                height: '72px', 
+                borderRadius: '50%', 
+                border: '4px solid #fff', 
+                background: 'rgba(255,255,255,0.3)', 
+                cursor: cameraError ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                opacity: cameraError ? 0.5 : 1
+              }}
+            >
+              <div style={{ width: '56px', height: '56px', borderRadius: '50%', background: '#fff' }} />
+            </button>
+          </div>
+        </div>
+      )}
+
       <input 
         type="file" 
         ref={fileInputRef} 

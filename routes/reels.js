@@ -86,72 +86,90 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
 
   console.log(`[API REEL POST] Received duration_seconds: ${rawDuration} -> Insert value: ${durationSeconds}`);
 
+  // Rule 1: Reject browser-local blob URLs immediately
+  if (typeof videoUrl === 'string' && videoUrl.trim().toLowerCase().startsWith('blob:')) {
+    return res.status(400).json({ error: 'Browser blob URLs cannot be persisted. Please upload raw base64 or durable video URL.' });
+  }
+  if (typeof thumbnailUrl === 'string' && thumbnailUrl.trim().toLowerCase().startsWith('blob:')) {
+    return res.status(400).json({ error: 'Browser blob URLs cannot be used as thumbnails.' });
+  }
+
+  let uploadedStoragePath = null;
+
   try {
     let finalVideoUrl = videoUrl;
+    let finalThumbnailUrl = thumbnailUrl || '';
     const userId = req.user.id;
 
     // Handle base64 video upload to Supabase storage if applicable
     if (typeof videoUrl === 'string' && videoUrl.startsWith('data:')) {
-      try {
-        const matches = videoUrl.match(/^data:([^;]+);(?:[^;]+;)*base64,(.+)$/);
-        if (matches && matches.length === 3) {
-          const mimeType = matches[1];
-          const base64Data = matches[2];
-          const buffer = Buffer.from(base64Data, 'base64');
-
-          if (!mimeType.startsWith('video/')) {
-            return res.status(400).json({ error: 'Uploaded file is not a valid video MIME type.' });
-          }
-          if (buffer.length < 1024) {
-            return res.status(400).json({ error: 'Uploaded video media payload is corrupt or too small.' });
-          }
-
-          console.log(`[API REEL UPLOAD] Validated media payload: size=${buffer.length} bytes, MIME=${mimeType}`);
-
-          const ext = mimeType.split('/')[1] || 'webm';
-          const filename = `${userId}/reel_${Date.now()}.${ext}`;
-
-          const { error: uploadErr } = await supabase.storage
-            .from('post-videos')
-            .upload(filename, buffer, { contentType: mimeType, upsert: true });
-
-          if (!uploadErr) {
-            const { data: publicUrlData } = supabase.storage.from('post-videos').getPublicUrl(filename);
-            if (publicUrlData?.publicUrl) {
-              finalVideoUrl = publicUrlData.publicUrl;
-            }
-          } else {
-            console.warn("Reel storage upload notice:", uploadErr.message);
-          }
-        } else {
-          return res.status(400).json({ error: 'Malformed base64 video data URL.' });
-        }
-      } catch (e) {
-        console.warn("Reel storage exception notice:", e.message);
-        return res.status(500).json({ error: 'Failed to process video media payload.' });
+      const matches = videoUrl.match(/^data:([^;]+);(?:[^;]+;)*base64,(.+)$/);
+      if (!matches || matches.length !== 3) {
+        return res.status(400).json({ error: 'Malformed base64 video data URL.' });
       }
+
+      const mimeType = matches[1].toLowerCase();
+      const base64Data = matches[2];
+      const buffer = Buffer.from(base64Data, 'base64');
+
+      if (!mimeType.startsWith('video/')) {
+        return res.status(400).json({ error: 'Uploaded file is not a valid video MIME type.' });
+      }
+      if (buffer.length < 1024) {
+        return res.status(400).json({ error: 'Uploaded video media payload is corrupt or too small.' });
+      }
+
+      console.log(`[API REEL UPLOAD] Validated media payload: size=${buffer.length} bytes, MIME=${mimeType}`);
+
+      const ext = mimeType.split('/')[1] || 'mp4';
+      uploadedStoragePath = `${userId}/reel_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${ext}`;
+
+      const { error: uploadErr } = await supabase.storage
+        .from('post-videos')
+        .upload(uploadedStoragePath, buffer, { contentType: mimeType, upsert: true });
+
+      if (uploadErr) {
+        console.error("[Reel Storage Upload Error]:", uploadErr.message);
+        return res.status(500).json({ error: `Failed to upload reel video to storage: ${uploadErr.message}` });
+      }
+
+      const { data: publicUrlData } = supabase.storage.from('post-videos').getPublicUrl(uploadedStoragePath);
+      if (!publicUrlData?.publicUrl) {
+        return res.status(500).json({ error: 'Failed to retrieve public URL for uploaded reel video.' });
+      }
+      finalVideoUrl = publicUrlData.publicUrl;
     }
 
-    // Ensure valid profile exists
-    let validAuthorId = userId;
-    const { data: userProfile } = await supabase.from('profiles').select('id').eq('id', userId).single();
-    if (!userProfile) {
-      const userObj = req.user || {};
-      const { data: createdProf } = await supabase.from('profiles').insert([{
-        id: userId,
-        username: userObj.username || 'hubble_user',
-        full_name: userObj.full_name || userObj.username || 'Hubble User',
-        profile_image_url: userObj.profile_image_url || ''
-      }]).select('id').single();
-      if (createdProf) validAuthorId = createdProf.id;
+    // Handle base64 thumbnail upload if provided
+    if (typeof thumbnailUrl === 'string' && thumbnailUrl.startsWith('data:')) {
+      try {
+        const thumbMatches = thumbnailUrl.match(/^data:([^;]+);(?:[^;]+;)*base64,(.+)$/);
+        if (thumbMatches && thumbMatches.length === 3) {
+          const thumbMime = thumbMatches[1].toLowerCase();
+          const thumbBuffer = Buffer.from(thumbMatches[2], 'base64');
+          const thumbExt = thumbMime.split('/')[1] || 'jpeg';
+          const thumbPath = `${userId}/reel_thumb_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${thumbExt}`;
+
+          const { error: thumbUploadErr } = await supabase.storage
+            .from('post-images')
+            .upload(thumbPath, thumbBuffer, { contentType: thumbMime, upsert: true });
+
+          if (!thumbUploadErr) {
+            const { data: thumbUrlData } = supabase.storage.from('post-images').getPublicUrl(thumbPath);
+            if (thumbUrlData?.publicUrl) {
+              finalThumbnailUrl = thumbUrlData.publicUrl;
+            }
+          }
+        }
+      } catch (_) {}
     }
 
     const { data: newReel, error } = await supabase.from('reels').insert([{
-      author_id: validAuthorId,
+      author_id: userId,
       video_url: finalVideoUrl,
       caption: caption || '',
       audio_track_name: audioTrackName || '',
-      thumbnail_url: thumbnailUrl || '',
+      thumbnail_url: finalThumbnailUrl,
       duration_seconds: durationSeconds,
       view_count: 0,
       like_count: 0,
@@ -161,9 +179,12 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
       location_data: locationData || null
     }]).select('*, author:profiles(id, full_name, username, profile_image_url)').single();
 
-    if (error) {
-      console.error("Reel insert error:", error.message);
-      return res.status(500).json({ error: error.message });
+    if (error || !newReel) {
+      console.error("Reel insert error:", error?.message);
+      if (uploadedStoragePath) {
+        try { await supabase.storage.from('post-videos').remove([uploadedStoragePath]); } catch (_) {}
+      }
+      return res.status(500).json({ error: error?.message || 'Failed to create reel record.' });
     }
 
     // Process structured mentions if any
@@ -243,7 +264,8 @@ router.get('/api/reels', async (req, res) => {
 
     const { data: reelsData, error } = await supabase.from('reels')
       .select('*, author:profiles(id, full_name, username, profile_image_url), reel_likes(user_id), reel_comments(id), saved_reels(user_id)')
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(30);
 
     if (error) {
       console.error('[REELS GET] database error:', error.message);

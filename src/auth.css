@@ -1333,7 +1333,8 @@
   height: 22px;
 }
 
-.onboard-input-box input {
+.onboard-input-box input,
+.onboard-input-box select {
   width: 100%;
   padding: 15px 18px 15px 52px;
   border-radius: 16px;
@@ -1346,7 +1347,8 @@
   transition: all 0.3s ease;
 }
 
-.onboard-input-box input:focus {
+.onboard-input-box input:focus,
+.onboard-input-box select:focus {
   border-color: #8a5cff;
   box-shadow: 0 0 16px rgba(138, 92, 255, 0.4);
   background: rgba(255, 255, 255, 0.12);
@@ -1470,7 +1472,9 @@ body.light-theme .onboard-input-box svg {
 }
 
 .light-theme .onboard-input-box input,
-body.light-theme .onboard-input-box input {
+body.light-theme .onboard-input-box input,
+.light-theme .onboard-input-box select,
+body.light-theme .onboard-input-box select {
   background: #FFFFFF !important;
   border: 1.5px solid rgba(168, 85, 247, 0.3) !important;
   color: #2E1065 !important;
@@ -1482,7 +1486,9 @@ body.light-theme .onboard-input-box input::placeholder {
 }
 
 .light-theme .onboard-input-box input:focus,
-body.light-theme .onboard-input-box input:focus {
+body.light-theme .onboard-input-box input:focus,
+.light-theme .onboard-input-box select:focus,
+body.light-theme .onboard-input-box select:focus {
   border-color: var(--primary, #6C3BFF) !important;
   box-shadow: 0 0 16px rgba(108, 59, 255, 0.25) !important;
   background: #FFFFFF !important;

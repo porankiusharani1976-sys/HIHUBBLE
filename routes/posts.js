@@ -21,13 +21,15 @@ function mapPostToFrontend(post, media, author, comments, likes) {
     profileImage: ''
   };
 
+  const validMedia = (media || []).filter(m => m && m.media_url && !m.media_url.trim().toLowerCase().startsWith('blob:'));
+
   return {
     _id: post.id,
     author: authorObj,
     caption: post.caption || '',
-    mediaUrl: media && media.length > 0 ? media[0].media_url : '',
-    mediaType: media && media.length > 0 ? media[0].media_type : 'image',
-    mediaItems: (media || []).map(m => ({
+    mediaUrl: validMedia.length > 0 ? validMedia[0].media_url : '',
+    mediaType: validMedia.length > 0 ? validMedia[0].media_type : 'image',
+    mediaItems: validMedia.map(m => ({
       url: m.media_url,
       type: m.media_type
     })),
@@ -65,49 +67,78 @@ function mapCommentToFrontend(c, userLikes = new Set()) {
   };
 }
 
-// Helper to upload media item (base64 or URL)
-export async function uploadMediaItem(userId, mediaUrl, mediaType) {
-  if (!mediaUrl) return { url: '', type: 'image' };
+// Helper to upload media item (base64 or URL) to permanent Supabase Storage
+export async function uploadMediaItem(userId, mediaUrl, mediaType, prefix = 'hubb') {
+  if (!mediaUrl) return { url: '', type: 'image', storagePath: null, bucket: null };
+
+  // Rule 1: Reject temporary browser blob URLs immediately
+  if (typeof mediaUrl === 'string' && mediaUrl.trim().toLowerCase().startsWith('blob:')) {
+    throw new Error('Browser blob URLs cannot be persisted. Please provide raw base64 or a durable storage URL.');
+  }
+
   let finalMediaUrl = mediaUrl;
   let finalType = mediaType || 'image';
+  let storagePath = null;
+  let bucketName = null;
 
   if (typeof mediaUrl === 'string' && mediaUrl.startsWith('data:')) {
-    try {
-      const matches = mediaUrl.match(/^data:([a-zA-Z0-9\/]+);base64,(.+)$/);
-      if (matches && matches.length === 3) {
-        const mimeType = matches[1];
-        const isVideo = mimeType.startsWith('video');
-        finalType = isVideo ? 'video' : 'image';
-        const base64Data = matches[2];
-        const buffer = Buffer.from(base64Data, 'base64');
-        const ext = mimeType.split('/')[1] || (isVideo ? 'mp4' : 'png');
-        const bucketName = isVideo ? 'post-videos' : 'post-images';
-        const filename = `${userId}/hubb_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+    const matches = mediaUrl.match(/^data:([a-zA-Z0-9\/\-+.]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      throw new Error('Malformed base64 data URL.');
+    }
 
-        const { error: uploadErr } = await supabase.storage
-          .from(bucketName)
-          .upload(filename, buffer, { contentType: mimeType, upsert: true });
+    const mimeType = matches[1].toLowerCase();
+    const isVideo = mimeType.startsWith('video');
+    const isAudio = mimeType.startsWith('audio');
+    finalType = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
 
-        if (!uploadErr) {
-          const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(filename);
-          if (publicUrlData?.publicUrl) {
-            finalMediaUrl = publicUrlData.publicUrl;
-          }
-        }
-      }
-    } catch (uploadExc) {
-      console.warn("Storage upload exception:", uploadExc.message);
+    const base64Data = matches[2];
+    const buffer = Buffer.from(base64Data, 'base64');
+    if (buffer.length === 0) {
+      throw new Error('Media payload is empty.');
+    }
+
+    let ext = mimeType.split('/')[1]?.split('+')[0] || (isVideo ? 'mp4' : (isAudio ? 'mp3' : 'jpeg'));
+    if (ext === 'quicktime') ext = 'mov';
+    if (ext === 'octet-stream') ext = isVideo ? 'mp4' : 'jpeg';
+
+    bucketName = isVideo ? 'post-videos' : 'post-images';
+    storagePath = `${userId}/${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from(bucketName)
+      .upload(storagePath, buffer, { contentType: mimeType, upsert: true });
+
+    if (uploadErr) {
+      console.error(`[Storage Upload Error in ${bucketName}]:`, uploadErr.message);
+      throw new Error(`Failed to upload media to storage: ${uploadErr.message}`);
+    }
+
+    const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(storagePath);
+    if (!publicUrlData?.publicUrl) {
+      throw new Error('Failed to retrieve public storage URL for uploaded media.');
+    }
+
+    finalMediaUrl = publicUrlData.publicUrl;
+  } else if (typeof mediaUrl === 'string') {
+    if (!mediaUrl.startsWith('http://') && !mediaUrl.startsWith('https://')) {
+      throw new Error('Invalid media URL scheme. Only secure HTTP/HTTPS URLs are allowed.');
     }
   }
 
-  return { url: finalMediaUrl, type: finalType };
+  return { url: finalMediaUrl, type: finalType, storagePath, bucket: bucketName };
 }
 
 function parseScheduleTimeString(timeStr) {
   if (!timeStr) return new Date();
-  
+
   const now = new Date();
-  
+
+  const directDate = new Date(timeStr);
+  if (!isNaN(directDate.getTime()) && timeStr.includes('T') && timeStr.includes('Z')) {
+    return directDate;
+  }
+
   // Case 1: "Later Today, 8:00 PM"
   if (timeStr.toLowerCase().includes('later today')) {
     const timeMatch = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
@@ -127,7 +158,7 @@ function parseScheduleTimeString(timeStr) {
     }
     return date;
   }
-  
+
   // Case 2: "Tomorrow, 9:00 AM"
   if (timeStr.toLowerCase().includes('tomorrow')) {
     const timeMatch = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
@@ -145,7 +176,7 @@ function parseScheduleTimeString(timeStr) {
     }
     return date;
   }
-  
+
   // Case 3: "Aug 11, 8:00 PM" (or similar custom date)
   try {
     const currentYear = now.getFullYear();
@@ -157,17 +188,109 @@ function parseScheduleTimeString(timeStr) {
       }
       return date;
     }
-  } catch (_) {}
+  } catch (_) { }
 
   return new Date(now.getTime() + 10 * 60 * 1000);
 }
+
+// ------------------------------------------------------------------------------
+// 0. AUTHENTICATED SIGNED UPLOAD URL GENERATOR FOR LARGE MEDIA STREAMING
+// ------------------------------------------------------------------------------
+router.post('/api/upload-url', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { fileName, fileType, ext, type } = req.body || {};
+    const isVideo = (fileType && fileType.startsWith('video/')) || type === 'video' || (ext && ['mp4', 'mov', 'webm', 'm4v', 'avi', 'mkv'].includes(ext.toLowerCase()));
+    const isAudio = (fileType && fileType.startsWith('audio/')) || type === 'audio' || (ext && ['mp3', 'wav', 'm4a', 'aac', 'ogg'].includes(ext.toLowerCase()));
+    const bucketName = isVideo ? 'post-videos' : 'post-images';
+    const cleanExt = (ext || (isVideo ? 'mp4' : (isAudio ? 'mp3' : 'jpeg'))).replace(/[^a-zA-Z0-9]/g, '') || (isVideo ? 'mp4' : 'jpeg');
+    const prefix = isVideo ? 'vid' : (isAudio ? 'aud' : 'hubb');
+    const storagePath = `${userId}/${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${cleanExt}`;
+
+    const { data: signData, error: signErr } = await supabase.storage
+      .from(bucketName)
+      .createSignedUploadUrl(storagePath);
+
+    if (signErr || !signData?.signedUrl) {
+      console.error(`[Signed Upload URL Error in ${bucketName}]:`, signErr?.message);
+      return res.status(500).json({ error: `Failed to generate upload authorization: ${signErr?.message || 'Unknown error'}` });
+    }
+
+    const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(storagePath);
+    if (!publicUrlData?.publicUrl) {
+      return res.status(500).json({ error: 'Failed to generate public storage path for media.' });
+    }
+
+    res.json({
+      success: true,
+      signedUrl: signData.signedUrl,
+      token: signData.token,
+      storagePath,
+      bucket: bucketName,
+      publicUrl: publicUrlData.publicUrl,
+      mediaType: isVideo ? 'video' : (isAudio ? 'audio' : 'image')
+    });
+  } catch (err) {
+    console.error('POST /api/upload-url error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error generating upload authorization.' });
+  }
+});
+
+// ------------------------------------------------------------------------------
+// 0.1. AUTHENTICATED BINARY MEDIA UPLOAD FALLBACK ENDPOINT
+// ------------------------------------------------------------------------------
+router.post('/api/upload', authenticateToken, express.raw({ type: '*/*', limit: '500mb' }), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const rawContentType = req.headers['content-type'] || 'application/octet-stream';
+    const queryType = (req.query.type || '').toLowerCase();
+    const isVideo = rawContentType.startsWith('video') || queryType === 'video';
+    const isAudio = rawContentType.startsWith('audio') || queryType === 'audio';
+    const bucketName = isVideo ? 'post-videos' : 'post-images';
+    const rawExt = req.query.ext || (isVideo ? 'mp4' : (isAudio ? 'mp3' : 'jpeg'));
+    const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || (isVideo ? 'mp4' : 'jpeg');
+    const prefix = isVideo ? 'vid' : (isAudio ? 'aud' : 'hubb');
+    const storagePath = `${userId}/${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${ext}`;
+
+    const buffer = req.body;
+    if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+      return res.status(400).json({ error: 'Media payload is empty or invalid.' });
+    }
+
+    const { error: uploadErr } = await supabase.storage
+      .from(bucketName)
+      .upload(storagePath, buffer, { contentType: rawContentType, upsert: true });
+
+    if (uploadErr) {
+      console.error(`[POST /api/upload Error in ${bucketName}]:`, uploadErr.message);
+      return res.status(500).json({ error: `Failed to upload media to storage: ${uploadErr.message}` });
+    }
+
+    const { data: publicUrlData } = supabase.storage.from(bucketName).getPublicUrl(storagePath);
+    if (!publicUrlData?.publicUrl) {
+      return res.status(500).json({ error: 'Failed to retrieve public storage URL for uploaded media.' });
+    }
+
+    res.status(201).json({
+      success: true,
+      url: publicUrlData.publicUrl,
+      mediaUrl: publicUrlData.publicUrl,
+      mediaType: isVideo ? 'video' : (isAudio ? 'audio' : 'image'),
+      storagePath,
+      bucket: bucketName
+    });
+  } catch (err) {
+    console.error('POST /api/upload error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error during upload.' });
+  }
+});
 
 // ------------------------------------------------------------------------------
 // 1. CREATE NEW POST / HUBB
 // ------------------------------------------------------------------------------
 router.post('/api/posts', authenticateToken, async (req, res) => {
   const { mediaUrl, mediaType, caption, location, scheduledAt, collaborators, mediaItems, editorState } = req.body;
-  
+
   // Server-side diagnostics (safe output, no tokens or huge base64)
   const firstItem = Array.isArray(mediaItems) && mediaItems.length > 0 ? mediaItems[0] : null;
   const firstUrl = firstItem ? (firstItem.mediaUrl || firstItem.url || '') : (mediaUrl || '');
@@ -201,7 +324,7 @@ router.post('/api/posts', authenticateToken, async (req, res) => {
   const hasCaption = typeof caption === 'string' && caption.trim().length > 0;
 
   if (!hasMedia && !hasCaption) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'Media URL or caption is required.',
       received: {
         hasCaption,
@@ -270,7 +393,34 @@ router.post('/api/posts', authenticateToken, async (req, res) => {
       });
     }
 
-    // 2. Insert Post with base payload (guaranteed columns)
+    // 2. Pre-process and upload all media items to permanent storage FIRST
+    const uploadedMediaItems = [];
+    for (let i = 0; i < itemsToProcess.length; i++) {
+      const item = itemsToProcess[i];
+      const rawUrl = item.mediaUrl || item.url || '';
+      const rawType = item.mediaType || item.type || 'image';
+      if (!rawUrl) continue;
+
+      try {
+        const uploaded = await uploadMediaItem(userId, rawUrl, rawType, 'hubb');
+        uploadedMediaItems.push(uploaded);
+      } catch (uploadErr) {
+        console.error('[POST /api/posts Upload Failure]:', uploadErr.message);
+        // Compensating cleanup of any already-uploaded files for this request
+        for (const prev of uploadedMediaItems) {
+          if (prev.storagePath && prev.bucket) {
+            try { await supabase.storage.from(prev.bucket).remove([prev.storagePath]); } catch (_) { }
+          }
+        }
+        return res.status(400).json({ error: `Media upload failed: ${uploadErr.message}` });
+      }
+    }
+
+    if (!caption && uploadedMediaItems.length === 0) {
+      return res.status(400).json({ error: 'Post must contain either a caption or media.' });
+    }
+
+    // 3. Insert Post with base payload (guaranteed columns)
     const basePayload = {
       author_id: userId,
       caption: caption || '',
@@ -285,28 +435,45 @@ router.post('/api/posts', authenticateToken, async (req, res) => {
 
     if (postErr || !newPost) {
       console.error("Supabase post insert error:", postErr);
+      // Compensating cleanup of uploaded files
+      for (const prev of uploadedMediaItems) {
+        if (prev.storagePath && prev.bucket) {
+          try { await supabase.storage.from(prev.bucket).remove([prev.storagePath]); } catch (_) { }
+        }
+      }
       return res.status(500).json({ error: postErr?.message || 'Database error creating post.' });
     }
 
-    // 3. Upload & Insert all media items
+    // 4. Insert into post_media with permanent URLs
     let newMediaArr = [];
-    for (let i = 0; i < itemsToProcess.length; i++) {
-      const item = itemsToProcess[i];
-      const uploaded = await uploadMediaItem(userId, item.mediaUrl || item.url, item.mediaType || item.type);
+    if (uploadedMediaItems.length > 0) {
+      const mediaInserts = uploadedMediaItems.map((up, idx) => ({
+        post_id: newPost.id,
+        media_url: up.url,
+        media_type: up.type,
+        display_order: idx + 1
+      }));
 
       const { data: mediaData, error: mediaErr } = await supabase
         .from('post_media')
-        .insert([{
-          post_id: newPost.id,
-          media_url: uploaded.url,
-          media_type: uploaded.type,
-          display_order: i + 1
-        }])
+        .insert(mediaInserts)
         .select();
 
-      if (mediaErr) console.warn("Media insert warning:", mediaErr.message);
+      if (mediaErr) {
+        console.error("Media insert error, rolling back post:", mediaErr.message);
+        // Rollback created post
+        try { await supabase.from('posts').delete().eq('id', newPost.id); } catch (_) { }
+        // Cleanup uploaded files
+        for (const prev of uploadedMediaItems) {
+          if (prev.storagePath && prev.bucket) {
+            try { await supabase.storage.from(prev.bucket).remove([prev.storagePath]); } catch (_) { }
+          }
+        }
+        return res.status(500).json({ error: `Failed to insert post media: ${mediaErr.message}` });
+      }
+
       if (mediaData && mediaData.length > 0) {
-        newMediaArr.push(mediaData[0]);
+        newMediaArr.push(...mediaData);
       }
     }
 
@@ -316,7 +483,7 @@ router.post('/api/posts', authenticateToken, async (req, res) => {
       if (currentPostCount) {
         await supabase.from('profiles').update({ post_count: currentPostCount }).eq('id', userId);
       }
-    } catch (_) {}
+    } catch (_) { }
 
     const mappedPost = mapPostToFrontend(newPost, newMediaArr, dbProfile, [], []);
     res.status(201).json(mappedPost);
@@ -499,7 +666,7 @@ router.post('/api/posts/:id/comment', authenticateToken, async (req, res) => {
         .eq('post_id', targetPost.id);
 
       await supabase.from('posts').update({ comment_count: totalComments || 1 }).eq('id', targetPost.id);
-    } catch (_) {}
+    } catch (_) { }
 
     // 4. Update reply_count on parent comment if replying
     if (parentCommentId) {
@@ -510,7 +677,7 @@ router.post('/api/posts/:id/comment', authenticateToken, async (req, res) => {
           .eq('parent_comment_id', parentCommentId);
 
         await supabase.from('comments').update({ reply_count: replyCount || 1 }).eq('id', parentCommentId);
-      } catch (_) {}
+      } catch (_) { }
     }
 
     // 5. Send Notification to post author or parent comment author
@@ -524,7 +691,7 @@ router.post('/api/posts/:id/comment', authenticateToken, async (req, res) => {
           target_type: 'post',
           post_id: targetPost.id
         }]);
-      } catch (_) {}
+      } catch (_) { }
     }
 
     // Return the newly created comment object + updated post comments list
@@ -595,7 +762,7 @@ router.post('/api/comments/:id/reply', authenticateToken, async (req, res) => {
 
       const { count: totalPostComments } = await supabase.from('comments').select('*', { count: 'exact', head: true }).eq('post_id', parentComment.post_id);
       await supabase.from('posts').update({ comment_count: totalPostComments || 1 }).eq('id', parentComment.post_id);
-    } catch (_) {}
+    } catch (_) { }
 
     // 4. Send Notification to parent comment author
     if (parentComment.author_id && parentComment.author_id !== userId) {
@@ -608,7 +775,7 @@ router.post('/api/comments/:id/reply', authenticateToken, async (req, res) => {
           post_id: parentComment.post_id,
           comment_id: parentComment.id
         }]);
-      } catch (_) {}
+      } catch (_) { }
     }
 
     return res.status(201).json(mapCommentToFrontend(insertedReply));
@@ -662,7 +829,7 @@ router.post('/api/posts/:id/like', authenticateToken, async (req, res) => {
             target_type: 'post',
             post_id: targetPostId
           }]);
-        } catch (_) {}
+        } catch (_) { }
       }
     } else {
       await supabase.from('likes').delete().eq('post_id', targetPostId).eq('user_id', userId);
@@ -724,7 +891,7 @@ router.post('/api/comments/:id/like', authenticateToken, async (req, res) => {
             post_id: commentData.post_id,
             comment_id: commentId
           }]);
-        } catch (_) {}
+        } catch (_) { }
       }
     } else {
       await supabase.from('likes').delete().eq('comment_id', commentId).eq('user_id', userId);
@@ -805,7 +972,7 @@ router.get('/api/posts/trending', async (req, res) => {
     const trendingHubbs = (postsData || []).map(p => {
       const mediaItem = p.media && p.media.length > 0 ? p.media[0] : null;
       let rawCaption = (p.caption || '').replace(/<[^>]*>/g, '').trim();
-      
+
       const hashtagMatch = rawCaption.match(/#[a-zA-Z0-9_]+/);
       let title = rawCaption || (p.location ? `Hub in ${p.location.split(',')[0]}` : 'Trending Hubb');
       if (title.length > 50) title = title.substring(0, 50) + '...';
@@ -1070,7 +1237,3 @@ router.delete('/api/posts/:id', authenticateToken, async (req, res) => {
 });
 
 export default router;
-
-
-
-

@@ -81,9 +81,15 @@ export const videoWebRTC = {
       console.log('[Video WebRTC] Received remote track:', event.streams[0]);
       const remoteVideo = document.getElementById('video-call-remote-feed');
       if (remoteVideo && event.streams[0]) {
-        remoteVideo.srcObject = event.streams[0];
+        if (remoteVideo.srcObject !== event.streams[0]) {
+          remoteVideo.srcObject = event.streams[0];
+        }
         remoteVideo.muted = false;
-        remoteVideo.play().catch(e => console.warn("[Video WebRTC] Remote play error:", e));
+        remoteVideo.play().catch(e => {
+          if (e.name !== 'AbortError') {
+            console.warn('[Video WebRTC] Remote play error:', e);
+          }
+        });
       }
     };
 

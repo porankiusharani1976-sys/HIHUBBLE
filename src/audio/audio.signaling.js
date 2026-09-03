@@ -48,7 +48,7 @@ export const audioSignaling = {
   },
 
   sendInitialCallInvite(recipientUserId, callId, initiatorId) {
-    const inviteChannelName = `user-calls-signaling-${recipientUserId}`;
+    const inviteChannelName = `user-audio-calls-signaling-${recipientUserId}`;
     console.log(`[Audio Signaling] Dispatching initial invite to: ${inviteChannelName}`);
     
     const chan = supabase.channel(inviteChannelName, {
@@ -81,7 +81,7 @@ export const audioSignaling = {
       supabase.removeChannel(inviteChannel);
     }
 
-    const inviteChannelName = `user-calls-signaling-${userId}`;
+    const inviteChannelName = `user-audio-calls-signaling-${userId}`;
     console.log(`[Audio Signaling] Subscribing to user invite channel: ${inviteChannelName}`);
     
     inviteChannel = supabase.channel(inviteChannelName, {
