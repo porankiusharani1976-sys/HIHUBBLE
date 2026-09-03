@@ -1,6 +1,7 @@
 import express from 'express';
 import { supabase } from '../supabase.js';
 import { authenticateToken } from '../utils.js';
+import { optimizeReelMedia } from '../services/reel_optimizer_service.js';
 
 const router = express.Router();
 
@@ -41,11 +42,18 @@ function mapReelToFrontend(reel, currentUserId = null) {
     ? reel.saved_reels.some(s => s.user_id === currentUserId)
     : false;
 
+  const locData = typeof reel.location_data === 'object' && reel.location_data !== null ? reel.location_data : {};
+  const optMeta = locData.optimization || {};
+  const optimizedUrl = (optMeta.status === 'ready' && optMeta.optimized_media_url) ? optMeta.optimized_media_url : null;
+  const activeVideoUrl = optimizedUrl || reel.video_url;
+
   return {
     _id: reel.id,
     id: reel.id,
     author: mappedAuthor,
-    videoUrl: reel.video_url,
+    videoUrl: activeVideoUrl,
+    originalVideoUrl: reel.video_url,
+    optimizedVideoUrl: optimizedUrl,
     thumbnailUrl: reel.thumbnail_url || '',
     caption: reel.caption || '',
     audioTrackName: reel.audio_track_name || `Original Audio - ${mappedAuthor.username}`,
@@ -213,6 +221,11 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
       const { error: notifsErr } = await supabase.from('notifications').insert(notificationsInserts);
       if (notifsErr) console.error("Reel notifications db insertion error:", notifsErr.message);
     }
+
+    // Asynchronously optimize newly uploaded reel media in background (Non-blocking with original fallback)
+    optimizeReelMedia(newReel).catch(optErr => {
+      console.warn(`[REELS ASYNC OPTIMIZE] Non-fatal background optimization notice: ${optErr.message}`);
+    });
 
     res.status(201).json(mapReelToFrontend(newReel, userId));
   } catch (err) {
