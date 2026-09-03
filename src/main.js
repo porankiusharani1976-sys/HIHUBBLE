@@ -11758,6 +11758,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let _cachedFeedPosts = null;
   let _lastFeedFetchTime = 0;
   let _feedPostsInFlightPromise = null;
+  let _lastRenderedFeedFingerprint = '';
   const FEED_CACHE_TTL = 60 * 1000; // 60 seconds
 
   async function loadFeedPosts(forceRefresh = false) {

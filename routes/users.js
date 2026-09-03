@@ -188,8 +188,8 @@ const handlePresenceHeartbeat = async (req, res) => {
       }, { onConflict: 'user_id' });
 
     if (error) {
-      console.error('[Presence Heartbeat DB Error]:', error);
-      return res.status(500).json({ error: 'Failed to update presence status in database.' });
+      console.error('[Presence Heartbeat DB Error]:', error.message || error);
+      return res.status(500).json({ error: 'Failed to update presence status in database.', details: error.message });
     }
 
     // Keep profiles table timestamp fresh
