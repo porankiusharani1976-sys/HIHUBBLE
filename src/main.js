@@ -19,6 +19,7 @@ class HubbingPlaybackController {
     this.visibilityMap = new Map(); // card -> { video, reelId, ratio, entry }
     this.unloadTimers = new Map(); // reelId -> timerId
     this.settleTimer = null;
+    this.settleRafId = null;
     this.isExploreActive = false;
     this.isUserMuted = window.reelsMuted !== false;
     this.perfInterval = null;
@@ -37,7 +38,7 @@ class HubbingPlaybackController {
         this.scrollListenerBound = true;
         scroller.addEventListener('scroll', () => {
           if (!this.isExploreActive) return;
-          this.scheduleSettleEvaluation(120);
+          this.scheduleSettleEvaluation(60);
         }, { passive: true });
       }
     };
@@ -93,7 +94,7 @@ class HubbingPlaybackController {
       this.pauseAllReelVideos();
     } else {
       this.bindGlobalScrollListener();
-      this.scheduleSettleEvaluation(80);
+      this.scheduleSettleEvaluation(60);
     }
   }
 
@@ -117,19 +118,12 @@ class HubbingPlaybackController {
 
   onVisibilityChange(entries) {
     entries.forEach(entry => {
-      const target = entry.target;
-      let card = null;
-      let video = null;
+      const card = entry.target.classList.contains('reel-card') ? entry.target : entry.target.closest('.reel-card');
+      if (!card) return;
 
-      if (target.classList.contains('reel-card')) {
-        card = target;
-        video = card.querySelector('.reel-video');
-      } else if (target.classList.contains('reel-video')) {
-        video = target;
-        card = video.closest('.reel-card');
-      }
+      const video = card.querySelector('.reel-video');
+      if (!video) return;
 
-      if (!card || !video) return;
       const reelId = card.getAttribute('data-reel-id');
       if (!reelId) return;
 
@@ -141,7 +135,8 @@ class HubbingPlaybackController {
         this.scheduleUnload(reelId, video, card);
       } else if (ratio >= 0.15) {
         this.cancelUnload(reelId);
-        if (!video.src && video.dataset.src) {
+        // Only assign src if not already loaded or matching
+        if (video.dataset.src && (!video.src || !video.src.includes(video.dataset.src))) {
           video.src = video.dataset.src;
           video.preload = 'metadata';
         }
@@ -149,14 +144,18 @@ class HubbingPlaybackController {
     });
 
     if (this.isExploreActive) {
-      this.scheduleSettleEvaluation(100);
+      this.scheduleSettleEvaluation(60);
     }
   }
 
-  scheduleSettleEvaluation(delayMs = 120) {
+  scheduleSettleEvaluation(delayMs = 60) {
     if (this.settleTimer) clearTimeout(this.settleTimer);
+    if (this.settleRafId) cancelAnimationFrame(this.settleRafId);
+
     this.settleTimer = setTimeout(() => {
-      this.evaluateBestReel();
+      this.settleRafId = requestAnimationFrame(() => {
+        this.evaluateBestReel();
+      });
     }, delayMs);
   }
 
@@ -169,56 +168,40 @@ class HubbingPlaybackController {
       return;
     }
 
-    const scroller = exploreContainer.querySelector('.reels-scroller');
-    if (!scroller) return;
-
+    const scroller = exploreContainer.querySelector('.reels-scroller') || exploreContainer;
     const cards = Array.from(scroller.querySelectorAll('.reel-card'));
     if (cards.length === 0) {
       if (this.activeReelId) this.deactivateCurrentReel('no_cards');
       return;
     }
 
-    const scrollerRect = exploreContainer.getBoundingClientRect();
-    const scrollerTop = scrollerRect.top;
-    const scrollerBottom = scrollerRect.bottom;
-    const scrollerHeight = scrollerRect.height;
-    const scrollerCenter = scrollerTop + scrollerHeight / 2;
-
     let bestCandidate = null;
-    let minCenterDistance = Infinity;
+    const containerHeight = exploreContainer.clientHeight;
 
-    cards.forEach(card => {
-      if (card.getAttribute('data-reel-failed') === 'true') return;
-      if (!document.body.contains(card)) {
-        this.visibilityMap.delete(card);
-        return;
-      }
-
-      const rect = card.getBoundingClientRect();
-      const cardHeight = rect.height || 640;
-
-      // Calculate visible overlap in container viewport
-      const visibleTop = Math.max(scrollerTop, rect.top);
-      const visibleBottom = Math.min(scrollerBottom, rect.bottom);
-      const visibleHeight = Math.max(0, visibleBottom - visibleTop);
-      const visibleRatio = visibleHeight / cardHeight;
-
-      // Calculate distance of card center from container center
-      const cardCenter = rect.top + cardHeight / 2;
-      const centerDistance = Math.abs(cardCenter - scrollerCenter);
-
-      // Card must be at least 25% visible in viewport
-      if (visibleRatio >= 0.25) {
-        if (centerDistance < minCenterDistance) {
-          minCenterDistance = centerDistance;
-          const video = card.querySelector('.reel-video');
-          const reelId = card.getAttribute('data-reel-id');
-          if (video && reelId) {
-            bestCandidate = { card, video, reelId, ratio: visibleRatio, centerDistance };
-          }
+    // High-performance direct index calculation: Avoids synchronous getBoundingClientRect loops during scroll
+    if (containerHeight > 0) {
+      const scrollTop = exploreContainer.scrollTop;
+      const targetIdx = Math.max(0, Math.min(cards.length - 1, Math.round(scrollTop / containerHeight)));
+      const candidateCard = cards[targetIdx];
+      if (candidateCard && candidateCard.getAttribute('data-reel-failed') !== 'true') {
+        const video = candidateCard.querySelector('.reel-video');
+        const reelId = candidateCard.getAttribute('data-reel-id');
+        if (video && reelId) {
+          bestCandidate = { card: candidateCard, video, reelId };
         }
       }
-    });
+    }
+
+    // Fallback to highest visibility ratio from observer map if arithmetic target was not resolved
+    if (!bestCandidate) {
+      let maxRatio = 0;
+      for (const [card, data] of this.visibilityMap.entries()) {
+        if (document.body.contains(card) && data.ratio > maxRatio && card.getAttribute('data-reel-failed') !== 'true') {
+          maxRatio = data.ratio;
+          bestCandidate = data;
+        }
+      }
+    }
 
     if (bestCandidate) {
       if (this.activeReelId !== bestCandidate.reelId) {
@@ -287,8 +270,8 @@ class HubbingPlaybackController {
     // 2. Pause and mute all other videos immediately (Single Active Video Lock)
     this.pauseAllReelVideos(video);
 
-    // 3. Ensure target video src is assigned
-    if (!video.src && video.dataset.src) {
+    // 3. Ensure target video src is assigned only if not already assigned
+    if (video.dataset.src && (!video.src || !video.src.includes(video.dataset.src))) {
       video.src = video.dataset.src;
     }
     video.preload = 'auto';
@@ -317,6 +300,12 @@ class HubbingPlaybackController {
 
   async safePlay(video, token, reelId, card) {
     if (!video || this.activationId !== token) return;
+
+    // If video is already actively playing, don't re-trigger play()
+    if (!video.paused && video.readyState >= 2) {
+      this.syncCardPlayOverlay(card, false);
+      return;
+    }
 
     try {
       const playPromise = video.play();
@@ -457,10 +446,11 @@ class HubbingPlaybackController {
 
     neighbors.forEach(nCard => {
       const nVid = nCard.querySelector('.reel-video');
-      if (nVid && !nVid.src && nVid.dataset.src) {
-        nVid.src = nVid.dataset.src;
+      if (nVid && nVid.dataset.src) {
+        if (!nVid.src || !nVid.src.includes(nVid.dataset.src)) {
+          nVid.src = nVid.dataset.src;
+        }
         nVid.preload = 'metadata';
-        console.log(`[HUBBING PLAYER] Preloaded neighbor metadata: ${nCard.getAttribute('data-reel-id')}`);
       }
     });
   }
@@ -17107,14 +17097,14 @@ document.addEventListener('DOMContentLoaded', () => {
       postObserver.observe(video);
     });
 
-    // 2. Hubbing Reel Observer (Dedicated directly to Centralized Controller)
+    // 2. Hubbing Reel Observer (Dedicated directly to Centralized Controller - Single Observation per Reel Card)
     const reelObserver = new IntersectionObserver((entries) => {
       if (window.hubbingPlaybackController) {
         window.hubbingPlaybackController.onVisibilityChange(entries);
       }
-    }, { root: null, threshold: [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] });
+    }, { root: null, threshold: [0, 0.25, 0.5, 0.75, 1.0] });
 
-    document.querySelectorAll('.reel-video, .reel-card').forEach(el => {
+    document.querySelectorAll('.reel-card').forEach(el => {
       reelObserver.observe(el);
     });
 
@@ -17128,9 +17118,9 @@ document.addEventListener('DOMContentLoaded', () => {
               postObserver.observe(node);
             }
 
-            const reelElements = node.querySelectorAll('.reel-video, .reel-card');
-            reelElements.forEach(el => reelObserver.observe(el));
-            if (node.classList.contains('reel-video') || node.classList.contains('reel-card')) {
+            const reelCards = node.querySelectorAll('.reel-card');
+            reelCards.forEach(el => reelObserver.observe(el));
+            if (node.classList.contains('reel-card')) {
               reelObserver.observe(node);
             }
           }
