@@ -124,6 +124,18 @@ export async function initAuth() {
       appContainer.classList.add('auth-hidden');
       appContainer.style.setProperty('display', 'none', 'important');
     }
+    const navBubble = document.getElementById('floating-bubble-nav');
+    const blurOverlay = document.getElementById('radial-menu-blur-overlay');
+    if (navBubble) {
+      navBubble.classList.add('auth-hidden');
+      navBubble.style.setProperty('display', 'none', 'important');
+    }
+    if (blurOverlay) {
+      blurOverlay.style.setProperty('display', 'none', 'important');
+    }
+    if (typeof window.closeRadialMenu === 'function') {
+      window.closeRadialMenu();
+    }
     const homeFeed = document.getElementById('home-feed-posts');
     if (homeFeed) {
       homeFeed.innerHTML = '';
@@ -143,6 +155,15 @@ export async function initAuth() {
       appContainer.classList.remove('auth-hidden');
       appContainer.style.removeProperty('display');
       appContainer.style.display = 'flex';
+    }
+    const navBubble = document.getElementById('floating-bubble-nav');
+    const blurOverlay = document.getElementById('radial-menu-blur-overlay');
+    if (navBubble) {
+      navBubble.classList.remove('auth-hidden');
+      navBubble.style.removeProperty('display');
+    }
+    if (blurOverlay) {
+      blurOverlay.style.removeProperty('display');
     }
     updateAppUI();
     window.dispatchEvent(new CustomEvent('auth-changed'));

@@ -1716,86 +1716,84 @@
 
       </aside>
 
-    </main>
+    <!-- Localized Radial Menu Blur Panel (TOP-LEVEL PORTAL) -->
+    <div id="radial-menu-blur-overlay" class="blur-overlay"></div>
 
-  </div>
+    <!-- ==================== SIGNATURE FLOATING BUBBLE NAVIGATION ==================== -->
+    <div class="floating-nav-container" id="floating-bubble-nav">
 
-  <!-- Localized Radial Menu Blur Panel (TOP-LEVEL PORTAL) -->
-  <div id="radial-menu-blur-overlay" class="blur-overlay"></div>
-
-  <!-- ==================== SIGNATURE FLOATING BUBBLE NAVIGATION ==================== -->
-  <div class="floating-nav-container" id="floating-bubble-nav">
-
-    <!-- SCREEN TIME COUNTER -->
-    <div id="screen-time-box" style="position: absolute; bottom: 95px; top: auto; left: 50%; transform: translateX(-50%); background: rgba(20, 10, 30, 0.8); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 12px; padding: 4px 10px; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; backdrop-filter: blur(8px); box-shadow: 0 4px 12px rgba(0,0,0,0.3), inset 0 0 8px rgba(168, 85, 247, 0.1); pointer-events: none; z-index: 100; opacity: 0; visibility: hidden; transition: opacity 0.3s ease, visibility 0.3s ease;">
-      Screen Time: 00h 00m
-    </div>
-
-    <!-- RADIAL MENU SUB-ITEMS (Redesigned as Horizontal Pill) -->
-    <div class="radial-menu-wrapper" id="radial-menu-wrapper" aria-hidden="true">
-      <div id="radial-active-glow"></div>
-
-      <div class="radial-item-bubble" data-target-view="chats" title="Messages">
-        <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
-          <div class="icon-container">
-            <i data-lucide="message-square"></i>
-            <span class="nav-icon-badge" style="display: none;"></span>
-          </div>
-          <span class="radial-badge">Messages</span>
-        </button>
+      <!-- SCREEN TIME COUNTER -->
+      <div id="screen-time-box" style="position: absolute; bottom: 95px; top: auto; left: 50%; transform: translateX(-50%); background: rgba(20, 10, 30, 0.8); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 12px; padding: 4px 10px; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; backdrop-filter: blur(8px); box-shadow: 0 4px 12px rgba(0,0,0,0.3), inset 0 0 8px rgba(168, 85, 247, 0.1); pointer-events: none; z-index: 100; opacity: 0; visibility: hidden; transition: opacity 0.3s ease, visibility 0.3s ease;">
+        Screen Time: 00h 00m
       </div>
 
-      <div class="radial-item-bubble" data-target-view="explore" title="Hubbing">
-        <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
-          <div class="icon-container"><i data-lucide="clapperboard"></i></div>
-          <span class="radial-badge">Hubbing</span>
-        </button>
-      </div>
+      <!-- RADIAL MENU SUB-ITEMS (Redesigned as Horizontal Pill) -->
+      <div class="radial-menu-wrapper" id="radial-menu-wrapper" aria-hidden="true">
+        <div id="radial-active-glow"></div>
 
-      <div class="radial-item-bubble" data-target-view="home" title="Home Feed">
-        <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
-          <div class="icon-container"><i data-lucide="home"></i></div>
-          <span class="radial-badge">Home</span>
-        </button>
-      </div>
-
-      <div class="nav-center-spacer"></div>
-
-      <div class="radial-item-bubble" id="nav-notifications-btn" data-target-view="notifications" title="Notifications">
-        <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
-          <div class="icon-container">
-            <i data-lucide="bell"></i>
-            <span class="nav-icon-badge" id="radial-notif-badge" style="display: none;"></span>
-          </div>
-          <span class="radial-badge">Notifications</span>
-        </button>
-      </div>
-
-      <div class="radial-item-bubble" data-target-view="search" id="radial-search-btn" title="Search">
-        <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
-          <div class="icon-container"><i data-lucide="search"></i></div>
-          <span class="radial-badge">Search</span>
-        </button>
-      </div>
-
-      <div class="radial-item-bubble" data-target-view="profile" title="My Profile">
-        <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
-          <div class="icon-container"><i data-lucide="user"></i></div>
-          <span class="radial-badge">Profile</span>
-        </button>
-      </div>
-
-    </div>
-
-    <!-- MAIN FLOATING BUBBLE ORB -->
-    <button class="main-glow-bubble" id="main-navigation-bubble" title="Drag to Move! Click to Open Menu!">
-      <div class="bubble-orb-glowing">
-        <div class="orb-logo-icon">
-          <img src="/hihubble-mascot-circle.png" alt="Hi-Hubble">
+        <div class="radial-item-bubble" data-target-view="chats" title="Messages">
+          <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
+            <div class="icon-container">
+              <i data-lucide="message-square"></i>
+              <span class="nav-icon-badge" style="display: none;"></span>
+            </div>
+            <span class="radial-badge">Messages</span>
+          </button>
         </div>
+
+        <div class="radial-item-bubble" data-target-view="explore" title="Hubbing">
+          <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
+            <div class="icon-container"><i data-lucide="clapperboard"></i></div>
+            <span class="radial-badge">Hubbing</span>
+          </button>
+        </div>
+
+        <div class="radial-item-bubble" data-target-view="home" title="Home Feed">
+          <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
+            <div class="icon-container"><i data-lucide="home"></i></div>
+            <span class="radial-badge">Home</span>
+          </button>
+        </div>
+
+        <div class="nav-center-spacer"></div>
+
+        <div class="radial-item-bubble" id="nav-notifications-btn" data-target-view="notifications" title="Notifications">
+          <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
+            <div class="icon-container">
+              <i data-lucide="bell"></i>
+              <span class="nav-icon-badge" id="radial-notif-badge" style="display: none;"></span>
+            </div>
+            <span class="radial-badge">Notifications</span>
+          </button>
+        </div>
+
+        <div class="radial-item-bubble" data-target-view="search" id="radial-search-btn" title="Search">
+          <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
+            <div class="icon-container"><i data-lucide="search"></i></div>
+            <span class="radial-badge">Search</span>
+          </button>
+        </div>
+
+        <div class="radial-item-bubble" data-target-view="profile" title="My Profile">
+          <button class="radial-btn" tabindex="-1" aria-hidden="true" disabled>
+            <div class="icon-container"><i data-lucide="user"></i></div>
+            <span class="radial-badge">Profile</span>
+          </button>
+        </div>
+
       </div>
-      <div class="ambient-glow"></div>
-    </button>
+
+      <!-- MAIN FLOATING BUBBLE ORB -->
+      <button class="main-glow-bubble" id="main-navigation-bubble" title="Drag to Move! Click to Open Menu!">
+        <div class="bubble-orb-glowing">
+          <div class="orb-logo-icon">
+            <img src="/hihubble-mascot-circle.png" alt="Hi-Hubble">
+          </div>
+        </div>
+        <div class="ambient-glow"></div>
+      </button>
+
+    </div>
 
   </div>
 

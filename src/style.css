@@ -173,7 +173,14 @@ body::after {
 /* Strict Authentication State DOM Isolation */
 body:not(.logged-in) #app-container,
 body.logged-out #app-container,
-#app-container.auth-hidden {
+#app-container.auth-hidden,
+body:not(.logged-in) .floating-nav-container,
+body.logged-out .floating-nav-container,
+body:not(.logged-in) #floating-bubble-nav,
+body.logged-out #floating-bubble-nav,
+body:not(.logged-in) #radial-menu-blur-overlay,
+body.logged-out #radial-menu-blur-overlay,
+.floating-nav-container.auth-hidden {
   display: none !important;
   visibility: hidden !important;
   opacity: 0 !important;

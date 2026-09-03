@@ -3824,9 +3824,21 @@ document.addEventListener('DOMContentLoaded', () => {
     // Disable accessibility and pointer events for menu items
     setRadialMenuA11y(false);
   }
+  window.closeRadialMenu = closeRadialMenu;
 
   // Ensure closed accessibility state on initial load
   setRadialMenuA11y(false);
+
+  // Initialize visibility state based on authentication
+  if (typeof window.isUserAuthenticated === 'function' && !window.isUserAuthenticated()) {
+    if (navContainer) {
+      navContainer.classList.add('auth-hidden');
+      navContainer.style.setProperty('display', 'none', 'important');
+    }
+    if (blurOverlay) {
+      blurOverlay.style.setProperty('display', 'none', 'important');
+    }
+  }
 
   // Synchronize Hubble active state on browser back/forward and URL hash navigation
   window.addEventListener('popstate', () => {
