@@ -1,4 +1,4 @@
-const isCapacitor = !!window.Capacitor;
+const isCapacitor = Boolean(window.Capacitor);
 const API_URL = isCapacitor
   ? 'https://hihubble-five.vercel.app'
   : (
@@ -15,6 +15,14 @@ const API_URL = isCapacitor
 
 window.API_URL = API_URL;
 
+const getCanonicalToken = () => {
+  if (typeof window !== 'undefined' && typeof window.getAuthToken === 'function') {
+    return window.getAuthToken();
+  }
+  const tok = typeof localStorage !== 'undefined' ? localStorage.getItem('invibe_jwt_token') : null;
+  return (tok && typeof tok === 'string' && tok.includes('.')) ? tok.trim() : null;
+};
+
 const detectMediaType = (url) => {
   if (typeof url !== 'string' || !url) return 'image';
   const lower = url.toLowerCase();
@@ -25,7 +33,9 @@ const detectMediaType = (url) => {
 };
 
 export const createPost = async (postData) => {
-  const token = localStorage.getItem('invibe_jwt_token') || (window.getAuthToken ? window.getAuthToken() : null);
+  const token = getCanonicalToken();
+  if (!token) throw new Error('Authentication required to create a post.');
+
   const mediaList = Array.isArray(postData.media) ? postData.media : (postData.media ? [postData.media] : []);
   const firstMedia = mediaList[0] || '';
 
@@ -47,6 +57,9 @@ export const createPost = async (postData) => {
     })
   });
   if (!res.ok) {
+    if (res.status === 401 && window.handleUnauthorizedResponse) {
+      window.handleUnauthorizedResponse(res);
+    }
     let errorMsg = 'Failed to create post';
     try {
       const errData = await res.json();
@@ -58,7 +71,7 @@ export const createPost = async (postData) => {
 };
 
 export const uploadMediaBinary = async (file) => {
-  const token = localStorage.getItem('invibe_jwt_token') || (window.getAuthToken ? window.getAuthToken() : null);
+  const token = getCanonicalToken();
   if (!token) throw new Error('Authentication required for media upload.');
 
   const isVideo = file.type ? file.type.startsWith('video/') : (file.name && /\.(mp4|mov|webm|m4v|avi|mkv)$/i.test(file.name));
@@ -86,7 +99,7 @@ export const uploadMediaBinary = async (file) => {
     if (authRes.ok) {
       const authData = await authRes.json();
       if (authData && authData.signedUrl && authData.publicUrl) {
-        // 2. Direct streaming binary upload from browser to Supabase Storage CDN (0 Base64 RAM, 0 Node server buffer)
+        // 2. Direct streaming binary upload from browser to Supabase Storage CDN
         const uploadRes = await fetch(authData.signedUrl, {
           method: 'PUT',
           headers: {
@@ -100,6 +113,8 @@ export const uploadMediaBinary = async (file) => {
         }
         console.warn('[Direct Storage Upload notice, trying fallback]:', uploadRes.status);
       }
+    } else if (authRes.status === 401 && window.handleUnauthorizedResponse) {
+      window.handleUnauthorizedResponse(authRes);
     }
   } catch (directErr) {
     console.warn('[Signed upload request notice, trying binary endpoint]:', directErr.message);
@@ -116,6 +131,9 @@ export const uploadMediaBinary = async (file) => {
   });
 
   if (!res.ok) {
+    if (res.status === 401 && window.handleUnauthorizedResponse) {
+      window.handleUnauthorizedResponse(res);
+    }
     let errorMsg = 'Failed to upload media';
     try {
       const errData = await res.json();
@@ -144,7 +162,9 @@ export const saveDraft = async (draftData) => {
 };
 
 export const schedulePost = async (postData) => {
-  const token = localStorage.getItem('invibe_jwt_token') || (window.getAuthToken ? window.getAuthToken() : null);
+  const token = getCanonicalToken();
+  if (!token) throw new Error('Authentication required to schedule a post.');
+
   const mediaList = Array.isArray(postData.media) ? postData.media : (postData.media ? [postData.media] : []);
   const firstMedia = mediaList[0] || '';
 
@@ -167,6 +187,9 @@ export const schedulePost = async (postData) => {
     })
   });
   if (!res.ok) {
+    if (res.status === 401 && window.handleUnauthorizedResponse) {
+      window.handleUnauthorizedResponse(res);
+    }
     let errorMsg = 'Failed to schedule post';
     try {
       const errData = await res.json();

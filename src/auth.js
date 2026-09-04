@@ -7,6 +7,23 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIU
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+// Global Authoritative Authentication State Machine
+// States: UNKNOWN -> AUTHENTICATING -> AUTHENTICATED / UNAUTHENTICATED
+window.authState = 'UNKNOWN';
+window.getAuthState = () => window.authState;
+
+export function clearLocalAuthSession() {
+  localStorage.removeItem('invibeUser');
+  localStorage.removeItem('invibeProfileImage');
+  localStorage.removeItem('invibeBannerImage');
+  localStorage.removeItem('invibeIsLoggedIn');
+  localStorage.removeItem('invibe_jwt_token');
+  localStorage.removeItem('invibe_token');
+  localStorage.removeItem('invibeToken');
+  localStorage.removeItem('token');
+}
+window.clearLocalAuthSession = clearLocalAuthSession;
+
 /**
  * Diagnostic logger for Auth operations (No sensitive fields logged)
  */
@@ -113,6 +130,8 @@ export async function initAuth() {
   if (tabBtnLogin) tabBtnLogin.addEventListener('click', () => switchTab('login'));
 
   function showAuthView() {
+    window.authState = 'UNAUTHENTICATED';
+    window.dispatchEvent(new CustomEvent('auth-state-changed', { detail: { state: 'UNAUTHENTICATED' } }));
     document.body.classList.add('logged-out');
     document.body.classList.remove('logged-in');
     if (authView) {
@@ -145,6 +164,8 @@ export async function initAuth() {
 
   function showAppView() {
     stopWebcam();
+    window.authState = 'AUTHENTICATED';
+    window.dispatchEvent(new CustomEvent('auth-state-changed', { detail: { state: 'AUTHENTICATED' } }));
     document.body.classList.add('logged-in');
     document.body.classList.remove('logged-out');
     if (authView) {
@@ -338,34 +359,59 @@ export async function initAuth() {
     }
   }
 
-  // Check existing session
-  const storedUser = localStorage.getItem('invibeUser');
-  const isLoggedIn = localStorage.getItem('invibeIsLoggedIn') === 'true';
+  // Canonical Session Validation via /api/auth/me
   const curTok = localStorage.getItem('invibe_jwt_token');
+  if (!curTok || curTok === 'null' || curTok === 'undefined' || typeof curTok !== 'string' || !curTok.includes('.')) {
+    window.authState = 'UNAUTHENTICATED';
+    clearLocalAuthSession();
+    showAuthView();
+  } else {
+    window.authState = 'AUTHENTICATING';
+    window.dispatchEvent(new CustomEvent('auth-state-changed', { detail: { state: 'AUTHENTICATING' } }));
 
-  let sessionValid = isLoggedIn && storedUser;
-  if (sessionValid && curTok) {
-    if (isTokenExpired(curTok)) {
-      console.warn("Session token has expired. Logging out.");
-      localStorage.removeItem('invibeIsLoggedIn');
-      localStorage.removeItem('invibeUser');
-      localStorage.removeItem('invibe_jwt_token');
-      sessionValid = false;
-    }
-  }
+    (async () => {
+      try {
+        const res = await fetch((window.API_URL || '') + '/api/auth/me', {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${curTok.trim()}`
+          }
+        });
 
-  if (sessionValid) {
-    try {
-      const u = JSON.parse(storedUser);
-      if (u && (u.id || u._id)) {
-        if (!curTok || curTok === 'null' || curTok === 'undefined' || curTok.trim() === '') {
-          localStorage.setItem('invibe_jwt_token', (u.id || u._id).toString());
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.success && data.user) {
+            const u = data.user;
+            localStorage.setItem('invibeUser', JSON.stringify({
+              id: u.id,
+              username: u.username,
+              email: u.email,
+              fullName: u.fullName || u.username,
+              profileImage: u.profileImage || null
+            }));
+            if (u.profileImage) {
+              localStorage.setItem('invibeProfileImage', u.profileImage);
+            }
+            localStorage.setItem('invibeIsLoggedIn', 'true');
+            showAppView();
+            return;
+          }
+        }
+
+        // Token rejected or expired by server
+        console.warn('[Auth] Server rejected token on startup. Clearing authentication state.');
+        clearLocalAuthSession();
+        showAuthView();
+      } catch (netErr) {
+        console.warn('[Auth] Network error validating session on startup:', netErr.message);
+        if (!isTokenExpired(curTok) && localStorage.getItem('invibeUser')) {
+          showAppView();
+        } else {
+          clearLocalAuthSession();
+          showAuthView();
         }
       }
-    } catch (_) {}
-    showAppView();
-  } else {
-    showAuthView();
+    })();
   }
 
   // =========================================================================
@@ -524,8 +570,9 @@ export async function initAuth() {
         });
 
         const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'Invalid or expired verification code.');
+        if (!res.ok || !data.success) {
+          const msg = data.error?.message || data.error || 'Invalid or expired verification code.';
+          throw new Error(msg);
         }
 
         if (data.user) {
@@ -534,12 +581,12 @@ export async function initAuth() {
             username: data.user.username,
             email: data.user.email,
             fullName: data.user.fullName || data.user.full_name || data.user.username,
-            profileImage: data.user.profile_image_url || null
+            profileImage: data.user.profile_image_url || data.user.profileImage || null
           };
           localStorage.setItem('invibeUser', JSON.stringify(signedUpUser));
         }
 
-        if (data.token) {
+        if (data.token && typeof data.token === 'string' && data.token.includes('.')) {
           localStorage.setItem('invibe_jwt_token', data.token);
         }
 
@@ -630,11 +677,16 @@ export async function initAuth() {
 
       if (!res.ok || !data.success) {
         logAuthDiagnostic('handleLoginSubmit Failed', { input });
-        return showError(loginErrorMsg, data.error || 'Invalid username/email or password.');
+        const msg = data.error?.message || data.error || 'Invalid username/email or password.';
+        return showError(loginErrorMsg, msg);
       }
 
       const authenticatedUser = data.user;
       const jwtToken = data.token;
+
+      if (!jwtToken || typeof jwtToken !== 'string' || !jwtToken.includes('.')) {
+        throw new Error('Authentication server returned invalid token format.');
+      }
 
       // Store authenticated user session
       localStorage.setItem('invibeUser', JSON.stringify(authenticatedUser));
@@ -649,9 +701,7 @@ export async function initAuth() {
         localStorage.removeItem('invibeBannerImage');
       }
       localStorage.setItem('invibeIsLoggedIn', 'true');
-      if (jwtToken) {
-        localStorage.setItem('invibe_jwt_token', jwtToken);
-      }
+      localStorage.setItem('invibe_jwt_token', jwtToken);
 
       showAppView();
     } catch (err) {
@@ -801,8 +851,9 @@ function hideError(elem) {
  * Global Logout Handler
  */
 export function handleLogout() {
+  window.authState = 'UNAUTHENTICATED';
   const token = localStorage.getItem('invibe_jwt_token');
-  if (token) {
+  if (token && typeof token === 'string' && token.includes('.')) {
     try {
       if (navigator.sendBeacon) {
         const blob = new Blob([JSON.stringify({})], { type: 'application/json' });
@@ -816,11 +867,7 @@ export function handleLogout() {
     } catch (_) {}
   }
 
-  localStorage.removeItem('invibeUser');
-  localStorage.removeItem('invibeProfileImage');
-  localStorage.removeItem('invibeBannerImage');
-  localStorage.removeItem('invibeIsLoggedIn');
-  localStorage.removeItem('invibe_jwt_token');
+  clearLocalAuthSession();
 
   try {
     supabase.auth.signOut().catch(() => {});

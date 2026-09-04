@@ -1,6 +1,7 @@
 import express from 'express';
+import jwt from 'jsonwebtoken';
 import { supabase } from '../supabase.js';
-import { authenticateToken } from '../utils.js';
+import { authenticateToken, CANONICAL_JWT_SECRET, isValidUUID } from '../utils.js';
 import { optimizeReelMedia } from '../services/reel_optimizer_service.js';
 
 const router = express.Router();
@@ -234,37 +235,28 @@ router.post('/api/reels', authenticateToken, async (req, res) => {
   }
 });
 
-import jwt from 'jsonwebtoken';
-
 // Helper to extract userId from optional token in GET requests
 function getUserIdFromToken(req) {
   const authHeader = req.headers.authorization || req.headers['x-user-token'];
-  if (!authHeader) return null;
+  if (!authHeader || typeof authHeader !== 'string') return null;
 
   let token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
   if (!token || token === 'undefined' || token === 'null') return null;
+  token = token.trim();
 
-  const possibleSecrets = [
-    process.env.SUPABASE_JWT_SECRET,
-    process.env.JWT_SECRET,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    process.env.SUPABASE_ANON_KEY,
-    process.env.VITE_SUPABASE_ANON_KEY,
-    'hihubble-secure-jwt-secret',
-    'hi_hubble_super_secure_jwt_secret_key_2026_spec'
-  ].filter(Boolean);
+  if (!token.includes('.')) return null;
 
-  if (token.includes('.')) {
-    for (const secret of possibleSecrets) {
-      try {
-        const decoded = jwt.verify(token, secret);
-        if (decoded && (decoded.id || decoded.sub)) {
-          return decoded.id || decoded.sub;
-        }
-      } catch (_) {}
+  try {
+    const decoded = jwt.verify(token, CANONICAL_JWT_SECRET);
+    if (decoded && typeof decoded === 'object') {
+      const userId = decoded.id || decoded.sub || decoded.userId;
+      if (userId && isValidUUID(userId)) {
+        return userId;
+      }
     }
-  }
-  return token.length > 10 ? token : null;
+  } catch (_) {}
+
+  return null;
 }
 
 // 2. GET /api/reels - Get all user-posted reels from DB

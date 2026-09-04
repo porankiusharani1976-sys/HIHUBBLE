@@ -3,11 +3,12 @@ import app from './server.js';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import pg from 'pg';
+import { CANONICAL_JWT_SECRET } from './utils.js';
 
 const { Client } = pg;
 dotenv.config();
 
-const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || process.env.VITE_SUPABASE_ANON_KEY || 'hihubble-secure-jwt-secret';
+const JWT_SECRET = CANONICAL_JWT_SECRET;
 let API_URL = 'http://localhost:3099';
 
 const projectRef = 'fefrlcxctuhdbztyoncs';
@@ -258,6 +259,7 @@ async function runDMTests() {
   } finally {
     if (serverInstance) serverInstance.close();
     await dbClient.end();
+    process.exit(0);
   }
 }
 

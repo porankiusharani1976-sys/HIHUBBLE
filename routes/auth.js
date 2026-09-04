@@ -3,12 +3,9 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { supabase } from '../supabase.js';
-import { sendOTPEmailHelper, authenticateToken } from '../utils.js';
+import { sendOTPEmailHelper, authenticateToken, CANONICAL_JWT_SECRET } from '../utils.js';
 
 const router = express.Router();
-
-// Secret from .env for signing JWTs (must match Supabase JWT secret to work with RLS)
-const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || process.env.VITE_SUPABASE_ANON_KEY || 'hihubble-secure-jwt-secret';
 
 // ==========================================
 // 1. SIGNUP OTP: Generate 6-digit OTP and send email via Gmail SMTP
@@ -119,11 +116,32 @@ router.post('/api/auth/signup-otp', async (req, res) => {
 
 
 // ==========================================
+// 0. AUTH VALIDATION & SESSION RESTORATION (Canonical)
+// ==========================================
+router.get('/api/auth/me', authenticateToken, async (req, res) => {
+  return res.json({
+    success: true,
+    user: {
+      id: req.user.id,
+      username: req.user.username,
+      email: req.user.email,
+      fullName: req.user.full_name,
+      profileImage: req.user.profile_image_url || null
+    }
+  });
+});
+
+// ==========================================
 // 2. VERIFY SIGNUP OTP CODE & PERSIST TO DATABASE
 // ==========================================
 router.post('/api/auth/verify-action-otp', async (req, res) => {
   const { email, otp } = req.body;
-  if (!email || !otp) return res.status(400).json({ error: 'Email and OTP code are required.' });
+  if (!email || !otp) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'PARAMS_REQUIRED', message: 'Email and OTP code are required.' }
+    });
+  }
 
   const normalizedEmail = email.trim().toLowerCase();
   const enteredOtp = otp.trim();
@@ -141,19 +159,28 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       .maybeSingle();
 
     if (fetchErr || !record) {
-      return res.status(400).json({ error: 'Invalid or expired verification code.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'OTP_NOT_FOUND', message: 'Invalid or expired verification code.' }
+      });
     }
 
     // 2. Check 10-minute expiry
     if (new Date(record.expires_at) < new Date()) {
       await supabase.from('email_verification_otps').delete().eq('id', record.id);
-      return res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'OTP_EXPIRED', message: 'Verification code has expired. Please request a new code.' }
+      });
     }
 
     // 3. Brute-force protection: Enforce maximum 5 verification attempts
     if (record.attempts >= 5) {
       await supabase.from('email_verification_otps').delete().eq('id', record.id);
-      return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'MAX_ATTEMPTS_EXCEEDED', message: 'Maximum verification attempts exceeded. Please request a new verification code.' }
+      });
     }
 
     // 4. Constant-time hash verification
@@ -166,20 +193,43 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       const nextAttempts = (record.attempts || 0) + 1;
       if (nextAttempts >= 5) {
         await supabase.from('email_verification_otps').delete().eq('id', record.id);
-        return res.status(400).json({ error: 'Maximum verification attempts exceeded. Please request a new verification code.' });
+        return res.status(400).json({
+          success: false,
+          error: { code: 'MAX_ATTEMPTS_EXCEEDED', message: 'Maximum verification attempts exceeded. Please request a new verification code.' }
+        });
       }
       await supabase.from('email_verification_otps').update({ attempts: nextAttempts }).eq('id', record.id);
-      return res.status(400).json({ error: 'Invalid verification code.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_OTP', message: 'Invalid verification code.' }
+      });
     }
 
-    // 5. Mark OTP as consumed and clean up
-    await supabase.from('email_verification_otps').update({ consumed_at: new Date().toISOString() }).eq('id', record.id);
-    await supabase.from('email_verification_otps').delete().eq('email', normalizedEmail);
-
-    // 6. Extract pending registration payload
+    // 5. Extract pending registration payload
     const { fullName, username, password, phoneNumber, gender, dateOfBirth } = record.payload || {};
     if (!fullName || !username || !password) {
-      return res.status(400).json({ error: 'Registration session details missing. Please sign up again.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'SESSION_CORRUPTED', message: 'Registration session details missing. Please sign up again.' }
+      });
+    }
+
+    // 6. Pre-check uniqueness before attempting insert
+    const normalizedUsername = username.trim().toLowerCase();
+    const { data: existingEmail } = await supabase.from('profiles').select('id').eq('email', normalizedEmail).maybeSingle();
+    if (existingEmail) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'DUPLICATE_EMAIL', message: 'This email address is already registered.' }
+      });
+    }
+
+    const { data: existingUser } = await supabase.from('profiles').select('id').eq('username', normalizedUsername).maybeSingle();
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'DUPLICATE_USERNAME', message: 'This username is already taken. Please choose another username.' }
+      });
     }
 
     const nowIso = new Date().toISOString();
@@ -190,20 +240,20 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
 
     let insertPayload = {
       full_name: fullName,
-      username: username,
+      username: normalizedUsername,
       email: normalizedEmail,
       password_hash: password_hash,
       phone_number: phoneNumber,
       is_online: true,
       last_active_at: nowIso
     };
-    
+
     if (gender) insertPayload.gender = gender;
     if (dateOfBirth) insertPayload.date_of_birth = dateOfBirth;
 
     // 8. Insert finalized user profile into public.profiles database table
     let { data: newUser, error: createError } = await supabase.from('profiles').insert([insertPayload]).select().single();
-    
+
     // Fallback if optional columns don't exist
     if (createError && createError.code === '42703') {
       console.warn('[Signup Verification] Column not found error (42703). Retrying without gender/date_of_birth.');
@@ -214,14 +264,44 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       createError = retryResult.error;
     }
 
-    if (createError || !newUser) {
+    // Check for PostgreSQL unique constraint violations (code 23505)
+    if (createError) {
+      if (createError.code === '23505' || (createError.message && createError.message.includes('unique constraint'))) {
+        const isEmail = createError.message.includes('email') || (createError.details && createError.details.includes('email'));
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: isEmail ? 'DUPLICATE_EMAIL' : 'DUPLICATE_USERNAME',
+            message: isEmail ? 'This email address is already registered.' : 'This username is already taken.'
+          }
+        });
+      }
+
       console.error('[Signup Verification] Error creating profile in Supabase profiles table:', createError);
-      return res.status(500).json({ error: 'Failed to create user profile in database. Please check database permissions.' });
+      return res.status(500).json({
+        success: false,
+        error: { code: 'DATABASE_ERROR', message: 'Failed to create user profile in database.' }
+      });
+    }
+
+    if (!newUser) {
+      return res.status(500).json({
+        success: false,
+        error: { code: 'DATABASE_ERROR', message: 'User record was not created.' }
+      });
+    }
+
+    // 9. ONLY AFTER SUCCESSFUL INSERT: Mark OTP as consumed and clean up
+    try {
+      await supabase.from('email_verification_otps').update({ consumed_at: nowIso }).eq('id', record.id);
+      await supabase.from('email_verification_otps').delete().eq('email', normalizedEmail);
+    } catch (cleanupErr) {
+      console.warn('[Signup Verification] OTP cleanup note:', cleanupErr.message);
     }
 
     const userId = newUser.id;
 
-    // 9. Record login history in public.login_history table
+    // 10. Record login history in public.login_history table
     try {
       const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
       const userAgent = req.headers['user-agent'] || 'Browser';
@@ -233,7 +313,7 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       }]);
     } catch (_) {}
 
-    // 10. Record active status in public.online_users table
+    // 11. Record active status in public.online_users table
     try {
       await supabase.from('online_users').upsert([{
         user_id: userId,
@@ -241,10 +321,10 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
       }]);
     } catch (_) {}
 
-    // 11. Issue JWT token (7-day duration)
+    // 12. Issue authoritative JWT token (7-day duration) signed with CANONICAL_JWT_SECRET
     const token = jwt.sign(
       { id: userId, sub: userId, username: newUser.username, email: normalizedEmail, role: 'authenticated', aud: 'authenticated' },
-      JWT_SECRET,
+      CANONICAL_JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -263,7 +343,10 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
     });
   } catch (err) {
     console.error('[Signup Verification] Unexpected error:', err.message);
-    res.status(500).json({ error: 'An unexpected error occurred during verification.' });
+    res.status(500).json({
+      success: false,
+      error: { code: 'SERVER_ERROR', message: 'An unexpected error occurred during verification.' }
+    });
   }
 });
 
@@ -273,30 +356,67 @@ router.post('/api/auth/verify-action-otp', async (req, res) => {
 router.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required.' });
+    return res.status(400).json({
+      success: false,
+      error: { code: 'CREDENTIALS_REQUIRED', message: 'Username and password are required.' }
+    });
   }
 
   const normalizedInput = username.trim().toLowerCase();
 
   try {
-    // Find user profile by username or email in public.profiles table
-    const { data: user, error: fetchErr } = await supabase.from('profiles')
-      .select('*')
-      .or(`username.eq.${normalizedInput},email.eq.${normalizedInput}`)
-      .maybeSingle();
+    // Deterministic profile lookup: email vs username without raw .or() string interpolation
+    let user = null;
+    let fetchErr = null;
+
+    if (normalizedInput.includes('@')) {
+      const result = await supabase.from('profiles')
+        .select('*')
+        .eq('email', normalizedInput)
+        .maybeSingle();
+      user = result.data;
+      fetchErr = result.error;
+    } else {
+      const result = await supabase.from('profiles')
+        .select('*')
+        .eq('username', normalizedInput)
+        .maybeSingle();
+      user = result.data;
+      fetchErr = result.error;
+    }
+
+    // Fallback if not found by primary field
+    if (!user && !fetchErr) {
+      if (normalizedInput.includes('@')) {
+        const fallbackRes = await supabase.from('profiles').select('*').eq('username', normalizedInput).maybeSingle();
+        user = fallbackRes.data;
+      } else {
+        const fallbackRes = await supabase.from('profiles').select('*').eq('email', normalizedInput).maybeSingle();
+        user = fallbackRes.data;
+      }
+    }
 
     if (fetchErr || !user) {
-      return res.status(400).json({ error: 'Invalid username or password.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_CREDENTIALS', message: 'Invalid username or password.' }
+      });
     }
 
     if (!user.password_hash) {
-      return res.status(400).json({ error: 'Account has no password set. Please sign up or reset password.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'NO_PASSWORD_SET', message: 'Account has no password set. Please sign up or reset password.' }
+      });
     }
 
     // Verify password hash
     const passwordMatch = await bcrypt.compare(password, user.password_hash);
     if (!passwordMatch) {
-      return res.status(400).json({ error: 'Invalid username or password.' });
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_CREDENTIALS', message: 'Invalid username or password.' }
+      });
     }
 
     const nowIso = new Date().toISOString();
@@ -329,10 +449,10 @@ router.post('/api/auth/login', async (req, res) => {
       }, { onConflict: 'user_id' });
     } catch (_) {}
 
-    // Issue JWT token
+    // Issue authoritative JWT token signed with CANONICAL_JWT_SECRET
     const token = jwt.sign(
       { id: user.id, sub: user.id, username: user.username, email: user.email, role: 'authenticated', aud: 'authenticated' },
-      JWT_SECRET,
+      CANONICAL_JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -350,7 +470,11 @@ router.post('/api/auth/login', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[Login] Unexpected error:', err.message);
+    res.status(500).json({
+      success: false,
+      error: { code: 'SERVER_ERROR', message: 'An unexpected error occurred during login.' }
+    });
   }
 });
 

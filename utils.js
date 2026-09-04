@@ -7,9 +7,14 @@ import nodemailer from 'nodemailer';
 import jwt from 'jsonwebtoken';
 import { supabase } from './supabase.js';
 
-dotenv.config();
+// Authoritative canonical server-side JWT Secret (Dedicated signing secret)
+export const CANONICAL_JWT_SECRET = (process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || 'hihubble-secure-jwt-secret-2026-v8').trim();
 
-const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || process.env.VITE_SUPABASE_ANON_KEY || 'hihubble-secure-jwt-secret';
+if (!process.env.SUPABASE_JWT_SECRET && !process.env.JWT_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('⚠️ CRITICAL SECURITY WARNING: SUPABASE_JWT_SECRET is missing from production environment variables.');
+  }
+}
 
 // In-memory store for OTPs
 export const otps = new Map();
@@ -102,7 +107,6 @@ export async function sendOTPEmailHelper(targetEmail, otpCode) {
   return { success: true };
 }
 
-
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function isValidUUID(id) {
@@ -110,7 +114,8 @@ export function isValidUUID(id) {
 }
 
 /**
- * Middleware to authenticate requests using JWTs or validated session tokens
+ * Middleware to authenticate requests strictly using canonical signed JWTs.
+ * Rejects raw UUIDs, mock strings, expired signatures, or missing claims.
  */
 export async function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -125,113 +130,100 @@ export async function authenticateToken(req, res, next) {
   }
 
   if (!token || token === 'undefined' || token === 'null' || typeof token !== 'string' || token.trim() === '') {
-    return res.status(401).json({ error: 'Unauthorized: Authentication token is required.' });
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'TOKEN_REQUIRED',
+        message: 'Authentication token is required.'
+      }
+    });
   }
 
   token = token.trim();
 
-  const possibleSecrets = [
-    process.env.SUPABASE_JWT_SECRET,
-    process.env.JWT_SECRET,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    process.env.SUPABASE_ANON_KEY,
-    process.env.VITE_SUPABASE_ANON_KEY,
-    'hihubble-secure-jwt-secret',
-    'hi_hubble_super_secure_jwt_secret_key_2026_spec'
-  ].filter(Boolean);
-
-  let userId = null;
-  let email = '';
-  let username = 'user';
-  let fullName = 'User';
-
-  if (token.includes('.')) {
-    for (const secret of possibleSecrets) {
-      try {
-        const decoded = jwt.verify(token, secret);
-        if (decoded) {
-          userId = decoded.id || decoded.sub || decoded.userId;
-          email = decoded.email || '';
-          username = decoded.username || (decoded.email ? decoded.email.split('@')[0] : 'user');
-          fullName = decoded.full_name || decoded.fullName || decoded.username || 'User';
-          break;
-        }
-      } catch (_) {}
-    }
-
-    if (!userId) {
-      // Fallback: Verify token directly using Supabase client
-      try {
-        const { data: { user: sbUser }, error: sbErr } = await supabase.auth.getUser(token);
-        if (sbUser && !sbErr) {
-          userId = sbUser.id;
-          email = sbUser.email || '';
-          username = sbUser.user_metadata?.username || (sbUser.email ? sbUser.email.split('@')[0] : 'user');
-          fullName = sbUser.user_metadata?.full_name || sbUser.user_metadata?.fullName || username;
-        }
-      } catch (err) {
-        console.warn('Supabase auth fallback verification warning:', err.message);
+  // Strict JWT validation: Must have standard 3-part dot format
+  if (!token.includes('.')) {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'TOKEN_MALFORMED',
+        message: 'Authentication token is malformed. Please log in again.'
       }
-    }
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid or expired authentication token signature.' });
-    }
-
-    // Reject non-UUID user identities
-    if (!isValidUUID(userId)) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid user identity format in token.' });
-    }
-
-    // Verify corresponding profile exists in public.profiles
-    try {
-      const { data: dbProfile, error: profileErr } = await supabase
-        .from('profiles')
-        .select('id, full_name, username, email, profile_image_url')
-        .eq('id', userId)
-        .maybeSingle();
-
-      if (profileErr || !dbProfile) {
-        return res.status(401).json({ error: 'Unauthorized: Authenticated user profile does not exist.' });
-      }
-
-      req.token = token;
-      req.user = {
-        id: dbProfile.id,
-        username: dbProfile.username || username,
-        full_name: dbProfile.full_name || fullName,
-        email: dbProfile.email || email,
-        profile_image_url: dbProfile.profile_image_url || ''
-      };
-      return next();
-    } catch (err) {
-      return res.status(500).json({ error: 'Authentication database verification failure.' });
-    }
+    });
   }
 
-  // Session lookup for direct non-JWT UUIDs if valid profile matches token directly
-  if (isValidUUID(token)) {
-    try {
-      const { data: dbProfile, error: profileErr } = await supabase
-        .from('profiles')
-        .select('id, full_name, username, email, profile_image_url')
-        .eq('id', token)
-        .maybeSingle();
-
-      if (dbProfile && !profileErr) {
-        req.token = token;
-        req.user = {
-          id: dbProfile.id,
-          username: dbProfile.username,
-          full_name: dbProfile.full_name || dbProfile.username,
-          email: dbProfile.email,
-          profile_image_url: dbProfile.profile_image_url || ''
-        };
-        return next();
+  let decoded;
+  try {
+    decoded = jwt.verify(token, CANONICAL_JWT_SECRET);
+  } catch (jwtErr) {
+    const isExpired = jwtErr.name === 'TokenExpiredError';
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: isExpired ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID',
+        message: isExpired ? 'Your session has expired. Please log in again.' : 'Invalid authentication token signature.'
       }
-    } catch (_) {}
+    });
   }
 
-  return res.status(401).json({ error: 'Unauthorized: Invalid or expired authentication token.' });
+  if (!decoded || typeof decoded !== 'object') {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'TOKEN_INVALID',
+        message: 'Invalid authentication token claims.'
+      }
+    });
+  }
+
+  const userId = decoded.id || decoded.sub || decoded.userId;
+  if (!userId || !isValidUUID(userId)) {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'TOKEN_INVALID_CLAIMS',
+        message: 'Invalid user identity format in token claims.'
+      }
+    });
+  }
+
+  // Verify corresponding profile exists in public.profiles database table
+  try {
+    const { data: dbProfile, error: profileErr } = await supabase
+      .from('profiles')
+      .select('id, full_name, username, email, profile_image_url')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (profileErr || !dbProfile) {
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'PROFILE_NOT_FOUND',
+          message: 'Authenticated user profile does not exist.'
+        }
+      });
+    }
+
+    req.token = token;
+    req.user = {
+      id: dbProfile.id,
+      username: dbProfile.username || decoded.username || 'user',
+      full_name: dbProfile.full_name || decoded.fullName || dbProfile.username,
+      email: dbProfile.email || decoded.email || '',
+      profile_image_url: dbProfile.profile_image_url || ''
+    };
+    return next();
+  } catch (err) {
+    console.error('[AUTH DATABASE ERROR]:', err.message);
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_UNAVAILABLE',
+        message: 'Authentication service temporarily unavailable. Please try again.'
+      }
+    });
+  }
 }
+
 

@@ -25,4 +25,5 @@ dist-ssr
 
 # Sensitive files
 .env
+scratch/
 

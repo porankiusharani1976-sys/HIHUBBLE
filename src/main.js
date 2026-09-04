@@ -2513,9 +2513,14 @@ document.addEventListener('DOMContentLoaded', () => {
         let allSaved = [];
         if (postsRes.ok) {
           allSaved = allSaved.concat(await postsRes.json());
+        } else if (postsRes.status === 401 && window.handleUnauthorizedResponse) {
+          window.handleUnauthorizedResponse(postsRes);
         }
+
         if (reelsRes.ok) {
           allSaved = allSaved.concat(await reelsRes.json());
+        } else if (reelsRes.status === 401 && window.handleUnauthorizedResponse) {
+          window.handleUnauthorizedResponse(reelsRes);
         }
         window.savedHubbs = allSaved;
         window.updateSavedBadgeCount();
@@ -2532,14 +2537,9 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   function getAuthToken() {
-    let tok = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || localStorage.getItem('invibeToken') || localStorage.getItem('token');
-    if (tok && tok !== 'null' && tok !== 'undefined' && tok.trim() !== '') {
+    const tok = localStorage.getItem('invibe_jwt_token');
+    if (tok && typeof tok === 'string' && tok !== 'null' && tok !== 'undefined' && tok.trim() !== '' && tok.includes('.')) {
       return tok.trim();
-    }
-    const cu = typeof getCurrentUser === 'function' ? getCurrentUser() : null;
-    const cuId = cu ? (cu.id || cu._id) : null;
-    if (cuId && typeof cuId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cuId)) {
-      return cuId.trim();
     }
     return null;
   }
@@ -2548,15 +2548,43 @@ document.addEventListener('DOMContentLoaded', () => {
   function isUserAuthenticated() {
     const isLoggedIn = localStorage.getItem('invibeIsLoggedIn') === 'true';
     const token = getAuthToken();
-    return Boolean(isLoggedIn && token);
+    const isStateAuth = window.authState === 'AUTHENTICATED';
+    return Boolean(isLoggedIn && token && isStateAuth);
   }
   window.isUserAuthenticated = isUserAuthenticated;
 
+  // Centralized 401 Unauthorized Interceptor
+  let _isHandlingUnauthorized = false;
+  window.handleUnauthorizedResponse = function (response) {
+    if (!response || response.status !== 401) return false;
+    if (_isHandlingUnauthorized) return true;
+
+    _isHandlingUnauthorized = true;
+    console.warn('[Auth 401 Interceptor] Received 401 Unauthorized from backend. Clearing stale session.');
+
+    if (typeof window.clearLocalAuthSession === 'function') {
+      window.clearLocalAuthSession();
+    } else {
+      localStorage.removeItem('invibeUser');
+      localStorage.removeItem('invibeProfileImage');
+      localStorage.removeItem('invibeBannerImage');
+      localStorage.removeItem('invibeIsLoggedIn');
+      localStorage.removeItem('invibe_jwt_token');
+    }
+
+    if (typeof window.showAuthView === 'function') {
+      window.showAuthView();
+    }
+
+    setTimeout(() => {
+      _isHandlingUnauthorized = false;
+    }, 1500);
+
+    return true;
+  };
+
   initAuth();
-  if (isUserAuthenticated()) {
-    updateAppUI();
-    window.fetchSavedHubbs();
-  }
+
   window.addEventListener('auth-changed', () => {
     if (isUserAuthenticated()) {
       updateAppUI();

@@ -28,6 +28,14 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   };
   const showToast = safeShowToast;
 
+  const getEditorAuthToken = () => {
+    if (typeof window !== 'undefined' && typeof window.getAuthToken === 'function') {
+      return window.getAuthToken();
+    }
+    const tok = typeof localStorage !== 'undefined' ? localStorage.getItem('invibe_jwt_token') : null;
+    return (tok && typeof tok === 'string' && tok.includes('.')) ? tok.trim() : null;
+  };
+
   // --- UI Elements ---
   const exploreCreateModal = document.getElementById('explore-create-modal');
   const exploreCreateBtn = document.getElementById('explore-create-btn');
@@ -2632,7 +2640,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
         if (value) {
           if (!mentions.includes(value)) {
             try {
-              const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+              const token = getEditorAuthToken();
+              if (!token) return;
               const baseUrl = window.API_URL || '';
               const res = await fetch(`${baseUrl}/api/users/mention-suggestions?q=${encodeURIComponent(value)}`, {
                 headers: { 'Authorization': `Bearer ${token}` }
@@ -2680,7 +2689,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
 
       mentionsTimeout = setTimeout(async () => {
         try {
-          const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+          const token = getEditorAuthToken();
+          if (!token) return;
           const baseUrl = window.API_URL || '';
           const res = await fetch(`${baseUrl}/api/users/mention-suggestions?q=${encodeURIComponent(q)}`, {
             headers: { 'Authorization': `Bearer ${token}` }
@@ -3547,7 +3557,11 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       }));
       console.log('[REEL POST 3] Selected media:', selectedMedia);
 
-      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+      const token = getEditorAuthToken();
+      if (!token) {
+        safeShowToast('Authentication required to publish Reel. Please log in.');
+        return;
+      }
 
       btn.disabled = true;
       btn.innerHTML = '<i data-lucide="loader" class="animate-spin" style="width:14px; height:14px;"></i> Posting...';
@@ -3612,11 +3626,13 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           safeShowToast('New Reel posted successfully! 🎥✨');
           if (currentDraftId) {
             try {
-              const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
-              await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
-                method: 'DELETE',
-                headers: { 'Authorization': `Bearer ${token}` }
-              });
+              const token = getEditorAuthToken();
+              if (token) {
+                await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
+                  method: 'DELETE',
+                  headers: { 'Authorization': `Bearer ${token}` }
+                });
+              }
             } catch (err) {
               console.error("Cleanup delete draft error:", err.message);
             }
@@ -3663,7 +3679,11 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       }));
       console.log('[REEL POST 3] Selected media:', selectedMedia);
 
-      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+      const token = getEditorAuthToken();
+      if (!token) {
+        safeShowToast('Authentication required to publish Reel. Please log in.');
+        return;
+      }
 
       postBtn.disabled = true;
       postBtn.innerHTML = '<i data-lucide="loader" class="animate-spin"></i> Posting...';
@@ -3735,11 +3755,13 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           safeShowToast('New Reel posted successfully! 🎥✨');
           if (currentDraftId) {
             try {
-              const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
-              await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
-                method: 'DELETE',
-                headers: { 'Authorization': `Bearer ${token}` }
-              });
+              const token = getEditorAuthToken();
+              if (token) {
+                await fetch(`${API_URL}/api/reels/drafts/${currentDraftId}`, {
+                  method: 'DELETE',
+                  headers: { 'Authorization': `Bearer ${token}` }
+                });
+              }
             } catch (err) {
               console.error("Cleanup delete draft error:", err.message);
             }
@@ -4743,7 +4765,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   // Helper: Upload a local clip/audio file to secure backend streaming endpoint
   async function uploadDraftFile(file, type) {
     if (!file) return null;
-    const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+    const token = getEditorAuthToken();
+    if (!token) throw new Error('Authentication required for draft upload.');
     const response = await fetch(`${API_URL}/api/reels/drafts/upload?name=${encodeURIComponent(file.name)}`, {
       method: 'POST',
       headers: {
@@ -4775,7 +4798,11 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
       if (window.debouncedCreateIcons) window.debouncedCreateIcons();
 
       try {
-        const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+        const token = getEditorAuthToken();
+        if (!token) {
+          showToast('Please log in to save drafts! 🔐');
+          return;
+        }
         const userStr = localStorage.getItem('invibeUser');
         let userId = 'anon';
         try { if (userStr) userId = JSON.parse(userStr).id || userId; } catch (e) { }
@@ -4904,7 +4931,11 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
     if (window.debouncedCreateIcons) window.debouncedCreateIcons();
 
     try {
-      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+      const token = getEditorAuthToken();
+      if (!token) {
+        draftsList.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-muted); font-size: 13px;">Please log in to view saved drafts.</div>';
+        return;
+      }
       const res = await fetch(`${API_URL}/api/reels/drafts`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
@@ -4960,7 +4991,8 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
           e.stopPropagation();
           if (!confirm('Are you sure you want to delete this draft?')) return;
           try {
-            const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+            const token = getEditorAuthToken();
+            if (!token) return;
             const delRes = await fetch(`${API_URL}/api/reels/drafts/${d.id}`, {
               method: 'DELETE',
               headers: { 'Authorization': `Bearer ${token}` }
@@ -5004,7 +5036,11 @@ export function initVideoEditor(API_URL, showToastParam, loadFeedReels) {
   async function resumeDraft(draftId) {
     showToast('Loading draft... ⏳');
     try {
-      const token = localStorage.getItem('invibe_jwt_token') || localStorage.getItem('invibe_token') || 'session_user';
+      const token = getEditorAuthToken();
+      if (!token) {
+        showToast('Please log in to resume drafts.');
+        return;
+      }
       const res = await fetch(`${API_URL}/api/reels/drafts/${draftId}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });

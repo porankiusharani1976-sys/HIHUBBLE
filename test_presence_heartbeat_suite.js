@@ -1,14 +1,20 @@
+process.env.NO_AUTO_LISTEN = 'true';
+import app from './server.js';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { CANONICAL_JWT_SECRET } from './utils.js';
 dotenv.config();
 
 const { Client } = pg;
 const connectionString = 'postgresql://postgres:Ansoceanverse2026@db.fefrlcxctuhdbztyoncs.supabase.co:5432/postgres';
-const API_URL = 'http://localhost:3000';
-const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || 'hihubble-secure-jwt-secret';
+const PORT = 3089;
+const API_URL = `http://localhost:${PORT}`;
+const JWT_SECRET = CANONICAL_JWT_SECRET;
 
 async function runPresenceTestSuite() {
+  const server = app.listen(PORT);
+  await new Promise(r => setTimeout(r, 400));
   console.log('====================================================');
   console.log('   RUNNING PHASE 2 PRESENCE HEARTBEAT TEST SUITE    ');
   console.log('====================================================\n');
@@ -143,6 +149,7 @@ async function runPresenceTestSuite() {
   console.log('\n✔ DB Row in online_users:', dbCheck.rows[0]);
 
   await client.end();
+  server.close();
   console.log('\n====================================================');
   console.log('   ALL 8 PRESENCE HEARTBEAT TESTS PASSED CLEANLY!   ');
   console.log('====================================================');
